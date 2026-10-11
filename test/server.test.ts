@@ -162,6 +162,52 @@ describe("read tools", () => {
     expect(data.byContract["BT.MNQ"].wins).toBe(1);
   });
 
+  describe("trade metrics", () => {
+    // MNQ bought at T0's open 20000 + 1 tick = 20000.25. Bar 2 trades down to 19990.
+    const data = { NQ: [...flat(T0 - 5 * MIN, 5, 20000), ...seq(T0, [[20000, 20002, 19999, 20001], [20001, 20003, 19998, 20002], [20002, 20002.5, 19990, 19995], [19995, 19995, 19995, 19995]])] };
+
+    it("search_trades attaches the round trip to its closing fill; get_performance grades round trips", async () => {
+      const { call, setNow } = await setup({ data });
+      await call("place_order", { ...order, stopLossBracket: { ticks: 20, type: "stop" } }); // stop 19995.25: $10 risk
+      setNow(T0 + 3 * MIN);
+      const fills = (await call("search_trades", { accountId: 1 })).data;
+      expect(fills[0]).toMatchObject({ id: 1, halfTurn: true, roundTripId: 1 });
+      expect(fills[0].roundTrip).toBeUndefined();
+      // The stop fills at 19995.25 - 1 tick = 19995.00: -21 ticks = -$10.50 = -1.05R; best: bar 1's 20003 = +11 ticks = $5.50.
+      expect(fills[1]).toMatchObject({
+        profitAndLoss: -10.5, halfTurn: false, roundTripId: 1, exitReason: "stop",
+        roundTrip: {
+          id: 1, direction: "long", entryPrice: 20000.25, exitPrice: 19995, reason: "stop", initialStop: 19995.25, riskDollars: 10,
+          maeTicks: -21, maeDollars: -10.5, maeR: -1.05, mfeTicks: 11, mfeDollars: 5.5, mfeR: 0.55, mfeTime: iso(T0 + MIN), barsHeld: 2,
+          gross: -10.5, fees: 0.74, net: -11.24, r: -1.05, rNet: -1.124,
+        },
+      });
+      const perf = (await call("get_performance", { accountId: 1 })).data;
+      expect(perf.overall).toMatchObject({ closingFills: 1, netPnL: -11.24 });
+      expect(perf.roundTrips.overall).toMatchObject({ trades: 1, losses: 1, expectancy: -11.24, expectancyR: -1.124, maxDrawdown: 11.24, avgMaeRLosers: -1.05, avgBarsHeld: 2 });
+      expect(perf.roundTrips.byContract["BT.MNQ"].trades).toBe(1);
+      // A window after the exit holds no round trip.
+      expect((await call("get_performance", { accountId: 1, startTimestamp: iso(T0 + 4 * MIN) })).data.roundTrips.overall.trades).toBe(0);
+    });
+
+    it("list_open_positions and the snapshot show the open round trip so far, closed bars only; a stop placed after the entry sets R", async () => {
+      const { call, setNow } = await setup({ data });
+      await call("place_order", order);
+      setNow(T0 + 20000);
+      await call("place_order", { ...order, side: "sell", type: "stop", stopPrice: 19995.25 });
+      setNow(T0 + 70000);
+      expect((await call("modify_order", { accountId: 1, orderId: 2, stopPrice: 19996 })).data.success).toBe(true);
+      setNow(T0 + 2 * MIN + 30000); // bar 2 (low 19990) is still forming
+      const [pos] = (await call("list_open_positions", { accountId: 1 })).data;
+      expect(pos).toMatchObject({ direction: "long", size: 1, averagePrice: 20000.25 });
+      expect(pos.roundTrip).toMatchObject({
+        open: true, initialStop: 19995.25, riskDollars: 10, barsHeld: 2, reason: null,
+        maePoints: -2.25, maeDollars: -4.5, maeR: -0.45, mfePoints: 2.75, mfeR: 0.55,
+      });
+      expect((await call("get_account_snapshot", { accountId: 1 })).data.positions[0].roundTrip.barsHeld).toBe(2);
+    });
+  });
+
   it("surfaces an unknown account as a tool error", async () => {
     const res = await (await setup()).call("list_open_positions", { accountId: 9 });
     expect(res).toMatchObject({ isError: true, text: expect.stringMatching(/Account 9 not found/) });

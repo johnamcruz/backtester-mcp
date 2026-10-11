@@ -26,6 +26,7 @@ import {
   type SimOrder,
   type SimPosition,
 } from "./fills.js";
+import { roundTrips, type FillInfo, type RoundTrip } from "./metrics.js";
 import type { Trade } from "./performance.js";
 import { realizedNet, tradingDayStart } from "./risk.js";
 
@@ -147,7 +148,14 @@ export function specOf(contractId: string): ContractSpec | null {
 interface StoredOrder extends SimOrder {
   accountId: number;
   contractId: string;
+  /** Client stops: [time, stop price] at placement and at each modify (for a round trip's initial stop). */
+  stopAt?: Array<[number, number]>;
+  /** Filled at the last close after BACKTESTER_END (a round trip's exit reason "end"). */
+  endOfWindow?: boolean;
 }
+
+/** A fill as search_trades returns it: the stored fill plus its round-trip metrics (extra fields). */
+export type TradeWithMetrics = Trade & { roundTripId?: number; exitReason?: FillInfo["exitReason"]; roundTrip?: RoundTrip };
 
 interface State {
   version: 1;
@@ -208,6 +216,15 @@ export interface BarsRequest {
 }
 
 const iso = (ms: number) => new Date(ms).toISOString();
+
+/** Contracts the run has traded (read without the lock, so their bars load before it). */
+function state0Contracts(statePath: string): string[] {
+  try {
+    return [...new Set(((JSON.parse(readFileSync(statePath, "utf8")) as State).trades ?? []).map((t) => t.contractId))];
+  } catch {
+    return [];
+  }
+}
 const sleep = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const LOCK_WAIT_MS = 60000; // longer than LOCK_STALE_MS, so a crashed holder's lock is cleared before callers give up
 const LOCK_STALE_MS = 30000;
@@ -501,9 +518,43 @@ export class ReplayExchange {
     return this.tx((state) => [this.accountOf(state)]);
   }
 
-  positions(accountId: number) {
-    return this.tx((state) => {
+  /**
+   * Round trips (metrics.ts) of every contract the account traded, from the whole run's fills and
+   * the bars closed at or before the cutoff: closed ones, each contract's open one, and per fill
+   * the round trip it belongs to.
+   */
+  private roundTripsOf(state: State, now: Date) {
+    const cutoff = this.cutoff(now);
+    const closed: RoundTrip[] = [];
+    const open: Record<string, RoundTrip> = {};
+    const fills = new Map<number, FillInfo>();
+    for (const contractId of [...new Set(state.trades.map((t) => t.contractId))].sort()) {
+      const c = specOf(contractId);
+      if (!c) continue;
+      const bars = this.store.has(c.dataRoot) ? this.store.get(c.dataRoot) : null;
+      const r = roundTrips(
+        contractId,
+        state.trades.filter((t) => t.contractId === contractId),
+        state.orders.filter((o) => o.contractId === contractId),
+        bars,
+        c,
+        cutoff,
+      );
+      closed.push(...r.closed);
+      if (r.open) open[contractId] = r.open;
+      for (const [id, f] of r.fills) fills.set(id, f);
+    }
+    return { closed, open, fills };
+  }
+
+  /**
+   * Open positions; with `metrics`, each carries its round trip so far (extra field `roundTrip`:
+   * MAE/MFE over the bars closed at or before the clock, bars held, initial stop and risk).
+   */
+  positions(accountId: number, metrics = false) {
+    return this.tx((state, now) => {
       this.assertAccount(state, accountId);
+      const trips = metrics ? this.roundTripsOf(state, now).open : null;
       return Object.entries(state.positions)
         .filter(([, p]) => p.net !== 0)
         .sort(([a], [b]) => a.localeCompare(b))
@@ -515,8 +566,9 @@ export class ReplayExchange {
           type: p.net > 0 ? 1 : 2,
           size: Math.abs(p.net),
           averagePrice: Math.round(p.averagePrice * 1e9) / 1e9,
+          ...(trips?.[contractId] ? { roundTrip: trips[contractId] } : {}),
         }));
-    });
+    }, metrics ? state0Contracts(this.config.statePath) : []);
   }
 
   private orderView(o: StoredOrder) {
@@ -559,6 +611,34 @@ export class ReplayExchange {
       const e = end ? Date.parse(end) : Infinity;
       return state.orders.filter((o) => o.placedAt >= s && o.placedAt <= e).map((o) => this.orderView(o));
     });
+  }
+
+  /**
+   * Fills in a window with their round-trip metrics (extra fields: `roundTripId` on every fill,
+   * `exitReason` on a fill that reduced the position, `roundTrip` on the fill that ended one), and
+   * the round trips that ended in the window. Round trips are built from the whole run, so one that
+   * began before the window is complete.
+   */
+  tradeReport(accountId: number, start: string, end?: string | null): { trades: TradeWithMetrics[]; roundTrips: RoundTrip[] } {
+    return this.tx((state, now) => {
+      this.assertAccount(state, accountId);
+      const s = Date.parse(start);
+      const e = end ? Date.parse(end) : Infinity;
+      const inWindow = (iso: string) => {
+        const ts = Date.parse(iso);
+        return ts >= s && ts <= e;
+      };
+      const { closed, fills } = this.roundTripsOf(state, now);
+      const ended = new Map(closed.map((r) => [r.exitFillId, r]));
+      const trades = state.trades
+        .filter((t) => inWindow(t.creationTimestamp))
+        .map((t) => {
+          const f = fills.get(t.id);
+          const trip = ended.get(t.id);
+          return { ...t, ...(f ? { roundTripId: f.roundTripId } : {}), ...(f?.exitReason ? { exitReason: f.exitReason } : {}), ...(trip ? { roundTrip: trip } : {}) };
+        });
+      return { trades, roundTrips: closed.filter((r) => inWindow(r.exitTime as string)) };
+    }, state0Contracts(this.config.statePath));
   }
 
   trades(accountId: number, start: string, end?: string | null): Trade[] {
@@ -740,6 +820,7 @@ export class ReplayExchange {
     const book = this.book(state, contractId);
     const o = book.orders.find((x) => x.id === orderId && x.status === STATUS.open);
     if (last === null || !o) return;
+    (o as StoredOrder).endOfWindow = true;
     const fs = this.spec(c);
     fillOrder(book, o, onTick(last, c.tickSize), this.cutoff(now), fs, this.ids(state), this.hooks(state, contractId));
     this.adopt(state, book, contractId);
@@ -816,6 +897,7 @@ export class ReplayExchange {
         filledPrice: null,
         customTag: req.customTag,
       };
+      if (stopPrice !== null) order.stopAt = [[t, stopPrice]];
       state.orders.push(order);
       if (ended) this.fillAtEnd(state, req.contractId, c, s, now, order.id);
       else if (req.type === ORDER_TYPES.market) this.fillNowIfDue(state, req.contractId, c, s, next.index, now, order.id);
@@ -849,6 +931,10 @@ export class ReplayExchange {
       // A modify takes effect at once, as at a live broker: the bar in progress (not yet settled)
       // is checked on the new terms, so a resting order is never skipped for a bar, and a smaller
       // order can't fill at its old size beside a replacement.
+      if (typeof patch.stopPrice === "number" && o.stopPrice !== null) {
+        o.stopAt ??= [[o.placedAt, o.stopPrice]];
+        o.stopAt.push([now.getTime(), patch.stopPrice]);
+      }
       Object.assign(o, patch, { updatedAt: now.getTime() });
       return OK;
     });

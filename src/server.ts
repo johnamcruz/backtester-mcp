@@ -13,7 +13,7 @@ import {
   decorateTrade,
 } from "./enums.js";
 import { JOURNAL_KINDS, Journal } from "./journal.js";
-import { summarizeTrades } from "./performance.js";
+import { summarizeRoundTrips, summarizeTrades } from "./performance.js";
 import {
   RiskError,
   assertDailyLoss,
@@ -101,6 +101,8 @@ export function createServer(deps: Deps): McpServer {
   const write = { readOnlyHint: false, destructiveHint: true, openWorldHint: false } as const;
 
   const openPositions = async (acct: number) => client.positions(acct).map(decoratePosition);
+  /** Open positions with their round trip so far (extra field `roundTrip`: MAE/MFE, bars held, initial risk). */
+  const positionsWithMetrics = async (acct: number) => client.positions(acct, true).map(decoratePosition);
   const openOrders = async (acct: number) => client.openOrders(acct).map(decorateOrder);
   const trades = async (acct: number, start: string, end?: string) => client.trades(acct, start, end);
   const dayStart = () => tradingDayStart(client.now()).toISOString();
@@ -204,7 +206,7 @@ export function createServer(deps: Deps): McpServer {
     },
     handler(async ({ accountId: acct }: { accountId: number }) => {
       const start = dayStart();
-      const [accounts, positions, orders, today] = await Promise.all([client.accounts(), openPositions(acct), openOrders(acct), trades(acct, start)]);
+      const [accounts, positions, orders, today] = await Promise.all([client.accounts(), positionsWithMetrics(acct), openOrders(acct), trades(acct, start)]);
       const realized = realizedNet(today);
       return {
         account: accounts.find((a) => a.id === acct) ?? null,
@@ -342,11 +344,12 @@ export function createServer(deps: Deps): McpServer {
     "list_open_positions",
     {
       title: "Open positions",
-      description: "Open positions on an account. direction is long/short; averagePrice is the entry.",
+      description:
+        "Open positions on an account. direction is long/short; averagePrice is the entry. roundTrip (extra) is the trade so far: MAE/MFE in points, ticks, $ and R over the closed bars, bars held, initial stop and risk.",
       inputSchema: { accountId },
       annotations: read,
     },
-    handler(async ({ accountId: acct }: { accountId: number }) => openPositions(acct)),
+    handler(async ({ accountId: acct }: { accountId: number }) => positionsWithMetrics(acct)),
   );
 
   server.registerTool(
@@ -354,12 +357,12 @@ export function createServer(deps: Deps): McpServer {
     {
       title: "Fill history",
       description:
-        "Fills in a time window. profitAndLoss is null on the opening half of a round turn (halfTurn=true) and set on the closing fill. Defaults to the current trading day.",
+        "Fills in a time window. profitAndLoss is null on the opening half of a round turn (halfTurn=true) and set on the closing fill. Defaults to the current trading day. Extra fields: roundTripId (the round trip the fill belongs to), exitReason on a reducing fill (partial, stop, trail, target, close, end), and roundTrip on the fill that ended a round trip (entry/exit, MAE/MFE in points, ticks, $ and R, bars held, gross/fees/net, R).",
       inputSchema: { accountId, startTimestamp: isoTime.optional(), endTimestamp: isoTime.optional() },
       annotations: read,
     },
     handler(async (a: { accountId: number; startTimestamp?: string; endTimestamp?: string }) =>
-      (await trades(a.accountId, a.startTimestamp ?? dayStart(), a.endTimestamp)).map((t) => decorateTrade(t as unknown as Record<string, unknown>)),
+      client.tradeReport(a.accountId, a.startTimestamp ?? dayStart(), a.endTimestamp).trades.map((t) => decorateTrade(t as unknown as Record<string, unknown>)),
     ),
   );
 
@@ -368,13 +371,14 @@ export function createServer(deps: Deps): McpServer {
     {
       title: "Performance statistics",
       description:
-        "Win rate, net P&L after fees, average win/loss, profit factor, expectancy, overall and per contract, for a time window (default: current trading day). Use it to grade your own trading.",
+        "Win rate, net P&L after fees, average win/loss, profit factor, expectancy, overall and per contract, for a time window (default: current trading day). roundTrips (extra) grades whole trades ending in the window: win rate, average win/loss and expectancy in $ and R, profit factor, max drawdown, MAE/MFE of winners vs losers, bars held. Use it to grade your own trading.",
       inputSchema: { accountId, startTimestamp: isoTime.optional(), endTimestamp: isoTime.optional() },
       annotations: read,
     },
     handler(async (a: { accountId: number; startTimestamp?: string; endTimestamp?: string }) => {
       const start = a.startTimestamp ?? dayStart();
-      return { window: { start, end: a.endTimestamp ?? "now" }, ...summarizeTrades(await trades(a.accountId, start, a.endTimestamp)) };
+      const report = client.tradeReport(a.accountId, start, a.endTimestamp);
+      return { window: { start, end: a.endTimestamp ?? "now" }, ...summarizeTrades(report.trades), roundTrips: summarizeRoundTrips(report.roundTrips) };
     }),
   );
 

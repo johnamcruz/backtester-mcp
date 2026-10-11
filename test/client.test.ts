@@ -221,6 +221,21 @@ describe("after BACKTESTER_END", () => {
   });
 });
 
+describe("round trips through the exchange", () => {
+  it("a close after BACKTESTER_END ends the round trip with reason end", async () => {
+    const { exchange, setNow } = await setup({ env: { BACKTESTER_END: iso(T0 + 10 * MIN) } });
+    exchange.place(req({ stopLossBracket: { ticks: 20, type: 4 } }));
+    setNow(T0 + 20 * MIN);
+    expect(exchange.close(1, "BT.MNQ", null)).toMatchObject({ success: true });
+    const report = exchange.tradeReport(1, iso(T0));
+    // Flat at 20000: the market buy filled at 20000.25, the end fill at the last close 20000 (-1 tick). Bars T0..T0+9 held whole.
+    expect(report.trades.at(-1)?.roundTrip).toMatchObject({ reason: "end", exitPrice: 20000, barsHeld: 10, gross: -0.5, r: -0.05 });
+    expect(report.roundTrips).toHaveLength(1);
+    expect(exchange.tradeReport(1, iso(T0), iso(T0 + 5 * MIN)).roundTrips).toEqual([]);
+    expect(exchange.positions(1, true)).toEqual([]);
+  });
+});
+
 describe("no bar left before BACKTESTER_END", () => {
   // Data ends at T0+9 (the last bar closes at T0+10); END is an hour later.
   it("flattens at the last close at or before the clock", async () => {

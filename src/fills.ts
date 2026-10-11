@@ -4,8 +4,8 @@
  * exchange (client.ts) feeds it bars in time order.
  *
  * Ported from the futures-trading-harness simulated broker,
- * scripts/lib/backtest/sim-broker.js (`createSimBroker`; harness branch
- * feat/sim-broker, PR #23, extracted from scripts/lib/backtest/engine.js),
+ * scripts/lib/backtest/sim-broker.js (`createSimBroker`, on the harness's main;
+ * the fill model its backtester scripts/lib/backtest/engine.js drives),
  * cited by function as sim-broker.js#<function>, so a replay through this
  * server fills the way a backtest does:
  *
