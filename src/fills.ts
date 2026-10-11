@@ -3,24 +3,27 @@
  * net position) and one 1-minute bar at a time. No I/O and no clock: the
  * exchange (client.ts) feeds it bars in time order.
  *
- * Ported from the futures-trading-harness backtester,
- * scripts/lib/backtest/engine.js (cited as engine.js:<line>), so a replay
- * through this server fills the way a backtest does:
+ * Ported from the futures-trading-harness simulated broker,
+ * scripts/lib/backtest/sim-broker.js (`createSimBroker`; harness branch
+ * feat/sim-broker, PR #23, extracted from scripts/lib/backtest/engine.js),
+ * cited by function as sim-broker.js#<function>, so a replay through this
+ * server fills the way a backtest does:
  *
  *   - market orders fill at the next 1-minute bar's open plus slippage
- *     (engine.js:312), in the order's direction;
+ *     (sim-broker.js#fillAtOpen), in the order's direction;
  *   - stops fill at the stop price less slippage, or at the bar's open when
- *     the bar gapped through it (engine.js:334, 337);
+ *     the bar gapped through it (sim-broker.js#onBar);
  *   - limits (targets) fill at the limit price, or at a better open
- *     (engine.js:335, 354), without slippage;
+ *     (sim-broker.js#onBar), without slippage;
  *   - a bar that touches both a stop and a limit fills the stop first
- *     (engine.js:351-354: "a bar touching both is a loss");
+ *     (sim-broker.js#onBar: "a bar reaching both stop and target is a loss");
  *   - bracket legs sit a number of ticks from the entry's fill price,
- *     slippage included (engine.js:313-314), and are checked on the fill bar
- *     itself (engine.js:332: the fill bar is past the signal bar);
- *   - P&L is ticks x tick value x size, ticks rounded to 1e-6 (engine.js:210-211);
- *     fees are per side per contract (engine.js:212 charges both sides at
- *     the close; here each fill carries its own side).
+ *     slippage included (sim-broker.js#fillAtOpen: the stop keeps the order's
+ *     distance from the fill), and are checked on the fill bar itself;
+ *   - P&L is ticks x tick value x size, ticks rounded to 1e-6, fees per side
+ *     per contract (sim-broker.js#exit charges both sides at the close; here
+ *     each fill carries its own side);
+ *   - prices on the tick grid without float noise (sim-broker.js#onTick).
  *
  * Trailing (scripts/lib/trading/trail.js) is not ported: the harness runner
  * trails its stops with modify_order. A broker-side `trailing_stop` order is
@@ -73,6 +76,12 @@ export interface SimOrder {
    * the next bar), so a resting order is never skipped for a bar.
    */
   prior?: { from: number; limitPrice: number | null; stopPrice: number | null; size: number; trailDistance: number | null } | null;
+  /**
+   * When the client cancelled it inside a bar: like a modify, the bar in
+   * progress still settles on the terms it opened with (too late to cancel),
+   * so the order can still fill on that bar.
+   */
+  cancelledAt?: number | null;
 }
 
 export interface SimPosition {
@@ -121,7 +130,7 @@ export interface BarOHLC {
 
 const round2 = (x: number) => Math.round(x * 100) / 100 + 0; // + 0: no -0
 
-/** A price on the tick grid, free of float noise. engine.js:102 */
+/** A price on the tick grid, free of float noise. sim-broker.js#onTick */
 export const onTick = (x: number, tick: number) => Math.round(Math.round(x / tick) * tick * 1e9) / 1e9;
 
 export const isOnTick = (x: number, tick: number) => Math.abs(x / tick - Math.round(x / tick)) < 1e-6;
@@ -133,28 +142,28 @@ export const isStopType = (type: number) => type === ORDER_TYPES.stop || type ==
 export const isLimitType = (type: number) =>
   type === ORDER_TYPES.limit || type === ORDER_TYPES.join_bid || type === ORDER_TYPES.join_ask;
 
-/** Market fill: the bar's open plus slippage in the order's direction. engine.js:312 */
+/** Market fill: the bar's open plus slippage in the order's direction. sim-broker.js#fillAtOpen */
 export function marketFillPrice(open: number, side: Side, spec: FillSpec): number {
   return onTick(open + sideSign(side) * spec.slippageTicks * spec.tickSize, spec.tickSize);
 }
 
-/** A buy stop triggers when the high reaches it; a sell stop when the low does. engine.js:334 */
+/** A buy stop triggers when the high reaches it; a sell stop when the low does. sim-broker.js#onBar */
 export function stopTriggered(bar: BarOHLC, side: Side, stop: number): boolean {
   return side === 0 ? bar.h >= stop : bar.l <= stop;
 }
 
-/** Stop fill: the stop, or the open when the bar gapped through it, less slippage. engine.js:337 */
+/** Stop fill: the stop, or the open when the bar gapped through it, less slippage. sim-broker.js#onBar */
 export function stopFillPrice(bar: BarOHLC, side: Side, stop: number, spec: FillSpec): number {
   const base = side === 0 ? Math.max(bar.o, stop) : Math.min(bar.o, stop);
   return onTick(base + sideSign(side) * spec.slippageTicks * spec.tickSize, spec.tickSize);
 }
 
-/** A buy limit fills when the low reaches it; a sell limit when the high does. engine.js:335 */
+/** A buy limit fills when the low reaches it; a sell limit when the high does. sim-broker.js#onBar */
 export function limitTriggered(bar: BarOHLC, side: Side, limit: number): boolean {
   return side === 0 ? bar.l <= limit : bar.h >= limit;
 }
 
-/** Limit fill: the limit, or a better open. No slippage. engine.js:354 */
+/** Limit fill: the limit, or a better open. No slippage. sim-broker.js#onBar */
 export function limitFillPrice(bar: BarOHLC, side: Side, limit: number): number {
   return side === 0 ? Math.min(bar.o, limit) : Math.max(bar.o, limit);
 }
@@ -167,21 +176,21 @@ export function triggers(o: SimOrder, bar: BarOHLC): boolean {
 
 /**
  * Bracket leg prices from the entry fill (slippage included), `ticks` away:
- * the stop loss against the position, the take profit with it. engine.js:313-314
+ * the stop loss against the position, the take profit with it. sim-broker.js#fillAtOpen
  */
 export function bracketPrice(fill: number, entrySide: Side, ticks: number, leg: "sl" | "tp", tick: number): number {
   const dir = sideSign(entrySide) * (leg === "sl" ? -1 : 1);
   return onTick(fill + dir * Math.abs(ticks) * tick, tick);
 }
 
-/** Realized P&L of closing `size` contracts of a position at `price`. engine.js:210-211 */
+/** Realized P&L of closing `size` contracts of a position at `price`. sim-broker.js#exit */
 export function closePnl(net: number, averagePrice: number, price: number, size: number, spec: FillSpec): number {
   const sign = net > 0 ? 1 : -1;
   const ticks = Math.round(((sign * (price - averagePrice)) / spec.tickSize) * 1e6) / 1e6;
   return round2(ticks * spec.tickValue * size);
 }
 
-/** Fees of one fill: per side per contract. engine.js:212 (2 sides x fee x size per round turn) */
+/** Fees of one fill: per side per contract. sim-broker.js#exit (2 sides x fee x size per round turn) */
 export const feesFor = (size: number, spec: FillSpec) => round2(size * spec.feePerSide);
 
 /**
@@ -231,7 +240,8 @@ function newLeg(parent: SimOrder, leg: "sl" | "tp", spec: BracketSpec, fill: num
   };
 }
 
-const cancel = (o: SimOrder, time: number) => Object.assign(o, { status: STATUS.cancelled, updatedAt: time });
+// The engine's own cancels (OCO, flat) take effect at once: no grace for the bar in progress.
+const cancel = (o: SimOrder, time: number) => Object.assign(o, { status: STATUS.cancelled, updatedAt: time, cancelledAt: null });
 
 /**
  * Fill an order (whole size; a bracket leg only as far as it reduces the
@@ -273,7 +283,7 @@ export function fillOrder(book: Book, o: SimOrder, price: number, time: number, 
 
 /**
  * The bar's open: market orders placed at or before it fill at the open plus
- * slippage (engine.js:309-312). Their bracket legs are live from this bar on.
+ * slippage (sim-broker.js#fillAtOpen). Their bracket legs are live from this bar on.
  */
 export function openBar(book: Book, bar: BarOHLC, spec: FillSpec, ids: Ids): SimFill[] {
   const fills: SimFill[] = [];
@@ -288,12 +298,12 @@ export function openBar(book: Book, bar: BarOHLC, spec: FillSpec, ids: Ids): Sim
 
 /** Fill price of a triggered resting order on the bar. */
 export function restingFillPrice(o: SimOrder, bar: BarOHLC, spec: FillSpec): number {
-  return isStopType(o.type) ? stopFillPrice(bar, o.side, o.stopPrice as number, spec) : limitFillPrice(bar, o.side, o.limitPrice as number);
+  return isStopType(o.type) ? stopFillPrice(bar, o.side, o.stopPrice as number, spec) : onTick(limitFillPrice(bar, o.side, o.limitPrice as number), spec.tickSize);
 }
 
 /**
  * The bar's range, once it has closed: every resting order live on this bar
- * that its high/low reached fills, stops before limits (engine.js:351-354),
+ * that its high/low reached fills, stops before limits (sim-broker.js#onBar),
  * then by order id. A stop-loss leg created by a fill inside the bar is
  * checked against the same bar too (pessimistic: the stop is assumed hit
  * after the entry), at its own price less slippage, since the gap rule needs
@@ -304,12 +314,12 @@ export function closeBar(book: Book, bar: BarOHLC, spec: FillSpec, ids: Ids): Si
   const end = bar.t + MINUTE;
   const fills: SimFill[] = [];
   const hit = book.orders
-    .filter((o) => o.status === STATUS.open && o.type !== ORDER_TYPES.market)
+    .filter((o) => o.type !== ORDER_TYPES.market && (o.status === STATUS.open || cancelledDuring(o, bar)))
     .map((o) => ({ o, terms: termsOn(o, bar) }))
     .filter((x): x is { o: SimOrder; terms: SimOrder } => x.terms !== null && triggers(x.terms, bar))
     .sort((a, b) => Number(isStopType(b.o.type)) - Number(isStopType(a.o.type)) || a.o.id - b.o.id);
   for (const { o, terms } of hit) {
-    if (o.status !== STATUS.open) continue;
+    if (o.status !== STATUS.open && !cancelledDuring(o, bar)) continue;
     if (terms !== o) Object.assign(o, { size: terms.size }); // a size changed inside the bar applies from the next bar
     const { fill, legs } = fillOrder(book, o, restingFillPrice(terms, bar, spec), end, spec, ids);
     if (fill) fills.push(fill);
@@ -329,6 +339,11 @@ export function closeBar(book: Book, bar: BarOHLC, spec: FillSpec, ids: Ids): Si
  * at or before the bar's open), the terms it had when the bar opened if it
  * was modified inside the bar, else none (placed inside the bar: from the next one).
  */
+/** Cancelled by the client inside this bar: the bar still settles on its terms. */
+export function cancelledDuring(o: SimOrder, bar: BarOHLC): boolean {
+  return o.status === STATUS.cancelled && o.cancelledAt != null && bar.t < o.cancelledAt && o.cancelledAt < bar.t + MINUTE;
+}
+
 export function termsOn(o: SimOrder, bar: BarOHLC): SimOrder | null {
   if (o.activeFrom <= bar.t) return o;
   if (o.prior && o.prior.from <= bar.t) return { ...o, ...o.prior };

@@ -44,14 +44,14 @@ function order(p: Partial<SimOrder>): SimOrder {
 
 const emptyBook = (orders: SimOrder[] = []): Book => ({ orders, position: { id: null, net: 0, averagePrice: 0, openedAt: null } });
 
-describe("price rules (engine.js)", () => {
-  it("market: next bar's open plus slippage in the order's direction (engine.js:312)", () => {
+describe("price rules (sim-broker.js)", () => {
+  it("market: next bar's open plus slippage in the order's direction (fillAtOpen)", () => {
     expect(marketFillPrice(20000, 0, MNQ)).toBe(20000.25);
     expect(marketFillPrice(20000, 1, MNQ)).toBe(19999.75);
     expect(marketFillPrice(20000, 0, { ...MNQ, slippageTicks: 0 })).toBe(20000);
   });
 
-  it("stop: the stop less slippage, or the open when the bar gapped through (engine.js:334, 337)", () => {
+  it("stop: the stop less slippage, or the open when the bar gapped through (onBar)", () => {
     expect(stopTriggered(bar(100, 101, 98.75, 99), 1, 99)).toBe(true);
     expect(stopTriggered(bar(100, 101, 99.25, 99.5), 1, 99)).toBe(false);
     expect(stopFillPrice(bar(100, 101, 98, 99), 1, 99, MNQ)).toBe(98.75);
@@ -61,7 +61,7 @@ describe("price rules (engine.js)", () => {
     expect(stopFillPrice(bar(103, 104, 102, 103), 0, 101, MNQ)).toBe(103.25); // gap up through a buy stop
   });
 
-  it("limit: the limit or a better open, no slippage (engine.js:335, 354)", () => {
+  it("limit: the limit or a better open, no slippage (onBar)", () => {
     expect(limitTriggered(bar(100, 101, 99, 100), 1, 101)).toBe(true);
     expect(limitTriggered(bar(100, 100.75, 99, 100), 1, 101)).toBe(false);
     expect(limitFillPrice(bar(100, 101, 99, 100), 1, 101)).toBe(101);
@@ -70,14 +70,14 @@ describe("price rules (engine.js)", () => {
     expect(limitFillPrice(bar(98, 99, 97, 98), 0, 99)).toBe(98);
   });
 
-  it("brackets sit ticks from the fill, slippage included (engine.js:313-314)", () => {
+  it("brackets sit ticks from the fill, slippage included (fillAtOpen)", () => {
     expect(bracketPrice(20000.25, 0, 20, "sl", 0.25)).toBe(19995.25);
     expect(bracketPrice(20000.25, 0, 40, "tp", 0.25)).toBe(20010.25);
     expect(bracketPrice(19999.75, 1, 20, "sl", 0.25)).toBe(20004.75);
     expect(bracketPrice(19999.75, 1, -40, "tp", 0.25)).toBe(19989.75); // signed ticks read as a distance
   });
 
-  it("P&L in ticks x tick value x size; fees per side per contract (engine.js:210-212)", () => {
+  it("P&L in ticks x tick value x size; fees per side per contract (exit)", () => {
     expect(closePnl(1, 20000.25, 20010.25, 1, MNQ)).toBe(20); // 40 ticks x $0.50
     expect(closePnl(-2, 20000, 20005, 2, MNQ)).toBe(-20); // short 2, 20 ticks against: 2 x 20 x $0.50
     expect(closePnl(1, 2045.1, 2044.9, 1, { ...MNQ, tickSize: 0.1, tickValue: 1 })).toBe(-2); // MGC, no float noise
@@ -112,7 +112,7 @@ describe("bars", () => {
     expect(openBar(book, bar(101, 101, 101, 101, T + M), MNQ, ids())[0]).toMatchObject({ orderId: 2, price: 101.25, time: T + M });
   });
 
-  it("checks a market entry's bracket on its fill bar; a bar touching both fills the stop (engine.js:332, 351-354)", () => {
+  it("checks a market entry's bracket on its fill bar; a bar touching both fills the stop (onBar)", () => {
     const entry = order({ stopLossBracket: { ticks: 8, type: 4 }, takeProfitBracket: { ticks: 8, type: 1 } });
     const book = emptyBook([entry]);
     const i = ids();

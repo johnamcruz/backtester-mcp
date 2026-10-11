@@ -16,6 +16,7 @@ describe("CSV", () => {
     const s = parseCsv(csv([[T0, 1, 2, 0.5, 1.5, 7], [T0, 9, 9, 9, 9], [T0 + MIN, 2, 3, 1, 2.5]]));
     expect(s.length).toBe(2);
     expect(s.bar(0)).toEqual({ t: T0, o: 1, h: 2, l: 0.5, c: 1.5, v: 7 });
+    expect(parseCsv("datetime,open,high,low,close,volume\n2024-03-05 15:00:00+00:00,2158.3000000000006,2158.4,2158.2,2158.3,1\n").o[0]).toBe(2158.3);
     expect(() => parseCsv("time,o,h,l,c,v\n")).toThrow(/header/);
     expect(() => parseCsv(csv([[T0 + MIN, 1, 1, 1, 1], [T0, 1, 1, 1, 1]]))).toThrow(/oldest first/);
     expect(() => parseCsv("datetime,open,high,low,close,volume\n2024-03-05 15:00:00+00:00,1,x,1,1,1\n")).toThrow(/bad number/);

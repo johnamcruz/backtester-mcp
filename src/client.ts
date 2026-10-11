@@ -12,6 +12,8 @@ import {
   isOnTick,
   isStopType,
   marketFillPrice,
+  onTick,
+  sideSign,
   openBar,
   type BracketSpec,
   type Book,
@@ -158,6 +160,16 @@ interface State {
   orders: StoredOrder[];
   positions: Record<string, SimPosition>;
   trades: Trade[];
+  /** The fill and account settings the run was created with; every process on the run must match them. */
+  settings?: RunSettings;
+}
+
+interface RunSettings {
+  accountId: number;
+  startBalance: number;
+  slippageTicks: number;
+  feesMicro: number;
+  feesMini: number;
 }
 
 export interface PlaceRequest {
@@ -250,6 +262,7 @@ export class ReplayExchange {
       orders: [],
       positions: {},
       trades: [],
+      settings: this.settings(),
     };
   }
 
@@ -300,12 +313,52 @@ export class ReplayExchange {
   }
 
   /** Lock the run, sync it to the clock, run `fn`, save. */
-  private tx<T>(fn: (state: State, now: Date) => T): T {
+  private settings(): RunSettings {
+    const c = this.config;
+    return { accountId: c.accountId, startBalance: c.startBalance, slippageTicks: c.slippageTicks, feesMicro: c.feesMicro, feesMini: c.feesMini };
+  }
+
+  /** Every process on a run fills the same way: refuse one whose settings differ from the run's. */
+  private checkSettings(state: State): void {
+    const mine = this.settings();
+    state.settings ??= mine;
+    const diff = (Object.keys(mine) as Array<keyof RunSettings>).filter((k) => state.settings?.[k] !== mine[k]);
+    if (diff.length) {
+      throw new ReplayError(
+        `This process's settings differ from run ${this.config.runId}'s (${diff.map((k) => `${k} ${mine[k]} vs ${state.settings?.[k]}`).join(", ")}). ` +
+          "Use the run's settings, or a new BACKTESTER_RUN_ID.",
+      );
+    }
+  }
+
+  /**
+   * Load the data files this call may need before taking the lock (bars never change), so a
+   * large CSV loading inside the lock can't make other processes judge it stale.
+   */
+  private preload(contractIds: string[]): void {
+    const roots = new Set<string>();
+    const add = (id: string) => {
+      const c = specOf(id);
+      if (c) roots.add(c.dataRoot);
+    };
+    contractIds.forEach(add);
+    try {
+      const st = JSON.parse(readFileSync(this.config.statePath, "utf8")) as State;
+      for (const o of st.orders ?? []) if (o.status === STATUS.open || o.cancelledAt != null) add(o.contractId);
+    } catch {
+      /* no state yet, or mid-write: the locked read decides */
+    }
+    for (const r of roots) if (this.store.has(r)) this.store.get(r);
+  }
+
+  private tx<T>(fn: (state: State, now: Date) => T, contractIds: string[] = []): T {
+    this.preload(contractIds);
     const unlock = this.lock();
     try {
       // Read the clock under the lock: another process may have synced to a newer clock while this one waited.
       const now = this.clock();
       const state = this.load();
+      this.checkSettings(state);
       this.sync(state, now);
       const out = fn(state, now);
       this.save(state);
@@ -368,8 +421,9 @@ export class ReplayExchange {
       );
     }
     const from = state.syncedTo;
-    const contracts = [...new Set(state.orders.filter((o) => o.status === STATUS.open).map((o) => o.contractId))].sort();
-    const pending: Array<{ contractId: string; fill: SimFill }> = [];
+    const pending = (o: SimOrder) => o.status === STATUS.open || (o.cancelledAt != null && o.cancelledAt > from - MINUTE);
+    const contracts = [...new Set(state.orders.filter(pending).map((o) => o.contractId))].sort();
+    const found: Array<{ contractId: string; fill: SimFill }> = [];
     for (const contractId of contracts) {
       const c = specOf(contractId);
       if (!c || !this.store.has(c.dataRoot)) continue;
@@ -382,14 +436,14 @@ export class ReplayExchange {
         const fills: SimFill[] = [];
         if (bar.t > from) fills.push(...openBar(book, bar, fs, ids));
         if (bar.t + MINUTE <= cutoff) fills.push(...closeBar(book, bar, fs, ids));
-        for (const fill of fills) pending.push({ contractId, fill });
-        if (!book.orders.some((o) => o.status === STATUS.open)) break;
+        for (const fill of fills) found.push({ contractId, fill });
+        if (!book.orders.some((o) => o.status === STATUS.open || (o.cancelledAt != null && o.cancelledAt > bar.t + MINUTE))) break;
       }
       this.adopt(state, book, contractId);
     }
     // Fills of all contracts in time order (then order id), so trade ids follow the replay.
-    pending.sort((a, b) => a.fill.time - b.fill.time || a.fill.orderId - b.fill.orderId);
-    for (const p of pending) this.record(state, p.contractId, [p.fill]);
+    found.sort((a, b) => a.fill.time - b.fill.time || a.fill.orderId - b.fill.orderId);
+    for (const p of found) this.record(state, p.contractId, [p.fill]);
     state.syncedTo = cutoff;
   }
 
@@ -551,7 +605,7 @@ export class ReplayExchange {
         cutoff,
         partial: req.includePartialBar,
       });
-    });
+    }, [req.contractId]);
   }
 
   /** The last closed 1-minute bar as a quote; null when the newest closed bar is over 15 minutes old (market closed). */
@@ -593,7 +647,7 @@ export class ReplayExchange {
           timestamp: iso(closedAt),
         },
       };
-    });
+    }, [contractId]);
   }
 
   // ── Orders ───────────────────────────────────────────────────────
@@ -625,6 +679,26 @@ export class ReplayExchange {
     if (fill) this.record(state, contractId, [fill]);
   }
 
+  /** The clock has reached BACKTESTER_END: no more bars will be processed. */
+  private ended(now: Date): boolean {
+    return this.config.end !== null && now.getTime() >= this.config.end;
+  }
+
+  /**
+   * After the window: fill at the last close at or before BACKTESTER_END, without slippage, as the
+   * harness backtester settles a trade still open at the end of its data (reason "end").
+   */
+  private fillAtEnd(state: State, contractId: string, c: ContractSpec, s: BarSeries, now: Date, orderId: number): void {
+    const last = this.lastClose(s, now);
+    const book = this.book(state, contractId);
+    const o = book.orders.find((x) => x.id === orderId && x.status === STATUS.open);
+    if (last === null || !o) return;
+    const fs = this.spec(c);
+    const { fill } = fillOrder(book, o, onTick(last, c.tickSize), this.cutoff(now), fs, this.ids(state));
+    this.adopt(state, book, contractId);
+    if (fill) this.record(state, contractId, [fill]);
+  }
+
   private lastClose(s: BarSeries, now: Date): number | null {
     const n = s.closedCount(this.cutoff(now));
     return n ? s.c[n - 1] : null;
@@ -638,7 +712,14 @@ export class ReplayExchange {
       if (!c) return no(8, `Contract ${req.contractId} not found.`);
       if (!this.store.has(c.dataRoot)) return no(9, `No data for ${c.root} (${c.dataRoot}_1min.csv) in BACKTESTER_DATA_DIR.`);
       const s = this.store.get(c.dataRoot);
-      const next = this.nextBar(s, now);
+      const ended = this.ended(now);
+      if (ended) {
+        // After BACKTESTER_END only a market order that reduces the position is taken: it fills at the last close.
+        const net = state.positions[req.contractId]?.net ?? 0;
+        const reduces = req.type === ORDER_TYPES.market && net !== 0 && Math.sign(net) !== sideSign(req.side) && req.size <= Math.abs(net);
+        if (!reduces) return no(5, "The replay is over (BACKTESTER_END): only market orders that reduce the position are taken, at the last close.");
+      }
+      const next = ended ? { index: -1 } : this.nextBar(s, now);
       if ("reason" in next) return no(5, `Outside trading hours: ${next.reason}.`);
       if (req.customTag !== null && state.orders.some((o) => o.customTag === req.customTag)) {
         return no(2, `customTag "${req.customTag}" is already used on this account.`);
@@ -690,9 +771,10 @@ export class ReplayExchange {
         customTag: req.customTag,
       };
       state.orders.push(order);
-      if (req.type === ORDER_TYPES.market) this.fillNowIfDue(state, req.contractId, c, s, next.index, now, order.id);
+      if (ended) this.fillAtEnd(state, req.contractId, c, s, now, order.id);
+      else if (req.type === ORDER_TYPES.market) this.fillNowIfDue(state, req.contractId, c, s, next.index, now, order.id);
       return { orderId: order.id, ...OK };
-    });
+    }, [req.contractId]);
   }
 
   modify(req: ModifyRequest): Outcome {
@@ -736,7 +818,11 @@ export class ReplayExchange {
       if (accountId !== state.accountId) return refuse(1, `Account ${accountId} not found.`);
       const o = state.orders.find((x) => x.id === orderId);
       if (!o || o.status !== STATUS.open) return refuse(2, `No working order ${orderId}.`);
-      Object.assign(o, { status: STATUS.cancelled, updatedAt: now.getTime() });
+      // Like a modify: inside a bar, the bar in progress still settles on the order's terms (bars open on whole minutes).
+      const t = now.getTime();
+      const barOpen = Math.floor(t / MINUTE) * MINUTE;
+      const live = o.type !== ORDER_TYPES.market && t !== barOpen && (o.activeFrom <= barOpen || (o.prior != null && o.prior.from <= barOpen));
+      Object.assign(o, { status: STATUS.cancelled, updatedAt: t, cancelledAt: live ? t : null });
       return OK;
     });
   }
@@ -758,7 +844,8 @@ export class ReplayExchange {
         .reduce((n, o) => n + o.size, 0);
       if (waiting + qty > Math.abs(pos.net)) return refuse(7, `A market order closing ${waiting} is already waiting for the next bar.`);
       const s = this.store.get(c.dataRoot);
-      const next = this.nextBar(s, now);
+      const ended = this.ended(now);
+      const next = ended ? { index: -1 } : this.nextBar(s, now);
       if ("reason" in next) return refuse(6, `Order rejected: ${next.reason}.`);
       const t = now.getTime();
       const id = state.nextOrderId++;
@@ -784,9 +871,10 @@ export class ReplayExchange {
         filledPrice: null,
         customTag: null,
       });
-      this.fillNowIfDue(state, contractId, c, s, next.index, now, id);
+      if (ended) this.fillAtEnd(state, contractId, c, s, now, id);
+      else this.fillNowIfDue(state, contractId, c, s, next.index, now, id);
       return OK;
-    });
+    }, [contractId]);
   }
 
   /** Signed net position of a contract (for the guardrails). */

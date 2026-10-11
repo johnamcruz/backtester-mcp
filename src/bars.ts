@@ -88,7 +88,8 @@ export function parseCsv(text: string, source = "csv"): BarSeries {
     for (let j = 1; j < 6; j++) {
       const x = Number(f[j]);
       if (!Number.isFinite(x)) throw new Error(`${source}:${i + 1}: bad number "${f[j]}"`);
-      cols[j][k] = x;
+      // Drop float noise from the source (2158.3000000000006 -> 2158.3).
+      cols[j][k] = Math.round(x * 1e9) / 1e9;
     }
     k++;
   }

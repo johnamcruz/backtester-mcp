@@ -1,8 +1,9 @@
 import { existsSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { BarStore } from "../src/bars.js";
 import { CONTRACTS, ReplayExchange, frontMonthName, specOf, type PlaceRequest } from "../src/client.js";
 import { loadConfig } from "../src/config.js";
-import { MIN, T0, flat, iso, seq, setup, tmp, writeData, type Row } from "./helpers.js";
+import { MIN, T0, defaultData, flat, iso, seq, setup, tmp, writeData, type Row } from "./helpers.js";
 
 const req = (p: Partial<PlaceRequest> = {}): PlaceRequest => ({
   accountId: 1, contractId: "BT.MNQ", type: 2, side: 0, size: 1, limitPrice: null, stopPrice: null, trailPrice: null,
@@ -169,6 +170,26 @@ describe("inside a bar", () => {
     expect(exchange.trades(1, iso(T0)).map((t) => [t.side, t.size, t.price])).toEqual([[0, 1, 20000.25], [1, 1, 19995]]);
   });
 
+  it("a stop cancelled inside a bar still settles that bar; one cancelled on a bar's open does not", async () => {
+    const mid = await setup({ data: data() });
+    mid.exchange.place(req({ size: 1 }));
+    mid.exchange.place(req({ type: 4, side: 1, stopPrice: 19995 }));
+    mid.setNow(T0 + 90000);
+    expect(mid.exchange.cancel(1, 2)).toMatchObject({ success: true });
+    expect(mid.exchange.openOrders(1)).toEqual([]);
+    mid.setNow(T0 + 2 * MIN);
+    expect(mid.exchange.positions(1)).toEqual([]);
+    expect(mid.exchange.searchOrders(1, iso(T0))[1]).toMatchObject({ id: 2, status: 2, filledPrice: 19994.75 });
+    const open = await setup({ data: data() });
+    open.exchange.place(req({ size: 1 }));
+    open.exchange.place(req({ type: 4, side: 1, stopPrice: 19995 }));
+    open.setNow(T0 + MIN);
+    open.exchange.cancel(1, 2);
+    open.setNow(T0 + 2 * MIN);
+    expect(open.exchange.positions(1)).toMatchObject([{ size: 1 }]);
+    expect(open.exchange.searchOrders(1, iso(T0))[1]).toMatchObject({ id: 2, status: 3 });
+  });
+
   it("a size changed inside a bar applies from the next bar", async () => {
     const { exchange, setNow } = await setup({ data: data() });
     exchange.place(req({ size: 2 }));
@@ -188,6 +209,20 @@ describe("inside a bar", () => {
     setNow(T0 + 2 * MIN);
     expect(exchange.positions(1)).toEqual([]);
     expect(exchange.trades(1, iso(T0)).map((t) => [t.orderId, t.price])).toEqual([[1, 20000.25], [2, 19998]]);
+  });
+});
+
+describe("after BACKTESTER_END", () => {
+  it("takes only market orders that reduce the position, at the last close", async () => {
+    const { exchange, setNow } = await setup({ env: { BACKTESTER_END: iso(T0 + 10 * MIN) } });
+    exchange.place(req({ size: 2 }));
+    setNow(T0 + 20 * MIN);
+    expect(exchange.place(req({ side: 0 }))).toMatchObject({ errorCode: 5, errorMessage: expect.stringMatching(/replay is over/) });
+    expect(exchange.place(req({ side: 1, size: 3 }))).toMatchObject({ errorCode: 5 });
+    expect(exchange.place(req({ side: 1, type: 4, stopPrice: 19990 }))).toMatchObject({ errorCode: 5 });
+    expect(exchange.place(req({ side: 1 }))).toMatchObject({ success: true });
+    expect(exchange.close(1, "BT.MNQ", null)).toMatchObject({ success: true });
+    expect(exchange.trades(1, iso(T0)).slice(1).map((t) => [t.side, t.price, t.creationTimestamp])).toEqual([[1, 20000, iso(T0 + 10 * MIN)], [1, 20000, iso(T0 + 10 * MIN)]]);
   });
 });
 
@@ -257,6 +292,29 @@ describe("state", () => {
     const thief = new ReplayExchange(config, { now: () => { writeFileSync(lock, "someone-else"); return new Date(T0); } });
     thief.accounts();
     expect(readFileSync(lock, "utf8")).toBe("someone-else");
+  });
+
+  it("loads data files before taking the lock", async () => {
+    const { config } = await setup();
+    const lock = `${config.statePath}.lock`;
+    const seen: boolean[] = [];
+    class Spy extends BarStore {
+      get(root: string) {
+        seen.push(existsSync(lock));
+        return super.get(root);
+      }
+    }
+    const ex = new ReplayExchange(config, { store: new Spy(config.dataDir) });
+    ex.quote("BT.MNQ");
+    expect(seen[0]).toBe(false);
+  });
+
+  it("refuses a process whose fill settings differ from the run's", async () => {
+    const dir = tmp();
+    const a = await setup({ dir, data: defaultData(), now: T0 });
+    a.exchange.accounts();
+    const b = await setup({ dir, env: { BACKTESTER_SLIPPAGE_TICKS: "2" } });
+    expect(() => b.exchange.accounts()).toThrow(/slippageTicks 2 vs 1/);
   });
 
   it("removes a stale lock and reports an unreadable state file", async () => {

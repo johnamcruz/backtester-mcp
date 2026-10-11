@@ -247,11 +247,11 @@ describe("place_order", () => {
     expect((await m.call("modify_order", { accountId: 1, orderId: 2, size: 1 })).data.success).toBe(true);
   });
 
-  it("counts the part of a stop against the position that would reverse it", async () => {
+  it("counts a stop against the position that would reverse it", async () => {
     const { call } = await setup({ env: { BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "3" } });
     await call("place_order", { ...order, side: "sell" }); // short 1
     expect((await call("place_order", { ...order, type: "stop", stopPrice: 20010, size: 3 })).data.success).toBe(true); // projected +2
-    expect((await call("place_order", { ...order, type: "limit", limitPrice: 19990, size: 2 })).text).toMatch(/net position to 3/); // -1 + 2 (stop beyond the short) + 2
+    expect((await call("place_order", { ...order, type: "limit", limitPrice: 19990, size: 2 })).text).toMatch(/net position to 4/); // -1 + 3 (the stop) + 2
   });
 
   it("lets a protective order grow to cover the position after the daily loss limit", async () => {
@@ -274,12 +274,43 @@ describe("place_order", () => {
     expect((await call("modify_order", { accountId: 1, orderId: 2, size: 2 })).text).toMatch(/net position to 3/);
   });
 
+  it("counts every stop against the position: no stacking stops past the limit", async () => {
+    const { call } = await setup({ env: { BACKTESTER_MAX_POSITION_SIZE: "1", BACKTESTER_MAX_DAILY_LOSS: "0" } });
+    await call("place_order", order); // long 1
+    const stop = { ...order, side: "sell", type: "stop", stopPrice: 19990 };
+    expect((await call("place_order", stop)).data.success).toBe(true); // projected 0
+    expect((await call("place_order", stop)).data.success).toBe(true); // projected -1: no further from flat
+    expect((await call("place_order", stop)).text).toMatch(/net position to -2/);
+  });
+
+  it("always allows a stop and a target protecting a position within the limit", async () => {
+    const { call } = await setup({ env: { BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2" } });
+    await call("place_order", { ...order, size: 2 });
+    expect((await call("place_order", { ...order, side: "sell", type: "limit", limitPrice: 20010, size: 2 })).data.success).toBe(true);
+    expect((await call("place_order", { ...order, side: "sell", type: "stop", stopPrice: 19990, size: 2 })).data.success).toBe(true);
+  });
+
+  it("never refuses a protective stop while an exit market order waits, even past the daily loss limit", async () => {
+    const data = { NQ: [...flat(T0 - 10 * MIN, 12, 20000), ...flat(T0 + 2 * MIN, 10, 19999)] };
+    const { call, setNow } = await setup({ data, env: { BACKTESTER_MAX_POSITION_SIZE: "1", BACKTESTER_MAX_DAILY_LOSS: "1" } });
+    await call("place_order", order); // long 1 MNQ
+    await call("place_order", { ...order, contractId: "BT.NQ" });
+    setNow(T0 + 2 * MIN);
+    await call("close_position", { accountId: 1, contractId: "BT.NQ" }); // realizes a loss past the limit
+    setNow(T0 + 2 * MIN + 30000);
+    expect((await call("place_order", { ...order, side: "sell", type: "limit", limitPrice: 20010 })).data.success).toBe(true);
+    expect((await call("place_order", { ...order, side: "sell" })).data.success).toBe(true); // waits for the next bar
+    expect((await call("place_order", { ...order, side: "sell", type: "stop", stopPrice: 19990 })).data.success).toBe(true);
+    expect((await call("place_order", { ...order, side: "buy" })).text).toMatch(/Daily loss limit reached/);
+  });
+
   it("refuses orders outside the replay window", async () => {
     const before = await setup({ env: { BACKTESTER_START: iso(T0 + MIN) } });
     expect((await before.call("place_order", order)).text).toMatch(/Blocked by risk guardrail: .*before BACKTESTER_START/);
     const after = await setup({ env: { BACKTESTER_END: iso(T0 - MIN) } });
     expect((await after.call("place_order", order)).text).toMatch(/after BACKTESTER_END/);
-    expect((await after.call("cancel_order", { accountId: 1, orderId: 1 })).text).toMatch(/after BACKTESTER_END/);
+    // Cancels are never refused for the window (nothing to cancel here: OrderNotFound, not a guardrail).
+    expect((await after.call("cancel_order", { accountId: 1, orderId: 1 })).data).toMatchObject({ errorName: "OrderNotFound" });
   });
 });
 
