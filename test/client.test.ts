@@ -258,15 +258,37 @@ describe("round trips through the exchange", () => {
     two.setNow(T0 + 3 * MIN);
     expect(two.exchange.tradeReport(1, iso(T0)).roundTrips[0]).toMatchObject({ initialStop: 19995, risk: 5.25, reason: "stop" }); // moved before the entry: not a trail
 
-    // A stop cancelled at T0 just before a market buy at T0: not the trade's stop.
+    // A closer stop cancelled at T0 just before a market buy at T0: not the trade's stop.
     const three = await setup({ now: T0 - 90000, data });
-    three.exchange.place(req({ side: 1, type: 4, stopPrice: 19900 }));
+    three.exchange.place(req({ side: 1, type: 4, stopPrice: 19998 }));
     three.setNow(T0);
     three.exchange.cancel(1, 1);
     three.exchange.place(req());
-    three.exchange.place(req({ side: 1, type: 4, stopPrice: 19995 }));
+    three.exchange.place(req({ side: 1, type: 4, stopPrice: 19990 }));
     three.setNow(T0 + 3 * MIN);
-    expect(three.exchange.tradeReport(1, iso(T0)).roundTrips[0]).toMatchObject({ initialStop: 19995, reason: "stop" });
+    expect(three.exchange.tradeReport(1, iso(T0)).roundTrips[0]).toMatchObject({ initialStop: 19990, reason: "stop" });
+
+    // The same stop cancelled just after the market buy at T0: it was working at the entry, so it is the initial stop.
+    const four = await setup({ now: T0 - 90000, data });
+    four.exchange.place(req({ side: 1, type: 4, stopPrice: 19998 }));
+    four.setNow(T0);
+    four.exchange.place(req());
+    four.exchange.cancel(1, 1);
+    four.exchange.place(req({ side: 1, type: 4, stopPrice: 19990 }));
+    four.setNow(T0 + 3 * MIN);
+    expect(four.exchange.tradeReport(1, iso(T0)).roundTrips[0]).toMatchObject({ initialStop: 19998, riskDollars: 4.5 });
+  });
+
+  it("a second stop placed later for another contract is not a trail while the first stop still works", async () => {
+    // Long 2 at 20000.25; a stop for 1 at 19995 at once, one for the other at 19990 two minutes later; bar T0+3 takes both.
+    const data = { NQ: [...flat(T0 - 5 * MIN, 5, 20000), ...seq(T0, [[20000, 20001, 19999, 20000], [20000, 20001, 19999, 20000], [20000, 20001, 19999, 20000], [20000, 20000, 19985, 19986], [19986, 19986, 19986, 19986]])] };
+    const { exchange, setNow } = await setup({ data, env: { BACKTESTER_MAX_ORDER_SIZE: "2" } });
+    exchange.place(req({ size: 2 }));
+    exchange.place(req({ side: 1, type: 4, stopPrice: 19995 }));
+    setNow(T0 + 2 * MIN);
+    exchange.place(req({ side: 1, type: 4, stopPrice: 19990 }));
+    setNow(T0 + 5 * MIN);
+    expect(exchange.tradeReport(1, iso(T0)).roundTrips[0]).toMatchObject({ initialStop: 19995, partialExits: 1, reason: "stop", exitPrice: 19992.25 });
   });
 
   it("a stop cancelled and replaced after the first minute reads trail", async () => {

@@ -81,6 +81,13 @@ describe("round trips: stop and target exits", () => {
     expect(run(order({ role: "sl", side: 1, type: ORDER_TYPES.stop, stopPrice: 100, stopAt: [[t(0), 99], [t(1), 100]] }), 100, t(2))).toBe("trail");
     expect(run(order({ side: 1, type: ORDER_TYPES.stop, stopPrice: 98, stopAt: [[t(0), 98]] }), 98, t(2))).toBe("stop");
     expect(run(order({ side: 1, type: ORDER_TYPES.stop, stopPrice: 100 }), 100, t(2))).toBe("stop");
+    // An add's own stop-loss leg (placed later, never moved) after the entry's leg was moved away: stop, not a replacement.
+    const e0 = order({ stopLossBracket: { ticks: 4, type: ORDER_TYPES.stop } });
+    const leg = order({ role: "sl", side: 1, type: ORDER_TYPES.stop, stopPrice: 99.5, parentId: e0.id, placedAt: t(0), status: STATUS.cancelled, updatedAt: t(3), stopAt: [[t(0), 99], [t(1), 99.5]] });
+    const add = order({ placedAt: t(2) });
+    const addLeg = order({ role: "sl", side: 1, type: ORDER_TYPES.stop, stopPrice: 98, parentId: add.id, placedAt: t(2) });
+    const legFills = [fill(1, e0, 0, 1, 100, t(0), null), fill(2, add, 0, 1, 100, t(2), null), fill(3, addLeg, 1, 2, 98, t(3), -8)];
+    expect(roundTrips("BT.MNQ", legFills, [e0, leg, add, addLeg], b, MNQ, t(4)).closed[0]).toMatchObject({ initialStop: 99, reason: "stop" });
     expect(run(order({ role: "sl", side: 1, type: ORDER_TYPES.trailing_stop, stopPrice: 99 }), 99, t(2))).toBe("trail");
     expect(run(order({ side: 1, type: ORDER_TYPES.stop, stopPrice: 99 }), 99, t(2))).toBe("stop");
     expect(run(order({ side: 1, type: ORDER_TYPES.limit }), 100, t(2))).toBe("target");

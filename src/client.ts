@@ -934,7 +934,7 @@ export class ReplayExchange {
       // is checked on the new terms, so a resting order is never skipped for a bar, and a smaller
       // order can't fill at its old size beside a replacement.
       if (typeof patch.stopPrice === "number" && o.stopPrice !== null) {
-        o.stopAt ??= [[o.placedAt, o.stopPrice, 0]];
+        o.stopAt ??= [[o.placedAt, o.stopPrice]];
         o.stopAt.push([now.getTime(), patch.stopPrice, state.nextTradeId]);
       }
       Object.assign(o, patch, { updatedAt: now.getTime() });
