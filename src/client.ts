@@ -872,34 +872,39 @@ export class ReplayExchange {
       const c = specOf(contractId);
       if (!c) return refuse(3, `Contract ${contractId} not found.`);
       if (!this.store.has(c.dataRoot)) return refuse(4, `No data for ${c.root}.`);
-      const pos = state.positions[contractId];
-      if (!pos || pos.net === 0) return refuse(2, `No open position in ${contractId}.`);
-      const qty = size ?? Math.abs(pos.net);
-      if (qty > Math.abs(pos.net)) return refuse(5, `Close size ${qty} is larger than the position (${Math.abs(pos.net)}).`);
-      const side: Side = pos.net > 0 ? 1 : 0;
-      // Only other closes waiting for the next bar matter here: a client market order is the
-      // client's own (if it would breach a limit when it fills, the fill is rejected then).
-      // A close_position flattens whatever is open when it fills, so it is always taken; a second one
-      // while one waits is the same request (idempotent: success, nothing added). A partial close
-      // beside a waiting close_position is redundant (OrderPending); partial closes together may not
-      // exceed the position.
-      const closes = state.orders.filter((o) => o.contractId === contractId && o.status === STATUS.open && o.role === "close");
-      const flat = closes.filter((o) => o.flatten).at(-1);
-      if (flat) {
-        if (size !== null) return refuse(7, "A close_position is already waiting for the next bar; it closes the whole position.");
-        // "Flat after everything sent before it": the same request again is a no-op, unless a client
-        // market order arrived after the waiting close; then the close moves to the end of the
-        // arrival order (the waiting one is cancelled, a new one goes in after that order).
-        const later = state.orders.some((o) => o.contractId === contractId && o.status === STATUS.open && o.role === "order" && o.type === ORDER_TYPES.market && o.id > flat.id);
-        if (!later) return OK;
-        Object.assign(flat, { status: STATUS.cancelled, updatedAt: now.getTime() });
-      }
-      const waiting = closes.reduce((n, o) => n + o.size, 0);
-      if (size !== null && waiting + qty > Math.abs(pos.net)) return refuse(7, `Partial closes for ${waiting} are already waiting for the next bar; ${Math.abs(pos.net) - waiting} left to close.`);
+      const held = state.positions[contractId]?.net ?? 0;
       const s = this.store.get(c.dataRoot);
       const ended = this.ended(now, s);
       const next = ended ? { index: -1 } : this.nextBar(s, now);
+      const closes = state.orders.filter((o) => o.contractId === contractId && o.status === STATUS.open && o.role === "close");
+      const flat = closes.filter((o) => o.flatten).at(-1);
+      // With a close_position waiting, what is left to close is what the client sent after it.
+      const after = (o: StoredOrder) => !flat || o.id > flat.id;
+      const ref = flat
+        ? state.orders
+            .filter((o) => o.contractId === contractId && o.status === STATUS.open && o.role === "order" && o.type === ORDER_TYPES.market && after(o))
+            .reduce((n, o) => n + sideSign(o.side) * o.size, 0)
+        : held;
+      if (size === null) {
+        if (flat && ref === 0) return OK; // the same request again: nothing sent since
+        if (!flat && held === 0) return refuse(2, `No open position in ${contractId}.`);
+      } else {
+        if (ref === 0) {
+          return flat
+            ? refuse(7, "A close_position is already waiting for the next bar and nothing sent after it is left to close.")
+            : refuse(2, `No open position in ${contractId}.`);
+        }
+        if (size > Math.abs(ref)) return refuse(5, `Close size ${size} is larger than the position${flat ? " left after the waiting close_position" : ""} (${Math.abs(ref)}).`);
+        const waiting = closes.filter((o) => !o.flatten && after(o)).reduce((n, o) => n + o.size, 0);
+        if (waiting + size > Math.abs(ref)) return refuse(7, `Partial closes for ${waiting} are already waiting for the next bar; ${Math.abs(ref) - waiting} left to close.`);
+      }
+      // Refuse before touching anything: a refusal never drops the waiting close.
       if ("reason" in next) return refuse(6, `Order rejected: ${next.reason}.`);
+      // close_position is "flat after everything sent before it": with a client market order sent
+      // after the waiting close, the close moves to the end of the arrival order.
+      if (flat && size === null) Object.assign(flat, { status: STATUS.cancelled, updatedAt: now.getTime() });
+      const qty = size ?? Math.abs(ref);
+      const side: Side = ref > 0 ? 1 : 0;
       const t = now.getTime();
       const id = state.nextOrderId++;
       state.orders.push({

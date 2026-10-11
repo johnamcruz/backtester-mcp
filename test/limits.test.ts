@@ -162,6 +162,57 @@ describe("close_position means flat after everything sent before it", () => {
     expect(await net(call)).toBe(0);
   });
 
+  it("a waiting close isn't cancelled when another fill flattens first; it flattens the add sent before it", async () => {
+    const { call, setNow } = await setup({ data: swings(), env, now: T0 - 2 * MIN });
+    await call("place_order", { ...base, side: "buy", type: "market", size: 1 }); // long 1
+    setNow(T0 - 30000);
+    await call("place_order", { ...base, side: "sell", type: "market", size: 1 }); // flattens first at T0's open
+    await call("place_order", { ...base, side: "buy", type: "market", size: 1 }); // reopens long 1
+    expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true);
+    setNow(T0 + MIN);
+    expect(await net(call)).toBe(0);
+  });
+
+  it("checks new orders against the flat the close leaves plus market orders sent after it", async () => {
+    const { call, setNow } = await setup({ data: swings(), env: { BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2" }, now: T0 - 2 * MIN });
+    await call("place_order", { ...base, side: "buy", type: "market", size: 1 }); // long 1
+    setNow(T0 - 30000);
+    await call("place_order", { ...base, side: "buy", type: "market", size: 1 }); // sent before the close: flattened
+    expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true);
+    expect((await call("place_order", { ...base, side: "buy", type: "market", size: 2 })).data.success).toBe(true); // 0 + 2
+    expect((await call("place_order", { ...base, side: "buy", type: "market", size: 1 })).text).toMatch(/net position to 3/);
+    setNow(T0 + MIN);
+    expect(await net(call)).toBe(2);
+  });
+
+  it("a partial close while a close waits reduces what was sent after it", async () => {
+    const { call, setNow } = await setup({ data: swings(), env: { BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2" }, now: T0 - 2 * MIN });
+    await call("place_order", { ...base, side: "buy", type: "market", size: 1 }); // long 1
+    setNow(T0 - 30000);
+    expect((await call("partial_close_position", { accountId: 1, contractId: "BT.MNQ", size: 1 })).data.success).toBe(true);
+    await call("cancel_order", { accountId: 1, orderId: 2 });
+    expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true);
+    expect((await call("partial_close_position", { accountId: 1, contractId: "BT.MNQ", size: 1 })).data).toMatchObject({ errorName: "OrderPending", errorMessage: expect.stringMatching(/nothing sent after it/) });
+    await call("place_order", { ...base, side: "buy", type: "market", size: 2 }); // long 2 after the close
+    expect((await call("partial_close_position", { accountId: 1, contractId: "BT.MNQ", size: 3 })).data).toMatchObject({ errorName: "InvalidCloseSize", errorMessage: expect.stringMatching(/left after the waiting close_position \(2\)/) });
+    expect((await call("partial_close_position", { accountId: 1, contractId: "BT.MNQ", size: 1 })).data.success).toBe(true);
+    expect((await call("partial_close_position", { accountId: 1, contractId: "BT.MNQ", size: 2 })).data).toMatchObject({ errorName: "OrderPending" });
+    setNow(T0 + MIN);
+    expect(await net(call)).toBe(1); // flat, long 2, then the partial sells 1
+  });
+
+  it("only market orders sent after a waiting close count as reopening it, not resting ones", async () => {
+    const { call, setNow } = await setup({ data: swings(), env, now: T0 - 2 * MIN });
+    await call("place_order", { ...base, side: "buy", type: "market", size: 1 }); // long 1
+    setNow(T0 - 30000);
+    expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true);
+    await call("place_order", { ...base, side: "buy", type: "limit", size: 1, limitPrice: 19900 }); // resting: may never fill
+    expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true); // still a no-op
+    expect((await call("partial_close_position", { accountId: 1, contractId: "BT.MNQ", size: 1 })).data).toMatchObject({ errorName: "OrderPending" });
+    const closes = (await orders(call)).filter((o: any) => o.reduceOnly);
+    expect(closes.map((o: any) => o.statusName)).toEqual(["open"]);
+  });
+
   it("a sell placed after a waiting close is an opening order (limits and the daily loss apply)", async () => {
     const { call, setNow } = await setup({ data: swings(), env: { ...env, BACKTESTER_MAX_DAILY_LOSS: "1" } });
     await call("place_order", { ...base, side: "buy", type: "market", size: 2 });

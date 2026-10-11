@@ -69,6 +69,12 @@ describe("market orders", () => {
     expect(closed.exchange.place(req())).toMatchObject({ success: false, errorCode: 5, orderId: null, errorMessage: expect.stringMatching(/market is closed/) });
     const after = await setup({ now: Date.parse("2024-03-06T00:00:00Z"), data });
     expect(after.exchange.place(req())).toMatchObject({ errorCode: 5, errorMessage: expect.stringMatching(/no data after/) });
+    // A position held into the daily break can't be closed until the market opens (OrderRejected).
+    const held = await setup({ now: Date.parse("2024-03-05T21:58:00Z"), data });
+    held.exchange.place(req());
+    held.setNow(Date.parse("2024-03-05T22:30:00Z"));
+    expect(held.exchange.close(1, "BT.MNQ", null)).toMatchObject({ success: false, errorCode: 6, errorMessage: expect.stringMatching(/market is closed/) });
+    expect(held.exchange.openOrders(1)).toEqual([]);
     const ended = await setup({ now: Date.parse("2024-03-05T21:54:30Z"), data, env: { BACKTESTER_END: "2024-03-05T21:54:30Z" } });
     expect(ended.exchange.place(req())).toMatchObject({ errorCode: 5, errorMessage: expect.stringMatching(/BACKTESTER_END/) });
   });
