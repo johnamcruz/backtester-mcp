@@ -258,7 +258,6 @@ describe("place_order", () => {
     const data = { NQ: [...flat(T0 - 10 * MIN, 12, 20000), ...flat(T0 + 2 * MIN, 10, 19999)] };
     const { call, setNow } = await setup({ data, env: { BACKTESTER_MAX_DAILY_LOSS: "1", BACKTESTER_MAX_ORDER_SIZE: "2", BACKTESTER_MAX_POSITION_SIZE: "2" } });
     await call("place_order", { ...order, size: 2, takeProfitBracket: { ticks: 40, type: "limit" } }); // long 2, TP leg sells 2
-    await call("place_order", { ...order, side: "sell", type: "limit", limitPrice: 20010, size: 2 }); // a manual target too
     await call("place_order", { ...order, side: "sell", type: "limit", limitPrice: 20005 }); // scale-out
     const stop = await call("place_order", { ...order, side: "sell", type: "stop", stopPrice: 19990 });
     await call("place_order", { ...order, contractId: "BT.NQ" });
@@ -266,6 +265,13 @@ describe("place_order", () => {
     await call("close_position", { accountId: 1, contractId: "BT.NQ" });
     expect((await call("place_order", { ...order, size: 1 })).text).toMatch(/Daily loss limit reached/);
     expect((await call("modify_order", { accountId: 1, orderId: stop.data.orderId, size: 2 })).data.success).toBe(true);
+  });
+
+  it("doesn't let several orders against the position grow past it", async () => {
+    const { call } = await setup({ env: { BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2" } });
+    await call("place_order", { ...order, side: "sell", size: 2 }); // short 2
+    for (let k = 0; k < 4; k++) expect((await call("place_order", { ...order, type: "limit", limitPrice: 19990 })).data.success).toBe(true);
+    expect((await call("modify_order", { accountId: 1, orderId: 2, size: 2 })).text).toMatch(/net position to 3/);
   });
 
   it("refuses orders outside the replay window", async () => {

@@ -475,10 +475,9 @@ export function createServer(deps: Deps): McpServer {
         const o = (await openOrders(a.accountId)).find((x) => x.id === a.orderId);
         if (o && !o.reduceOnly && a.size > (o.size as number)) {
           const side = o.side === SIDES.buy ? "buy" : "sell";
-          const { currentNet, exposure } = await exposureOf(a.accountId, o.contractId as string, side, a.size, a.orderId);
-          // An order against the position no larger than it only protects or scales out: always allowed.
-          const reducing = currentNet * (side === "buy" ? 1 : -1) < 0 && a.size <= Math.abs(currentNet);
-          if (!reducing && increasesExposure(exposure)) {
+          const { exposure } = await exposureOf(a.accountId, o.contractId as string, side, a.size, a.orderId);
+          // Protective growth (orders against the position staying within it) never increases exposure.
+          if (increasesExposure(exposure)) {
             if (config.maxDailyLoss > 0) assertDailyLoss(config, realizedNet(await trades(a.accountId, dayStart())));
             assertPositionLimit(config, exposure);
           }
