@@ -469,11 +469,17 @@ export class ReplayExchange {
       for (const k of curs) if (active(k)) t = Math.min(t, k.s.t[k.i]);
       if (t === Infinity) break;
       const group = curs.filter((k) => active(k) && k.s.t[k.i] === t);
-      if (t > from) for (const k of group) openBar(k.book, k.s.bar(k.i), k.fs, ids, this.hooks(state, k.contractId));
-      for (const k of group) {
-        if (t + MINUTE <= cutoff) closeBar(k.book, k.s.bar(k.i), k.fs, ids, this.hooks(state, k.contractId));
-        k.i++;
-      }
+      // Each moment (the minute's open, then its close) runs in two passes over every contract:
+      // first the fills that reduce a position (exits, stops, closes), then the ones that open
+      // exposure. A loss realized at that moment on any contract counts before any opening fill,
+      // whatever the contracts' order.
+      const pass = (fn: (k: (typeof curs)[number], hooks: Hooks, last: boolean) => void) => {
+        for (const k of group) fn(k, { ...this.hooks(state, k.contractId), deferOpening: true }, false);
+        for (const k of group) fn(k, this.hooks(state, k.contractId), true);
+      };
+      if (t > from) pass((k, h) => openBar(k.book, k.s.bar(k.i), k.fs, ids, h));
+      if (t + MINUTE <= cutoff) pass((k, h, last) => closeBar(k.book, k.s.bar(k.i), k.fs, ids, h, last));
+      for (const k of group) k.i++;
     }
     for (const k of curs) this.adopt(state, k.book, k.contractId);
     state.syncedTo = cutoff;
@@ -872,10 +878,14 @@ export class ReplayExchange {
       const side: Side = pos.net > 0 ? 1 : 0;
       // Only other closes waiting for the next bar matter here: a client market order is the
       // client's own (if it would breach a limit when it fills, the fill is rejected then).
+      // A close_position flattens whatever is open when it fills, so it is always taken; a second one
+      // while one waits is the same request (idempotent: success, nothing added). A partial close
+      // beside a waiting close_position is redundant (OrderPending); partial closes together may not
+      // exceed the position.
       const closes = state.orders.filter((o) => o.contractId === contractId && o.status === STATUS.open && o.role === "close");
-      if (closes.some((o) => o.flatten)) return refuse(7, "A close_position is already waiting for the next bar.");
+      if (closes.some((o) => o.flatten)) return size === null ? OK : refuse(7, "A close_position is already waiting for the next bar; it closes the whole position.");
       const waiting = closes.reduce((n, o) => n + o.size, 0);
-      if (waiting + qty > Math.abs(pos.net)) return refuse(7, `Closes for ${waiting} are already waiting for the next bar; ${Math.abs(pos.net) - waiting} left to close.`);
+      if (size !== null && waiting + qty > Math.abs(pos.net)) return refuse(7, `Partial closes for ${waiting} are already waiting for the next bar; ${Math.abs(pos.net) - waiting} left to close.`);
       const s = this.store.get(c.dataRoot);
       const ended = this.ended(now, s);
       const next = ended ? { index: -1 } : this.nextBar(s, now);

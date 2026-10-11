@@ -116,6 +116,12 @@ export interface FillSpec {
 export interface Hooks {
   guard?(o: SimOrder, size: number, pos: SimPosition, time: number): string | null;
   onFill?(fill: SimFill): void;
+  /**
+   * Exits first: when set, a client order's fill that would open exposure is skipped (the order
+   * stays open) so the caller can run every contract's reducing fills of a moment first, then
+   * call again without it for the opening fills.
+   */
+  deferOpening?: boolean;
 }
 
 /** The net position after a fill, and whether it opens exposure (grows |net| or goes through flat). */
@@ -263,6 +269,7 @@ export function fillOrder(book: Book, o: SimOrder, price: number, time: number, 
   if (o.role === "close" && o.flatten && pos.net !== 0) Object.assign(o, { side: pos.net > 0 ? 1 : 0, size: Math.abs(pos.net) });
   let size = o.size;
   if (o.role === "order") {
+    if (hooks.deferOpening && exposureAfter(pos.net, o.side, size).opens) return { fill: null, legs: [] };
     const reason = hooks.guard?.(o, size, pos, time) ?? null;
     if (reason) {
       Object.assign(o, { status: STATUS.rejected, updatedAt: time, rejectReason: reason });
@@ -290,10 +297,14 @@ export function fillOrder(book: Book, o: SimOrder, price: number, time: number, 
   if (pos.net === 0 || Math.sign(pos.net) !== Math.sign(before)) {
     for (const s of book.orders) if (s.role !== "order" && s.status === STATUS.open && !(s.flatten && pos.net !== 0)) cancel(s, time);
   }
+  // Brackets protect what the fill opened: none for a fill that only reduced the position (its legs
+  // would sit on the wrong side), and only the part beyond flat for one that went through it.
   const legs: SimOrder[] = [];
-  if (o.role === "order" && pos.net !== 0) {
-    if (o.stopLossBracket) legs.push(newLeg(o, "sl", o.stopLossBracket, price, size, time, spec.tickSize, ids));
-    if (o.takeProfitBracket) legs.push(newLeg(o, "tp", o.takeProfitBracket, price, size, time, spec.tickSize, ids));
+  const opened = exposureAfter(before, o.side, size);
+  if (o.role === "order" && pos.net !== 0 && opened.opens) {
+    const legSize = before !== 0 && Math.sign(pos.net) !== Math.sign(before) ? Math.abs(pos.net) : size;
+    if (o.stopLossBracket) legs.push(newLeg(o, "sl", o.stopLossBracket, price, legSize, time, spec.tickSize, ids));
+    if (o.takeProfitBracket) legs.push(newLeg(o, "tp", o.takeProfitBracket, price, legSize, time, spec.tickSize, ids));
     book.orders.push(...legs);
   }
   return { fill, legs };
@@ -329,7 +340,7 @@ export function restingFillPrice(o: SimOrder, bar: BarOHLC, spec: FillSpec): num
  * Fills inside the bar are stamped at the bar's close. Limits are enforced
  * per fill, in this order, against the position left by the fills before it.
  */
-export function closeBar(book: Book, bar: BarOHLC, spec: FillSpec, ids: Ids, hooks: Hooks = {}): SimFill[] {
+export function closeBar(book: Book, bar: BarOHLC, spec: FillSpec, ids: Ids, hooks: Hooks = {}, trail = true): SimFill[] {
   const end = bar.t + MINUTE;
   const fills: SimFill[] = [];
   const hit = book.orders
@@ -346,7 +357,7 @@ export function closeBar(book: Book, bar: BarOHLC, spec: FillSpec, ids: Ids, hoo
       if (r.fill) fills.push(r.fill);
     }
   }
-  for (const o of book.orders) if (o.status === STATUS.open && o.activeFrom <= bar.t) trailStep(o, bar, spec.tickSize, end);
+  if (trail) for (const o of book.orders) if (o.status === STATUS.open && o.activeFrom <= bar.t) trailStep(o, bar, spec.tickSize, end);
   return fills;
 }
 

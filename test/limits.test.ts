@@ -69,15 +69,40 @@ describe("fill-time limits: the review's repros", () => {
 });
 
 describe("closes", () => {
-  it("close_position is taken beside a waiting reversing market order, and still flattens", async () => {
+  it("close_position is taken beside a waiting reversing market order: exits fill first", async () => {
     const { call, setNow } = await setup({ data: swings(), env: { BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2" } });
     await call("place_order", { ...base, side: "sell", type: "market", size: 1 });
     setNow(T0 + 30000);
-    expect((await call("place_order", { ...base, side: "buy", type: "market", size: 2 })).data.success).toBe(true); // long 1 at the next open
+    expect((await call("place_order", { ...base, side: "buy", type: "market", size: 2 })).data.success).toBe(true);
     expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true);
-    expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data).toMatchObject({ errorName: "OrderPending", errorMessage: expect.stringMatching(/already waiting/) });
     setNow(T0 + 2 * MIN);
-    expect(await net(call)).toBe(0); // the close flattened the long the buy left
+    // At the next open the close (an exit) fills first and flattens the short; then the buy opens long 2.
+    const fills = (await call("search_trades", { accountId: 1, startTimestamp: iso(T0) })).data;
+    expect(fills.slice(1).map((t: any) => [t.orderId, t.sideName, t.size])).toEqual([[3, "buy", 1], [2, "buy", 2]]);
+    expect(await net(call)).toBe(2);
+  });
+
+  it("close_position is taken while a partial close waits, and a second one is the same request", async () => {
+    const { call, setNow } = await setup({ env: { BACKTESTER_MAX_POSITION_SIZE: "3", BACKTESTER_MAX_ORDER_SIZE: "3" } });
+    await call("place_order", { ...base, side: "buy", type: "market", size: 2 });
+    setNow(T0 + 30000);
+    expect((await call("partial_close_position", { accountId: 1, contractId: "BT.MNQ", size: 1 })).data.success).toBe(true);
+    expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true);
+    expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true); // idempotent
+    expect((await call("partial_close_position", { accountId: 1, contractId: "BT.MNQ", size: 1 })).data).toMatchObject({ errorName: "OrderPending" });
+    expect((await call("list_open_orders", { accountId: 1 })).data).toHaveLength(2); // the partial and one close
+    setNow(T0 + 2 * MIN);
+    expect(await net(call)).toBe(0);
+    expect((await call("search_trades", { accountId: 1, startTimestamp: iso(T0) })).data.slice(1).map((t: any) => t.size)).toEqual([1, 1]);
+  });
+
+  it("an order that only reduces gets no bracket legs; one going through flat gets them for the new part", async () => {
+    const { call } = await setup({ env: { BACKTESTER_MAX_POSITION_SIZE: "3", BACKTESTER_MAX_ORDER_SIZE: "3" } });
+    await call("place_order", { ...base, side: "buy", type: "market", size: 2 });
+    await call("place_order", { ...base, side: "sell", type: "market", size: 1, takeProfitBracket: { ticks: 8, type: "limit" } });
+    expect((await call("list_open_orders", { accountId: 1 })).data).toEqual([]);
+    await call("place_order", { ...base, side: "sell", type: "market", size: 3, stopLossBracket: { ticks: 8, type: "stop" } }); // long 1 -> short 2
+    expect((await call("list_open_orders", { accountId: 1 })).data).toMatchObject([{ sideName: "buy", typeName: "stop", size: 2 }]);
   });
 
   it("a reducing market order isn't refused for the opposite orders resting beside it", async () => {
@@ -89,6 +114,76 @@ describe("closes", () => {
     await call("partial_close_position", { accountId: 1, contractId: "BT.NQ", size: 1 }); // past the daily loss limit
     setNow(T0 + 30000);
     expect((await call("place_order", { ...base, side: "sell", type: "market", size: 1 })).data.success).toBe(true);
+  });
+});
+
+// ── Cross-contract sync: every contract's bars, exits before opens, opens before closes ──────
+
+describe("several contracts in one minute", () => {
+  // NQ rises through minute T0+1; ES falls 20 points in it.
+  const two = () => ({
+    NQ: [...flat(T0 - 30 * MIN, 30, 20000), ...seq(T0, [[20000, 20000, 20000, 20000], [20000, 20020, 20000, 20010]]), ...flat(T0 + 2 * MIN, 30, 20010)],
+    ES: [...flat(T0 - 30 * MIN, 30, 5000), ...seq(T0, [[5000, 5000, 5000, 5000], [5000, 5000, 4980, 4985]]), ...flat(T0 + 2 * MIN, 30, 4985)],
+  });
+  const env = { BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2", BACKTESTER_MAX_DAILY_LOSS: "5", BACKTESTER_SLIPPAGE_TICKS: "0" };
+  const statusOf = async (call: any, cid: string) => (await orders(call)).filter((o: any) => o.contractId === cid && o.typeName === "stop" && !o.reduceOnly)[0]?.statusName;
+
+  it.each([
+    ["BT.MES", "BT.MNQ"], // the loss's contract sorts first
+    ["BT.ES", "BT.MNQ"],
+  ])("a stop-out on %s counts before an entry on %s in the same minute", async (loser, entry) => {
+    const { call, setNow } = await setup({ data: two(), env });
+    await call("place_order", { ...base, contractId: loser, side: "buy", type: "market", size: 1, stopLossBracket: { ticks: 40, type: "stop" } }); // ES stop 4990: -$12.50 (MES) / -$125 (ES)
+    expect((await call("place_order", { ...base, contractId: entry, side: "buy", type: "stop", size: 1, stopPrice: 20005 })).data.success).toBe(true);
+    setNow(T0 + 3 * MIN);
+    expect(await statusOf(call, entry)).toBe("rejected");
+  });
+
+  it("the same when the entry's contract sorts first", async () => {
+    // NQ falls (a long MNQ is stopped out), ES rises (a buy stop entry on ES triggers) in the same minute.
+    const data = {
+      NQ: [...flat(T0 - 30 * MIN, 30, 20000), ...seq(T0, [[20000, 20000, 20000, 20000], [20000, 20000, 19950, 19960]]), ...flat(T0 + 2 * MIN, 30, 19960)],
+      ES: [...flat(T0 - 30 * MIN, 30, 5000), ...seq(T0, [[5000, 5000, 5000, 5000], [5000, 5020, 5000, 5010]]), ...flat(T0 + 2 * MIN, 30, 5010)],
+    };
+    const { call, setNow } = await setup({ data, env });
+    await call("place_order", { ...base, contractId: "BT.MNQ", side: "buy", type: "market", size: 1, stopLossBracket: { ticks: 40, type: "stop" } }); // stop 19990: -$5
+    expect((await call("place_order", { ...base, contractId: "BT.ES", side: "buy", type: "stop", size: 1, stopPrice: 5005 })).data.success).toBe(true);
+    setNow(T0 + 3 * MIN);
+    expect(await statusOf(call, "BT.ES")).toBe("rejected");
+    expect(await net(call)).toBe(0);
+  });
+
+  it("fills every contract's orders in a minute, at its open and at its close", async () => {
+    const { call, setNow } = await setup({ data: two(), env: { ...env, BACKTESTER_MAX_DAILY_LOSS: "0" } });
+    setNow(T0 + 30000);
+    await call("place_order", { ...base, contractId: "BT.MES", side: "sell", type: "market", size: 1 });
+    await call("place_order", { ...base, contractId: "BT.MNQ", side: "buy", type: "market", size: 1 });
+    await call("place_order", { ...base, contractId: "BT.MES", side: "buy", type: "limit", size: 1, limitPrice: 4990 });
+    await call("place_order", { ...base, contractId: "BT.MNQ", side: "sell", type: "limit", size: 1, limitPrice: 20015 });
+    setNow(T0 + 2 * MIN);
+    const fills = (await call("search_trades", { accountId: 1, startTimestamp: iso(T0) })).data;
+    expect(fills.map((t: any) => [t.contractId, t.creationTimestamp])).toEqual([
+      ["BT.MES", iso(T0 + MIN)], ["BT.MNQ", iso(T0 + MIN)], ["BT.MES", iso(T0 + 2 * MIN)], ["BT.MNQ", iso(T0 + 2 * MIN)],
+    ]);
+  });
+
+  it("all opens of a minute come before any of its closes: a loss at the close doesn't stop an entry at the open", async () => {
+    const { call, setNow } = await setup({ data: two(), env });
+    await call("place_order", { ...base, contractId: "BT.MES", side: "buy", type: "market", size: 1, stopLossBracket: { ticks: 40, type: "stop" } });
+    setNow(T0 + 30000);
+    expect((await call("place_order", { ...base, contractId: "BT.MNQ", side: "buy", type: "market", size: 1 })).data.success).toBe(true);
+    setNow(T0 + 2 * MIN);
+    expect((await orders(call)).find((o: any) => o.contractId === "BT.MNQ")).toMatchObject({ statusName: "filled" });
+  });
+
+  it("rejects an opening fill once realized loss equals the limit exactly", async () => {
+    const data = { NQ: [...flat(T0 - 30 * MIN, 30, 20000), ...seq(T0, [[20000, 20000, 20000, 20000], [20000, 20003, 19998, 20003]]), ...flat(T0 + 2 * MIN, 30, 20003)] };
+    const { call, setNow } = await setup({ data, env: { BACKTESTER_MAX_DAILY_LOSS: "2", BACKTESTER_SLIPPAGE_TICKS: "0", BACKTESTER_FEES_MICRO: "0", BACKTESTER_FEES_MINI: "0" } });
+    await call("place_order", { ...base, side: "buy", type: "market", size: 1, stopLossBracket: { ticks: 4, type: "stop" } }); // stop 19999: exactly -$2
+    expect((await call("place_order", { ...base, side: "buy", type: "stop", size: 1, stopPrice: 20002 })).data.success).toBe(true);
+    setNow(T0 + 3 * MIN);
+    expect((await call("search_trades", { accountId: 1, startTimestamp: iso(T0) })).data.at(-1)).toMatchObject({ profitAndLoss: -2 });
+    expect((await orders(call)).find((o: any) => o.stopPrice === 20002 && !o.reduceOnly)).toMatchObject({ statusName: "rejected" });
   });
 });
 
