@@ -40,7 +40,10 @@
  *     into that bar (not entered at its open).
  * A fill at a bar's open (market orders, closes) happens before the bar's
  * range; a stop or limit fill happens inside the bar (stamped at its close);
- * an end-of-window fill at the last close comes after every bar.
+ * a fill on arrival (marketFill "now": stamped at the replay moment it was
+ * placed) is at that bar's open when the moment is one, else inside the bar
+ * containing the moment (whether that bar's high or low came before it is
+ * unknown); an end-of-window fill at the last close comes after every bar.
  * MAE/MFE dollars are G; R is G / initial risk in dollars; points and ticks
  * are G per contract open at that moment (with no partial exit before it,
  * exactly the price's distance from the average entry). The time is the
@@ -66,7 +69,7 @@
 
 import type { BarSeries } from "./bars.js";
 import { ORDER_TYPES } from "./enums.js";
-import { MINUTE, STATUS, bracketPrice, isLimitType, isStopType, sideSign, type BracketSpec, type Side } from "./fills.js";
+import { MINUTE, STATUS, bracketPrice, containingBar, isLimitType, isStopType, sideSign, type BracketSpec, type Side } from "./fills.js";
 import type { Trade } from "./performance.js";
 
 export interface MetricOrder {
@@ -91,6 +94,8 @@ export interface MetricOrder {
   cancelSeq?: number;
   /** Filled at the last close after BACKTESTER_END. */
   endOfWindow?: boolean;
+  /** Filled on arrival at the replay moment it was placed (marketFill "now"), stamped at that moment. */
+  arrival?: boolean;
 }
 
 export interface TickSpec {
@@ -246,9 +251,10 @@ export function roundTrips(contractId: string, fills: Trade[], orders: MetricOrd
     }
     bi = Math.max(bi, end);
   };
-  // A bar with fills inside it counts as held when the same round trip was open at its open and still is at its close.
+  // A bar with fills inside it counts as held when the same round trip was open at its open and still is at its close
+  // (once it has closed: a fill on arrival can sit inside the bar in progress at the cutoff).
   const resolveDirty = () => {
-    if (dirty && dirty.ep && dirty.ep === ep) ep.barsHeld++;
+    if (dirty && dirty.ep && dirty.ep === ep && dirty.bar + MINUTE <= cutoff) ep.barsHeld++;
     dirty = null;
   };
 
@@ -376,8 +382,11 @@ export function roundTrips(contractId: string, fills: Trade[], orders: MetricOrd
     const o = byId.get(f.orderId);
     const time = Date.parse(f.creationTimestamp);
     // Where the fill sits among the bars: at a bar's open (market), inside a bar (stamped at its close), or after the window.
-    const phase = o?.endOfWindow ? "end" : !o || o.type === ORDER_TYPES.market ? "open" : "inside";
-    const bar = phase === "inside" ? time - MINUTE : time;
+    // A fill on arrival is at its moment: a bar's open when the moment is one, else inside the bar containing it.
+    const at = o?.arrival && bars ? containingBar(bars.t, bars.length, time) : -1;
+    const arrivalInside = at >= 0 && (bars as BarSeries).t[at] !== time;
+    const phase = o?.endOfWindow ? "end" : arrivalInside ? "inside" : !o || o.arrival || o.type === ORDER_TYPES.market ? "open" : "inside";
+    const bar = arrivalInside ? (bars as BarSeries).t[at] : phase === "inside" ? time - MINUTE : time;
     if (dirty && !(phase === "inside" && dirty.bar === bar)) resolveDirty();
     if (phase === "open") {
       clean(bar);

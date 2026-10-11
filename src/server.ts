@@ -108,7 +108,8 @@ export function createServer(deps: Deps): McpServer {
   const dayStart = () => tradingDayStart(client.now()).toISOString();
   /**
    * Net position and worst-case exposure of an order, as projectx-mcp would see it (there market
-   * orders fill at once). The position counts market orders waiting for the next bar's open: all
+   * orders fill at once, as they do here unless no bar contains the moment or the run fills at the
+   * next bar). The position counts market orders waiting for the next bar's open: all
    * of them when they add to it or go through flat, none when they only reduce it (so a
    * protective stop beside a waiting exit is still protective). Every resting same-side order
    * that could fill counts (limit, join, stop, trailing stop). Bracket legs and closes are
@@ -320,7 +321,7 @@ export function createServer(deps: Deps): McpServer {
     "list_open_orders",
     {
       title: "Open orders",
-      description: "Working orders on an account (includes bracket stop/target legs, and market orders waiting for the next bar's open).",
+      description: "Working orders on an account (includes bracket stop/target legs, and market orders waiting for the next bar's open: only when no bar contains the moment, or in a next-bar run).",
       inputSchema: { accountId },
       annotations: read,
     },
@@ -390,7 +391,7 @@ export function createServer(deps: Deps): McpServer {
       title: "Place order",
       description:
         "Submit an order. side: buy|sell. type: market | limit (needs limitPrice) | stop (needs stopPrice) | trailing_stop (needs trailPrice = absolute price level, NOT a distance) | join_bid | join_ask. " +
-        "Brackets (stopLossBracket/takeProfitBracket, in ticks from the fill) are supported (auto OCO). Market orders fill at the next 1-minute bar's open plus slippage. " +
+        "Brackets (stopLossBracket/takeProfitBracket, in ticks from the fill) are supported (auto OCO). Market orders fill at once, at the replay moment, at the open of the 1-minute bar containing it plus slippage (a run with BACKTESTER_MARKET_FILL=next-bar: at the next bar's open). " +
         "Server guardrails may block the order. `rationale` is required and saved to the journal so you can learn from the outcome.",
       inputSchema: {
         accountId,

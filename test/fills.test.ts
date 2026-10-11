@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   STATUS,
   applyFill,
+  arrivalFillPrice,
+  containingBar,
+  fillOnArrival,
   exposureAfter,
   bracketPrice,
   closeBar,
@@ -275,5 +278,49 @@ describe("bars", () => {
     expect(exposureAfter(1, 1, 2)).toEqual({ after: -1, opens: true });
     expect(exposureAfter(0, 0, 1)).toEqual({ after: 1, opens: true });
     expect(exposureAfter(-2, 0, 1)).toEqual({ after: -1, opens: false });
+  });
+});
+
+describe("fills on arrival (marketFill now)", () => {
+  it("containingBar: the bar whose open is at or before the moment and whose close is after it", () => {
+    const t = [T, T + M, T + 3 * M]; // no bar at T+2M
+    expect(containingBar(t, 3, T)).toBe(0);
+    expect(containingBar(t, 3, T + 59999)).toBe(0);
+    expect(containingBar(t, 3, T + M)).toBe(1);
+    expect(containingBar(t, 3, T + 2 * M + 30000)).toBe(-1); // a minute without a bar
+    expect(containingBar(t, 3, T - 1)).toBe(-1);
+    expect(containingBar(t, 3, T + 4 * M)).toBe(-1); // after the last bar's close
+    expect(containingBar([], 0, T)).toBe(-1);
+  });
+
+  it("arrivalFillPrice: market at the open plus slippage against the order; join only when marketable; never limits or stops", () => {
+    expect(arrivalFillPrice({ type: 2, side: 0, limitPrice: null }, 20000, MNQ)).toBe(20000.25);
+    expect(arrivalFillPrice({ type: 2, side: 1, limitPrice: null }, 20000, MNQ)).toBe(19999.75);
+    expect(arrivalFillPrice({ type: 2, side: 1, limitPrice: null }, 20000, { ...MNQ, slippageTicks: 3 })).toBe(19999.25);
+    expect(arrivalFillPrice({ type: 6, side: 0, limitPrice: 20000 }, 19999, MNQ)).toBe(19999); // buy joining above the market: the better open
+    expect(arrivalFillPrice({ type: 6, side: 0, limitPrice: 20000 }, 20000, MNQ)).toBe(20000); // at the market: touch fills
+    expect(arrivalFillPrice({ type: 6, side: 0, limitPrice: 20000 }, 20000.25, MNQ)).toBeNull(); // below the market: rests
+    expect(arrivalFillPrice({ type: 7, side: 1, limitPrice: 20000 }, 20001, MNQ)).toBe(20001);
+    expect(arrivalFillPrice({ type: 7, side: 1, limitPrice: 20000 }, 19999.75, MNQ)).toBeNull();
+    expect(arrivalFillPrice({ type: 1, side: 0, limitPrice: 20010 }, 20000, MNQ)).toBeNull(); // a plain limit rests even if marketable
+    expect(arrivalFillPrice({ type: 4, side: 0, limitPrice: null }, 20000, MNQ)).toBeNull();
+  });
+
+  it("fillOnArrival: stamped at the moment; its legs are checked from the next bar, not on the rest of the containing bar", () => {
+    const moment = T + 30000;
+    const o = order({ placedAt: moment, activeFrom: moment, stopLossBracket: { ticks: 8, type: 4 }, takeProfitBracket: { ticks: 8, type: 1 } });
+    const book = emptyBook([o]);
+    const fill = fillOnArrival(book, o, 20000, moment, MNQ, ids());
+    expect(fill).toMatchObject({ price: 20000.25, time: moment, profitAndLoss: null });
+    expect(book.orders.filter((x) => x.role !== "order").map((x) => [x.role, x.stopPrice ?? x.limitPrice, x.activeFrom])).toEqual([["sl", 19998.25], ["tp", 20002.25]].map(([r, p]) => [r, p, moment]));
+    // The containing bar reaches both legs: nothing fills on it (its range may come before the fill).
+    expect(closeBar(book, bar(20000, 20010, 19990, 20000), MNQ, ids())).toEqual([]);
+    expect(book.position.net).toBe(1);
+    // The next bar takes the stop.
+    expect(closeBar(book, bar(20000, 20000, 19998, 19998, T + M), MNQ, ids())).toMatchObject([{ price: 19998, time: T + 2 * M }]);
+    // A stop order doesn't fill on arrival.
+    const s = order({ type: 4, stopPrice: 19990 });
+    expect(fillOnArrival(emptyBook([s]), s, 20000, moment, MNQ, ids())).toBeNull();
+    expect(s.status).toBe(STATUS.open);
   });
 });

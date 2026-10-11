@@ -36,6 +36,14 @@ describe("config", () => {
     expect(publicConfig(loadConfig(base))).toMatchObject({ allowedAccountIds: "any", allowedSymbols: "any", clock: { fixed: base.BACKTESTER_NOW } });
   });
 
+  it("fills market orders at the replay moment by default; BACKTESTER_MARKET_FILL=next-bar keeps the earlier rule", () => {
+    expect(loadConfig(base).marketFill).toBe("now");
+    expect(loadConfig({ ...base, BACKTESTER_MARKET_FILL: " Next-Bar " }).marketFill).toBe("next-bar");
+    expect(loadConfig({ ...base, BACKTESTER_MARKET_FILL: "now" }).marketFill).toBe("now");
+    expect(() => loadConfig({ ...base, BACKTESTER_MARKET_FILL: "later" })).toThrow(/BACKTESTER_MARKET_FILL/);
+    expect(publicConfig(loadConfig(base))).toMatchObject({ marketFill: "now" });
+  });
+
   it("rejects bad values", () => {
     expect(() => loadConfig({ ...base, BACKTESTER_MAX_ORDER_SIZE: "-1" })).toThrow(/non-negative/);
     expect(() => loadConfig({ ...base, BACKTESTER_ALLOWED_ACCOUNT_IDS: "abc" })).toThrow(/non-integer/);

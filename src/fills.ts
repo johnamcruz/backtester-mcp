@@ -9,8 +9,19 @@
  * cited by function as sim-broker.js#<function>, so a replay through this
  * server fills the way a backtest does:
  *
- *   - market orders fill at the next 1-minute bar's open plus slippage
- *     (sim-broker.js#fillAtOpen), in the order's direction;
+ *   - market orders fill at a 1-minute bar's open plus slippage
+ *     (sim-broker.js#fillAtOpen), in the order's direction. Which bar is a
+ *     run setting (config.ts marketFill): by default the bar containing the
+ *     replay moment the order is placed at, filled at once and stamped at that
+ *     moment, as a live market order fills within seconds (fillOnArrival;
+ *     its open is the last price known then: nothing of the bar's high, low or
+ *     close is read). When the moment is a bar's open (the harness backtester
+ *     decides at bar boundaries) that is the sim-broker's bar, price and time.
+ *     Its bracket legs (and any order placed then) are checked from the first
+ *     bar opening at or after the moment: never on the rest of the containing
+ *     bar, whose range may hold prices from before the fill.
+ *     The other setting, "next-bar", is the rule runs were created with before:
+ *     the next bar opening at or after the order (openBar);
  *   - stops fill at the stop price less slippage, or at the bar's open when
  *     the bar gapped through it (sim-broker.js#onBar);
  *   - limits (targets) fill at the limit price, or at a better open
@@ -162,6 +173,41 @@ export const isLimitType = (type: number) =>
 /** Market fill: the bar's open plus slippage in the order's direction. sim-broker.js#fillAtOpen */
 export function marketFillPrice(open: number, side: Side, spec: FillSpec): number {
   return onTick(open + sideSign(side) * spec.slippageTicks * spec.tickSize, spec.tickSize);
+}
+
+/**
+ * The bar containing `time` (its open at or before `time`, `time` before its close): the bar whose
+ * open is the last price known at `time`. Its index in `t` (open times, ascending), or -1.
+ */
+export function containingBar(t: ArrayLike<number>, length: number, time: number): number {
+  let lo = 0;
+  let hi = length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (t[mid] <= time) lo = mid + 1;
+    else hi = mid;
+  }
+  const i = lo - 1;
+  return i >= 0 && time < t[i] + MINUTE ? i : -1;
+}
+
+/**
+ * The price an order fills at when it arrives at a replay moment whose containing bar opened at
+ * `open` (marketFill "now"), or null when it doesn't fill on arrival. Only that open is read, never
+ * the bar's high, low or close, which may come after the moment.
+ *   - market: the open plus slippage in the order's direction (sim-broker.js#fillAtOpen);
+ *   - join_bid / join_ask: only when marketable at that price (a buy joining at or above it, a sell
+ *     at or below it): the limit or the better open, without slippage (sim-broker.js#onBar's limit
+ *     rule, applied to the price known at the moment). Otherwise they rest like any limit.
+ * Plain limits and stops never fill on arrival: they rest until a later bar trades through them.
+ */
+export function arrivalFillPrice(o: Pick<SimOrder, "type" | "side" | "limitPrice">, open: number, spec: FillSpec): number | null {
+  if (o.type === ORDER_TYPES.market) return marketFillPrice(open, o.side, spec);
+  if ((o.type === ORDER_TYPES.join_bid || o.type === ORDER_TYPES.join_ask) && o.limitPrice !== null) {
+    const marketable = o.side === 0 ? open <= o.limitPrice : open >= o.limitPrice;
+    return marketable ? onTick(limitFillPrice({ t: 0, o: open, h: open, l: open, c: open }, o.side, o.limitPrice), spec.tickSize) : null;
+  }
+  return null;
 }
 
 /** A buy stop triggers when the high reaches it; a sell stop when the low does. sim-broker.js#onBar */
@@ -326,6 +372,20 @@ export function openBar(book: Book, bar: BarOHLC, spec: FillSpec, ids: Ids, hook
     if (fill) fills.push(fill);
   }
   return fills;
+}
+
+/**
+ * marketFill "now": an order arriving at replay moment `time`, inside the bar that opened at
+ * `open` (containingBar), fills at once at arrivalFillPrice, stamped `time`. Its bracket legs are
+ * live from `time` (activeFrom), so they are checked from the first bar opening at or after it:
+ * the containing bar's range is never used for them (its high or low may come before the fill),
+ * as for any order placed inside a bar. Returns the fill, or null when the order doesn't fill on
+ * arrival (it then rests, or was rejected or cancelled by fillOrder's rules).
+ */
+export function fillOnArrival(book: Book, o: SimOrder, open: number, time: number, spec: FillSpec, ids: Ids, hooks: Hooks = {}): SimFill | null {
+  const price = arrivalFillPrice(o, open, spec);
+  if (price === null) return null;
+  return fillOrder(book, o, price, time, spec, ids, hooks).fill;
 }
 
 /** Fill price of a triggered resting order on the bar. */

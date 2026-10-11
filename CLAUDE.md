@@ -82,7 +82,12 @@ BACKTESTER_DATA_DIR=<data> BACKTESTER_NOW=2024-03-05T15:00:00Z BACKTESTER_STATE_
   of the harness's simulated broker, `scripts/lib/backtest/sim-broker.js`
   (the fill model the harness backtester `engine.js` drives), cited by
   function. Change a rule only together with the backtester, and keep the
-  citations current. Trade metrics follow the backtester's definitions too
+  citations current. One rule is the replay's own, by the owner's decision
+  that replay must behave like the live market: with `BACKTESTER_MARKET_FILL=now`
+  (the default, pinned per run) a market order fills at the replay moment it is
+  placed, at the open of the bar containing it plus slippage, reading nothing
+  after that moment (`fills.ts#fillOnArrival`); at a bar boundary that is the
+  sim-broker's fill exactly. Runs created before it keep `next-bar`. Trade metrics follow the backtester's definitions too
   (`src/metrics.ts`); `test/harness-parity.test.ts` compares them with the
   harness's sim-broker when `FTH_HARNESS_DIR` points at a harness checkout.
 - **Deterministic.** A run's results depend only on the data, the window, the

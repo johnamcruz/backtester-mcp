@@ -346,7 +346,8 @@ describe("place_order", () => {
 
   it("never refuses a protective stop while an exit market order waits, even past the daily loss limit", async () => {
     const data = { NQ: [...flat(T0 - 10 * MIN, 12, 20000), ...flat(T0 + 2 * MIN, 10, 19999)] };
-    const { call, setNow } = await setup({ data, env: { BACKTESTER_MAX_POSITION_SIZE: "1", BACKTESTER_MAX_DAILY_LOSS: "1" } });
+    // A market order that waits for the next bar: a next-bar run (by default it fills at once).
+    const { call, setNow } = await setup({ data, env: { BACKTESTER_MAX_POSITION_SIZE: "1", BACKTESTER_MAX_DAILY_LOSS: "1", BACKTESTER_MARKET_FILL: "next-bar" } });
     await call("place_order", order); // long 1 MNQ
     await call("place_order", { ...order, contractId: "BT.NQ" });
     setNow(T0 + 2 * MIN);
