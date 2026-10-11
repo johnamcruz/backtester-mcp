@@ -55,7 +55,10 @@
  * at their price when they started protecting the trade and on the losing
  * side of the entry, the closest to the entry.
  * Exit reason "trail" (sim-broker.js#onBar: stop !== initialStop) is a
- * trailing stop, or a stop whose price was modified after it was placed. Initial risk = |entry - stop| /
+ * trailing stop, a stop whose price was modified during the trade, or a
+ * client stop placed after the trade's first minute away from the initial
+ * stop (a cancel-and-replace move). A different stop that was a candidate for
+ * the initial stop (a scale-out stop) reads "stop". Initial risk = |entry - stop| /
  * tickSize x tickValue x opening size. No such stop: R fields are null.
  */
 
@@ -74,8 +77,14 @@ export interface MetricOrder {
   placedAt: number;
   updatedAt: number;
   status: number;
-  /** [time, stop price] each time a client stop was placed or modified (ratchets of a trailing stop not included). */
-  stopAt?: Array<[number, number]>;
+  /**
+   * [time, stop price, seq] each time a stop was placed or modified (ratchets of a trailing stop not
+   * included). seq is the id the next fill would get then: a price with seq <= a fill's id was set
+   * before that fill, even at the same instant. Missing in runs from earlier versions.
+   */
+  stopAt?: Array<[number, number, number?]>;
+  /** The id the next fill would get when the client cancelled it (same ordering as stopAt's seq). */
+  cancelSeq?: number;
   /** Filled at the last close after BACKTESTER_END. */
   endOfWindow?: boolean;
 }
@@ -188,14 +197,14 @@ const r2 = (x: number) => Math.round(x * 100) / 100 + 0;
 const r3 = (x: number) => Math.round(x * 1000) / 1000 + 0;
 
 /**
- * The stop price an order had when it began protecting a trade at `at`: its last price recorded
- * before `at` (a modify at `at` itself comes after that moment's fills), else its first recorded
- * price (placed at `at`), else its current price (no history).
+ * The stop price an order had when it began protecting the trade opened by fill `entryId` at
+ * `entryTime`: its last price set before that fill (by seq; without one, recorded before
+ * `entryTime`), else its first recorded price (placed after the fill), else its current price.
  */
-function stopPriceAt(o: MetricOrder, at: number): number | null {
+function stopPriceAt(o: MetricOrder, entryId: number, entryTime: number): number | null {
   const h = o.stopAt ?? [];
   let price: number | null = null;
-  for (const [t, p] of h) if (t < at) price = p;
+  for (const [t, p, seq] of h) if (seq !== undefined ? seq <= entryId : t < entryTime) price = p;
   return price ?? h[0]?.[1] ?? o.stopPrice;
 }
 
@@ -239,6 +248,17 @@ export function roundTrips(contractId: string, fills: Trade[], orders: MetricOrd
     dirty = null;
   };
 
+  const fillOf = new Map<number, number>(); // order id -> its first fill's id
+  for (const f of fills) if (!fillOf.has(f.orderId)) fillOf.set(f.orderId, f.id);
+  // Whether an order stopped working before the fill that opened `e` (fill ids and seqs order events within an instant).
+  const endedBefore = (c: MetricOrder, e: Episode): boolean => {
+    if (c.status === STATUS.open) return false;
+    const filled = fillOf.get(c.id);
+    if (filled !== undefined) return filled < e.id;
+    if (c.cancelSeq !== undefined) return c.cancelSeq <= e.id;
+    return c.updatedAt < e.entryTime || (c.updatedAt === e.entryTime && c.placedAt < e.entryTime);
+  };
+
   const initialStop = (e: Episode): number | null => {
     const o = e.entryOrder;
     if (o && o.role === "order" && o.stopLossBracket && isStopType(o.stopLossBracket.type)) {
@@ -250,9 +270,9 @@ export function roundTrips(contractId: string, fills: Trade[], orders: MetricOrd
     for (const c of sorted) {
       if (c.role !== "order" || c.side !== closingSide || !isStopType(c.type) || c.id === o?.id) continue;
       if (c.placedAt >= until) continue;
-      // Filled or cancelled at or before the opening fill (an earlier trade's stop): not this trade's.
-      if (c.status !== STATUS.open && c.updatedAt <= e.entryTime) continue;
-      const price = stopPriceAt(c, Math.max(c.placedAt, e.entryTime));
+      // Filled or cancelled before the opening fill (an earlier trade's stop): not this trade's.
+      if (endedBefore(c, e)) continue;
+      const price = stopPriceAt(c, e.id, e.entryTime);
       if (price === null || e.sign * (e.entryPrice - price) <= 0) continue;
       // Several candidates (a leftover far stop, scale-out stops): the closest to the entry protects it.
       if (best === null || e.sign * (price - best) > 0) best = price;
@@ -260,15 +280,17 @@ export function roundTrips(contractId: string, fills: Trade[], orders: MetricOrd
     return best;
   };
 
-  const reasonOf = (o: MetricOrder | undefined): ExitReason => {
+  const reasonOf = (o: MetricOrder | undefined, e: Episode, stop: number | null): ExitReason => {
     if (!o) return "other";
     if (o.endOfWindow) return "end";
     const stopLike = o.role === "sl" || (o.role === "order" && isStopType(o.type));
     if (stopLike) {
-      // Moved: its price when filled differs from its price when placed (modify_order records both).
-      const first = o.stopAt?.[0]?.[1];
-      const moved = first !== undefined && o.stopPrice !== null && Math.abs(o.stopPrice - first) > 1e-9;
-      return o.type === ORDER_TYPES.trailing_stop || moved ? "trail" : "stop";
+      const differs = (a: number | null | undefined, b: number | null | undefined) => a != null && b != null && Math.abs(a - b) > 1e-9;
+      // Moved with modify_order during the trade: its price when filled differs from its price when the trade began.
+      const moved = differs(o.stopPrice, stopPriceAt(o, e.id, e.entryTime));
+      // Moved by cancel and replace: a client stop placed after the trade's first minute, away from the initial stop.
+      const replaced = o.role === "order" && o.placedAt >= e.entryTime + MINUTE && differs(o.stopPrice, stop);
+      return o.type === ORDER_TYPES.trailing_stop || moved || replaced ? "trail" : "stop";
     }
     if (o.role === "tp" || isLimitType(o.type)) return "target";
     if (o.role === "close" || o.type === ORDER_TYPES.market) return "close";
@@ -282,7 +304,7 @@ export function roundTrips(contractId: string, fills: Trade[], orders: MetricOrd
     const R = (g: number) => (riskRaw ? r3(g / riskRaw) : null);
     const over = e.endTime !== null;
     const last = e.exits.at(-1);
-    const reason = over && last ? reasonOf(last.order) : null;
+    const reason = over && last ? reasonOf(last.order, e, stop) : null;
     if (over && last) info.set(last.fillId, { roundTripId: e.id, exitReason: reason as ExitReason });
     const ex = (s: Sample) => {
       const ticks = r6(s.g / (spec.tickValue * s.open));

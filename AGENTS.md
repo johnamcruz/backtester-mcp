@@ -74,7 +74,7 @@ The server groups your fills into **round trips**: from the fill that takes a co
 
 | Field | Meaning |
 |---|---|
-| `reason` | `stop` (a stop never moved), `trail` (trailing stop, or a stop you moved with `modify_order`), `target` (take-profit leg or limit order), `close` (close/partial close/market order), `end` (closed after the replay window), `other` |
+| `reason` | `stop` (a stop not moved during the trade), `trail` (trailing stop, a stop you moved with `modify_order`, or a stop you cancelled and replaced at another price after the first minute), `target` (take-profit leg or limit order), `close` (close/partial close/market order), `end` (closed after the replay window), `other` |
 | `initialStop`, `riskDollars` | The stop that protected the trade from the start: its stop-loss bracket, or the closest stop on the closing side working at the entry or placed within a minute after it. Risk $ = \|entry − stop\| ÷ tickSize × tickValue × entry size. No such stop: every R field is `null`, so attach the stop at once to get graded in R. |
 | `r`, `rNet` | Gross P&L ÷ risk $, net P&L ÷ risk $ |
 | `maeDollars` / `maeR` / `maeTicks` / `maePoints` / `maeTime` | Worst point of the trade's running P&L (realized so far + open), ≤ 0, starting at 0 at entry |

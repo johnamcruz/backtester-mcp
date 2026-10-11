@@ -239,6 +239,48 @@ describe("round trips through the exchange", () => {
     expect(second).toMatchObject({ entryPrice: 20005.25, initialStop: 19995, risk: 10.25, riskDollars: 20.5, reason: "trail", exitPrice: 19999.75 });
   });
 
+  it("orders events of one instant by fill sequence: a stop filling on its entry's bar, a modify or cancel just before an entry", async () => {
+    // A buy stop entry at 20002 and its protective sell stop at 19995, both placed inside bar T0; bar T0+1 fills both (stamped T0+2).
+    const one = await setup({ now: T0 + 30000, data: { NQ: [...flat(T0 - 5 * MIN, 5, 20000), ...seq(T0, [[20000, 20000, 20000, 20000], [20000, 20004, 19994, 19996], [19996, 19996, 19996, 19996]])] } });
+    one.exchange.place(req({ type: 4, stopPrice: 20002 }));
+    one.exchange.place(req({ side: 1, type: 4, stopPrice: 19995 }));
+    one.setNow(T0 + 3 * MIN);
+    // Entry 20002.25, stop 19995: 29 ticks = $14.50; exit 19994.75: -30 ticks = -$15.
+    expect(one.exchange.tradeReport(1, iso(T0)).roundTrips[0]).toMatchObject({ entryPrice: 20002.25, initialStop: 19995, riskDollars: 14.5, reason: "stop", r: -1.034 });
+
+    // A stop placed earlier at 19980, moved to 19995 at T0, then a market buy at T0 (fills at once at 20000.25).
+    const data = { NQ: [...flat(T0 - 5 * MIN, 5, 20000), ...seq(T0, [[20000, 20001, 19999, 20000], [20000, 20000, 19985, 19990], [19990, 19990, 19990, 19990]])] };
+    const two = await setup({ now: T0 - 90000, data });
+    two.exchange.place(req({ side: 1, type: 4, stopPrice: 19980 }));
+    two.setNow(T0);
+    two.exchange.modify({ accountId: 1, orderId: 1, size: null, limitPrice: null, stopPrice: 19995, trailPrice: null });
+    two.exchange.place(req());
+    two.setNow(T0 + 3 * MIN);
+    expect(two.exchange.tradeReport(1, iso(T0)).roundTrips[0]).toMatchObject({ initialStop: 19995, risk: 5.25, reason: "stop" }); // moved before the entry: not a trail
+
+    // A stop cancelled at T0 just before a market buy at T0: not the trade's stop.
+    const three = await setup({ now: T0 - 90000, data });
+    three.exchange.place(req({ side: 1, type: 4, stopPrice: 19900 }));
+    three.setNow(T0);
+    three.exchange.cancel(1, 1);
+    three.exchange.place(req());
+    three.exchange.place(req({ side: 1, type: 4, stopPrice: 19995 }));
+    three.setNow(T0 + 3 * MIN);
+    expect(three.exchange.tradeReport(1, iso(T0)).roundTrips[0]).toMatchObject({ initialStop: 19995, reason: "stop" });
+  });
+
+  it("a stop cancelled and replaced after the first minute reads trail", async () => {
+    const data = { NQ: [...flat(T0 - 5 * MIN, 5, 20000), ...seq(T0, [[20000, 20003, 19999, 20002], [20002, 20004, 20001, 20003], [20003, 20003, 20000, 20001], [20001, 20001, 20001, 20001]])] };
+    const { exchange, setNow } = await setup({ data });
+    exchange.place(req());
+    exchange.place(req({ side: 1, type: 4, stopPrice: 19990 }));
+    setNow(T0 + 2 * MIN);
+    exchange.cancel(1, 2);
+    exchange.place(req({ side: 1, type: 4, stopPrice: 20001 }));
+    setNow(T0 + 4 * MIN);
+    expect(exchange.tradeReport(1, iso(T0)).roundTrips[0]).toMatchObject({ initialStop: 19990, reason: "trail", exitPrice: 20000.75 });
+  });
+
   it("a close after BACKTESTER_END ends the round trip with reason end", async () => {
     const { exchange, setNow } = await setup({ env: { BACKTESTER_END: iso(T0 + 10 * MIN) } });
     exchange.place(req({ stopLossBracket: { ticks: 20, type: 4 } }));

@@ -149,7 +149,9 @@ interface StoredOrder extends SimOrder {
   accountId: number;
   contractId: string;
   /** Stops: [time, stop price] at placement (client stops) and at each modify (for a round trip's initial stop and "trail"). */
-  stopAt?: Array<[number, number]>;
+  stopAt?: Array<[number, number, number?]>;
+  /** The id the next fill would get when the client cancelled it (orders a cancel against fills at the same instant). */
+  cancelSeq?: number;
   /** Filled at the last close after BACKTESTER_END (a round trip's exit reason "end"). */
   endOfWindow?: boolean;
 }
@@ -897,7 +899,7 @@ export class ReplayExchange {
         filledPrice: null,
         customTag: req.customTag,
       };
-      if (stopPrice !== null) order.stopAt = [[t, stopPrice]];
+      if (stopPrice !== null) order.stopAt = [[t, stopPrice, state.nextTradeId]];
       state.orders.push(order);
       if (ended) this.fillAtEnd(state, req.contractId, c, s, now, order.id);
       else if (req.type === ORDER_TYPES.market) this.fillNowIfDue(state, req.contractId, c, s, next.index, now, order.id);
@@ -932,8 +934,8 @@ export class ReplayExchange {
       // is checked on the new terms, so a resting order is never skipped for a bar, and a smaller
       // order can't fill at its old size beside a replacement.
       if (typeof patch.stopPrice === "number" && o.stopPrice !== null) {
-        o.stopAt ??= [[o.placedAt, o.stopPrice]];
-        o.stopAt.push([now.getTime(), patch.stopPrice]);
+        o.stopAt ??= [[o.placedAt, o.stopPrice, 0]];
+        o.stopAt.push([now.getTime(), patch.stopPrice, state.nextTradeId]);
       }
       Object.assign(o, patch, { updatedAt: now.getTime() });
       return OK;
@@ -946,7 +948,7 @@ export class ReplayExchange {
       const o = state.orders.find((x) => x.id === orderId);
       if (!o || o.status !== STATUS.open) return refuse(2, `No working order ${orderId}.`);
       // A cancel takes effect at once, as at a live broker and the harness sim-broker's cancel().
-      Object.assign(o, { status: STATUS.cancelled, updatedAt: now.getTime() });
+      Object.assign(o, { status: STATUS.cancelled, updatedAt: now.getTime(), cancelSeq: state.nextTradeId });
       return OK;
     });
   }
