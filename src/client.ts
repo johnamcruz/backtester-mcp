@@ -148,7 +148,7 @@ export function specOf(contractId: string): ContractSpec | null {
 interface StoredOrder extends SimOrder {
   accountId: number;
   contractId: string;
-  /** Client stops: [time, stop price] at placement and at each modify (for a round trip's initial stop). */
+  /** Stops: [time, stop price] at placement (client stops) and at each modify (for a round trip's initial stop and "trail"). */
   stopAt?: Array<[number, number]>;
   /** Filled at the last close after BACKTESTER_END (a round trip's exit reason "end"). */
   endOfWindow?: boolean;

@@ -77,7 +77,10 @@ describe("round trips: stop and target exits", () => {
       return roundTrips("BT.MNQ", [fill(1, entry, 0, 1, 100, t(0), null), fill(2, exit, 1, 1, price, time, 0)], [entry, exit], b, MNQ, t(4)).closed[0].reason;
     };
     expect(run(order({ role: "sl", side: 1, type: ORDER_TYPES.stop, stopPrice: 99 }), 99, t(2))).toBe("stop");
-    expect(run(order({ role: "sl", side: 1, type: ORDER_TYPES.stop, stopPrice: 100 }), 100, t(2))).toBe("trail");
+    // Moved with modify_order (its placement price is recorded first): trail. A different price never modified: stop.
+    expect(run(order({ role: "sl", side: 1, type: ORDER_TYPES.stop, stopPrice: 100, stopAt: [[t(0), 99], [t(1), 100]] }), 100, t(2))).toBe("trail");
+    expect(run(order({ side: 1, type: ORDER_TYPES.stop, stopPrice: 98, stopAt: [[t(0), 98]] }), 98, t(2))).toBe("stop");
+    expect(run(order({ side: 1, type: ORDER_TYPES.stop, stopPrice: 100 }), 100, t(2))).toBe("stop");
     expect(run(order({ role: "sl", side: 1, type: ORDER_TYPES.trailing_stop, stopPrice: 99 }), 99, t(2))).toBe("trail");
     expect(run(order({ side: 1, type: ORDER_TYPES.stop, stopPrice: 99 }), 99, t(2))).toBe("stop");
     expect(run(order({ side: 1, type: ORDER_TYPES.limit }), 100, t(2))).toBe("target");
@@ -203,6 +206,18 @@ describe("round trips: initial stop", () => {
     // Placed before the entry and moved before it: the price at the entry.
     const early = order({ side: 1, type: ORDER_TYPES.stop, stopPrice: 98, placedAt: t(0) - 50000, status: STATUS.open, stopAt: [[t(0) - 50000, 97], [t(0) - 10000, 98]] });
     expect(tripWith([early])).toMatchObject({ initialStop: 98, risk: 2, riskDollars: 4 });
+  });
+  it("takes the closest of several stops (a leftover far stop, scale-out stops)", () => {
+    const far = order({ side: 1, type: ORDER_TYPES.stop, stopPrice: 90, placedAt: t(0) - 50000, status: STATUS.open });
+    const near = order({ side: 1, type: ORDER_TYPES.stop, stopPrice: 99, placedAt: t(0) + 10000, status: STATUS.open });
+    const mid = order({ side: 1, type: ORDER_TYPES.stop, stopPrice: 98, placedAt: t(0) + 20000, status: STATUS.open });
+    expect(tripWith([far, near, mid])).toMatchObject({ initialStop: 99, riskDollars: 2 });
+  });
+  it("ignores a stop filled or cancelled at the very moment of the entry (the previous trade's)", () => {
+    expect(tripWith([order({ side: 1, type: ORDER_TYPES.stop, stopPrice: 99, placedAt: t(0) - 50000, updatedAt: t(0), status: STATUS.filled })])?.initialStop).toBeNull();
+    expect(tripWith([order({ side: 1, type: ORDER_TYPES.stop, stopPrice: 99, placedAt: t(0) - 50000, updatedAt: t(0), status: STATUS.cancelled })])?.initialStop).toBeNull();
+    // Cancelled later (while protecting this trade): counts.
+    expect(tripWith([order({ side: 1, type: ORDER_TYPES.stop, stopPrice: 99, placedAt: t(0) - 50000, updatedAt: t(0) + 1, status: STATUS.cancelled })])?.initialStop).toBe(99);
   });
   it("ignores stops placed later, gone before the entry, on the wrong side of it, or on the opening side", () => {
     expect(tripWith([order({ side: 1, type: ORDER_TYPES.stop, stopPrice: 99, placedAt: t(1), status: STATUS.open })])?.initialStop).toBeNull();

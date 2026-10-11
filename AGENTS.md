@@ -74,15 +74,15 @@ The server groups your fills into **round trips**: from the fill that takes a co
 
 | Field | Meaning |
 |---|---|
-| `reason` | `stop` (stop at the initial price), `trail` (trailing stop, or a stop you moved), `target`, `close` (close/partial close/market order), `end` (closed after the replay window), `other` |
-| `initialStop`, `riskDollars` | The stop that protected the trade from the start: its stop-loss bracket, or a stop on the closing side working at the entry or placed within a minute after it. Risk $ = \|entry − stop\| ÷ tickSize × tickValue × entry size. No such stop: every R field is `null`, so attach the stop at once to get graded in R. |
+| `reason` | `stop` (a stop never moved), `trail` (trailing stop, or a stop you moved with `modify_order`), `target` (take-profit leg or limit order), `close` (close/partial close/market order), `end` (closed after the replay window), `other` |
+| `initialStop`, `riskDollars` | The stop that protected the trade from the start: its stop-loss bracket, or the closest stop on the closing side working at the entry or placed within a minute after it. Risk $ = \|entry − stop\| ÷ tickSize × tickValue × entry size. No such stop: every R field is `null`, so attach the stop at once to get graded in R. |
 | `r`, `rNet` | Gross P&L ÷ risk $, net P&L ÷ risk $ |
 | `maeDollars` / `maeR` / `maeTicks` / `maePoints` / `maeTime` | Worst point of the trade's running P&L (realized so far + open), ≤ 0, starting at 0 at entry |
 | `mfeDollars` / `mfeR` / … / `mfeTime` | Best point of the same, ≥ 0 |
 | `barsHeld` | One-minute bars the trade was open from open to close |
 | `gross`, `fees`, `net`, `partialExits`, `reversed` | P&L of the whole round trip; scale-outs; whether it ended by reversing |
 
-Excursions use the high and low of each closed bar held whole, plus every fill price. On a bar where a fill happened inside the bar (a stop, target or limit/stop entry), only that bar's open and the fill price count, because whether its high or low came before the fill is unknown. Ticks and points are per contract open at that moment.
+Excursions use the high and low of each closed bar held whole, plus every fill price. On a bar where a fill happened inside the bar (a stop, target or limit/stop entry), only that bar's open (when you held the position into the bar) and the fill price count, because whether its high or low came before the fill is unknown. Ticks and points are per contract open at that moment.
 
 Aggregates: `winRate`, `avgWin` / `avgLoss` / `expectancy` ($, net), `avgWinR` / `avgLossR` / `expectancyR` (net R, trades with a stop only, counted in `tradesWithR`), `profitFactor`, `maxDrawdown` (realized equity curve, $), `avgMaeRWinners` / `avgMfeRWinners` / `avgMaeRLosers` / `avgMfeRLosers`, `winnersPastMinus1R` (share of winners that were down a full R first), `avgBarsHeld`. A win is `net > 0`.
 
