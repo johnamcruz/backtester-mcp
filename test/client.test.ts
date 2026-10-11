@@ -1,4 +1,4 @@
-import { utimesSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { CONTRACTS, ReplayExchange, frontMonthName, specOf, type PlaceRequest } from "../src/client.js";
 import { loadConfig } from "../src/config.js";
@@ -169,6 +169,17 @@ describe("inside a bar", () => {
     expect(exchange.trades(1, iso(T0)).map((t) => [t.side, t.size, t.price])).toEqual([[0, 1, 20000.25], [1, 1, 19995]]);
   });
 
+  it("a size changed inside a bar applies from the next bar", async () => {
+    const { exchange, setNow } = await setup({ data: data() });
+    exchange.place(req({ size: 2 }));
+    exchange.place(req({ type: 4, side: 1, stopPrice: 19995 }));
+    setNow(T0 + 90000);
+    expect(exchange.modify({ accountId: 1, orderId: 2, size: 2, limitPrice: null, stopPrice: null, trailPrice: null })).toMatchObject({ success: true });
+    setNow(T0 + 2 * MIN);
+    expect(exchange.trades(1, iso(T0)).map((t) => [t.side, t.size])).toEqual([[0, 2], [1, 1]]);
+    expect(exchange.positions(1)).toMatchObject([{ size: 1 }]);
+  });
+
   it("creates a mid-bar market order's bracket in one sync and fills it in a later one", async () => {
     const { exchange, setNow } = await setup({ now: T0 + 30000, data: data() });
     exchange.place(req({ stopLossBracket: { ticks: 8, type: 4 } }));
@@ -232,6 +243,20 @@ describe("state", () => {
     expect(b.exchange.positions(1)).toHaveLength(1);
     const other = new ReplayExchange(loadConfig({ ...envOf(a.config), BACKTESTER_RUN_ID: "other", BACKTESTER_STATE_DIR: `${dir}/state-other` }));
     expect(other.positions(1)).toEqual([]);
+  });
+
+  it("reads the clock only while holding the run's lock, and removes only its own lock", async () => {
+    const { config } = await setup();
+    const lock = `${config.statePath}.lock`;
+    const held: boolean[] = [];
+    const ex = new ReplayExchange(config, { now: () => { held.push(existsSync(lock)); return new Date(T0); } });
+    ex.accounts();
+    expect(held).toEqual([true]);
+    expect(existsSync(lock)).toBe(false);
+    // Another process took the lock over (a stale-lock sweep): this call must not delete it.
+    const thief = new ReplayExchange(config, { now: () => { writeFileSync(lock, "someone-else"); return new Date(T0); } });
+    thief.accounts();
+    expect(readFileSync(lock, "utf8")).toBe("someone-else");
   });
 
   it("removes a stale lock and reports an unreadable state file", async () => {

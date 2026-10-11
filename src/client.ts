@@ -445,6 +445,8 @@ export class ReplayExchange {
       fillVolume: o.fillVolume,
       filledPrice: o.filledPrice,
       customTag: o.customTag,
+      // Extra field (allowed by the interface): bracket legs and closes only ever reduce the position.
+      reduceOnly: o.role !== "order",
     };
   }
 

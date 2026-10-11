@@ -106,8 +106,8 @@ export function createServer(deps: Deps): McpServer {
   /**
    * Net position and worst-case exposure of an order, as projectx-mcp: resting same-side entry
    * orders count (limit/join), plus market orders waiting for the next bar's open (live, they
-   * would have filled) and same-side stop entries while they add to the position (a buy stop
-   * when flat or long); a protective stop is on the other side, or reduces.
+   * would have filled) and same-side stop entries (beyond the position they protect). Bracket
+   * legs and closes are reduce-only and never count.
    */
   async function exposureOf(acct: number, cid: string, side: "buy" | "sell", size: number, except?: number) {
     const [positions, orders] = await Promise.all([openPositions(acct), openOrders(acct)]);
@@ -115,11 +115,12 @@ export function createServer(deps: Deps): McpServer {
       .filter((p) => p.contractId === cid)
       .reduce((n, p) => n + (p.type === 1 ? 1 : p.type === 2 ? -1 : 0) * (p.size as number), 0);
     const sign = side === "buy" ? 1 : -1;
-    const entryTypes: number[] = [ORDER_TYPES.limit, ORDER_TYPES.join_bid, ORDER_TYPES.join_ask, ORDER_TYPES.market];
-    if (currentNet * sign >= 0) entryTypes.push(ORDER_TYPES.stop, ORDER_TYPES.trailing_stop);
-    const pendingSameSide = orders
-      .filter((o) => o.id !== except && o.contractId === cid && o.side === SIDES[side] && entryTypes.includes(o.type as number))
-      .reduce((n, o) => n + (o.size as number), 0);
+    const same = orders.filter((o) => o.id !== except && o.contractId === cid && o.side === SIDES[side] && !o.reduceOnly);
+    const sum = (types: number[]) => same.filter((o) => types.includes(o.type as number)).reduce((n, o) => n + (o.size as number), 0);
+    const entries = sum([ORDER_TYPES.limit, ORDER_TYPES.join_bid, ORDER_TYPES.join_ask, ORDER_TYPES.market]);
+    const stops = sum([ORDER_TYPES.stop, ORDER_TYPES.trailing_stop]);
+    // A stop against the position protects it up to its size; any excess would reverse it.
+    const pendingSameSide = entries + (currentNet * sign >= 0 ? stops : Math.max(0, stops - Math.abs(currentNet)));
     return { currentNet, exposure: { currentNet, pendingSameSide, side, size } };
   }
 
@@ -472,10 +473,12 @@ export function createServer(deps: Deps): McpServer {
         assertOrderSize(config, a.size);
         // A bigger resting order is more exposure: the same position and daily loss checks as place_order.
         const o = (await openOrders(a.accountId)).find((x) => x.id === a.orderId);
-        if (o && a.size > (o.size as number)) {
+        if (o && !o.reduceOnly && a.size > (o.size as number)) {
           const side = o.side === SIDES.buy ? "buy" : "sell";
-          const { exposure } = await exposureOf(a.accountId, o.contractId as string, side, a.size, a.orderId);
-          if (increasesExposure(exposure)) {
+          const { currentNet, exposure } = await exposureOf(a.accountId, o.contractId as string, side, a.size, a.orderId);
+          // An order against the position no larger than it only protects or scales out: always allowed.
+          const reducing = currentNet * (side === "buy" ? 1 : -1) < 0 && a.size <= Math.abs(currentNet);
+          if (!reducing && increasesExposure(exposure)) {
             if (config.maxDailyLoss > 0) assertDailyLoss(config, realizedNet(await trades(a.accountId, dayStart())));
             assertPositionLimit(config, exposure);
           }

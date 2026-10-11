@@ -30,7 +30,7 @@ The same checks and semantics as projectx-mcp's, with `BACKTESTER_` names:
 | `BACKTESTER_ALLOWED_ACCOUNT_IDS` | any | Only these accounts can be traded. |
 | `BACKTESTER_ALLOWED_SYMBOLS` | any | Contract roots, e.g. `MNQ,MES` (ids are `BT.<ROOT>`). |
 | `BACKTESTER_MAX_ORDER_SIZE` | `1` | Maximum contracts per order. |
-| `BACKTESTER_MAX_POSITION_SIZE` | `2` | Maximum absolute net position per contract, counting resting same-side entry orders (limit and join orders, market orders waiting for the next bar, and same-side stop entries while they add to the position), also when `modify_order` grows a resting order. Orders that reduce the position are always allowed. |
+| `BACKTESTER_MAX_POSITION_SIZE` | `2` | Maximum absolute net position per contract, counting resting same-side entry orders (limit and join orders, market orders waiting for the next bar, and same-side stops beyond the position they protect; bracket legs and closes never count), also when `modify_order` grows a resting order. Orders that reduce the position are always allowed. |
 | `BACKTESTER_MAX_DAILY_LOSS` | `500` | Once realized P&L after fees for the trading day (from 17:00 CT / 18:00 ET, replay time) reaches −this amount, only orders that reduce the position are allowed. `0` turns it off. |
 | `BACKTESTER_START` / `BACKTESTER_END` | none | Orders are refused while the replay clock is outside the window. |
 

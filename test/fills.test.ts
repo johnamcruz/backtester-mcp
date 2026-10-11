@@ -245,4 +245,12 @@ describe("bars", () => {
     expect(closeBar(book, bar(100, 100, 99, 99), MNQ, ids())).toEqual([]); // the old stop (98) was not reached
     expect(closeBar(book, bar(99.5, 99.5, 99, 99, T + M), MNQ, ids())).toMatchObject([{ price: 99.25 }]);
   });
+
+  it("creates no bracket legs for an order that flattens the position", () => {
+    const book = emptyBook();
+    book.position = { id: 1, net: 1, averagePrice: 100, openedAt: T - M };
+    const { legs } = fillOrder(book, order({ side: 1, stopLossBracket: { ticks: 4, type: 4 } }), 101, T, MNQ, ids());
+    expect(legs).toEqual([]);
+    expect(book.orders).toEqual([]);
+  });
 });
