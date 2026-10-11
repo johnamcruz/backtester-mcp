@@ -294,9 +294,10 @@ export function fillOrder(book: Book, o: SimOrder, price: number, time: number, 
     for (const s of book.orders) if (s.parentId === o.parentId && s.id !== o.id && s.status === STATUS.open) cancel(s, time);
   }
   // Flat, or reversed through flat: the old position's legs (and waiting closes) have nothing left to protect.
-  // A waiting close_position (flatten) survives a reversal: it closes whatever the position is.
+  // A waiting close_position (flatten) is never cancelled here: it closes whatever is open when it
+  // fills (and cancels itself if nothing is), so a later add sent before it is still flattened.
   if (pos.net === 0 || Math.sign(pos.net) !== Math.sign(before)) {
-    for (const s of book.orders) if (s.role !== "order" && s.status === STATUS.open && !(s.flatten && pos.net !== 0)) cancel(s, time);
+    for (const s of book.orders) if (s.role !== "order" && s.status === STATUS.open && !s.flatten) cancel(s, time);
   }
   // Brackets protect what the fill opened: none for a fill that only reduced the position (its legs
   // would sit on the wrong side), and only the part beyond flat for one that went through it.

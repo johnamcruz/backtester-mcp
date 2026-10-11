@@ -114,12 +114,17 @@ export function createServer(deps: Deps): McpServer {
    */
   async function exposureOf(acct: number, cid: string, side: "buy" | "sell", size: number, except?: number) {
     const [positions, orders] = await Promise.all([openPositions(acct), openOrders(acct)]);
-    const held = positions
+    const position = positions
       .filter((p) => p.contractId === cid)
       .reduce((n, p) => n + (p.type === 1 ? 1 : p.type === 2 ? -1 : 0) * (p.size as number), 0);
+    let held = position;
     const mine = orders.filter((o) => o.id !== except && o.contractId === cid && !o.reduceOnly);
+    // A waiting close_position leaves the contract flat: what counts is that, plus market orders
+    // sent after it (an order "reducing" a position the close will remove is an opening order).
+    const close = client.waitingClose(acct, cid);
+    if (close !== null) held = 0;
     const waiting = mine
-      .filter((o) => o.type === ORDER_TYPES.market)
+      .filter((o) => o.type === ORDER_TYPES.market && (close === null || (o.id as number) > close))
       .reduce((n, o) => n + (o.side === SIDES.buy ? 1 : -1) * (o.size as number), 0);
     const addsOrReverses = held === 0 || Math.sign(waiting) === Math.sign(held) || Math.abs(waiting) > Math.abs(held);
     const currentNet = addsOrReverses ? held + waiting : held;
@@ -127,7 +132,7 @@ export function createServer(deps: Deps): McpServer {
     const pendingSameSide = mine
       .filter((o) => o.side === SIDES[side] && resting.includes(o.type as number))
       .reduce((n, o) => n + (o.size as number), 0);
-    return { position: held, exposure: { currentNet, pendingSameSide, side, size } };
+    return { position, exposure: { currentNet, pendingSameSide, side, size } };
   }
 
   /**

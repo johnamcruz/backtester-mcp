@@ -56,15 +56,16 @@ describe("fill-time limits: the review's repros", () => {
     expect((await orders(call)).filter((o: any) => o.statusName === "rejected").map((o: any) => o.stopPrice)).toEqual([20015]);
   });
 
-  it("D: close_position waiting, then a reversing buy: the close flattens, the buy past the max is rejected", async () => {
+  it("D: close_position waiting, then a buy: checked against the flat position the close leaves", async () => {
     const { call, setNow } = await setup({ data: swings(), env: { BACKTESTER_MAX_POSITION_SIZE: "1", BACKTESTER_MAX_ORDER_SIZE: "2" } });
     await call("place_order", { ...base, side: "sell", type: "market", size: 1 });
     setNow(T0 + 30000);
     expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true);
-    expect((await call("place_order", { ...base, side: "buy", type: "market", size: 2 })).data.success).toBe(true);
+    // Against the short it would "reduce"; against the flat position the close leaves it opens long 2.
+    expect((await call("place_order", { ...base, side: "buy", type: "market", size: 2 })).text).toMatch(/net position to 2/);
+    expect((await call("place_order", { ...base, side: "buy", type: "market", size: 1 })).data.success).toBe(true);
     setNow(T0 + 2 * MIN);
-    expect(await net(call)).toBe(0);
-    expect((await orders(call)).at(-1)).toMatchObject({ statusName: "rejected", rejectReason: expect.stringMatching(/would be 2/) });
+    expect(await net(call)).toBe(1); // flattened, then the buy 1
   });
 });
 
@@ -142,6 +143,37 @@ describe("closes", () => {
   });
 });
 
+describe("close_position means flat after everything sent before it", () => {
+  const env = { BACKTESTER_MAX_POSITION_SIZE: "3", BACKTESTER_MAX_ORDER_SIZE: "3" };
+  it.each([
+    ["an add", "buy", 1],
+    ["a reversal", "sell", 2],
+  ])("a second close after %s sent between the two ends flat", async (_n, side, size) => {
+    const { call, setNow } = await setup({ data: swings(), env, now: T0 - 2 * MIN });
+    await call("place_order", { ...base, side: "buy", type: "market", size: 1 }); // long 1
+    setNow(T0 + 30000);
+    expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true);
+    expect((await call("place_order", { ...base, side, type: "market", size })).data.success).toBe(true);
+    expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true);
+    expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true); // nothing new since: no-op
+    const closes = (await call("search_orders", { accountId: 1, startTimestamp: iso(T0 - 864e5) })).data.filter((o: any) => o.reduceOnly);
+    expect(closes.map((o: any) => o.statusName)).toEqual(["cancelled", "open"]); // the close moved after the later order
+    setNow(T0 + 2 * MIN);
+    expect(await net(call)).toBe(0);
+  });
+
+  it("a sell placed after a waiting close is an opening order (limits and the daily loss apply)", async () => {
+    const { call, setNow } = await setup({ data: swings(), env: { ...env, BACKTESTER_MAX_DAILY_LOSS: "1" } });
+    await call("place_order", { ...base, side: "buy", type: "market", size: 2 });
+    await call("partial_close_position", { accountId: 1, contractId: "BT.MNQ", size: 1 }); // past the daily loss limit, long 1
+    setNow(T0 + 30000);
+    expect((await call("place_order", { ...base, side: "sell", type: "market", size: 1 })).data.success).toBe(true); // reduces: allowed
+    await call("cancel_order", { accountId: 1, orderId: 3 });
+    expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true);
+    expect((await call("place_order", { ...base, side: "sell", type: "market", size: 1 })).text).toMatch(/Daily loss limit reached/);
+  });
+});
+
 // ── Cross-contract sync: every contract's bars, exits before opens, opens before closes ──────
 
 describe("several contracts in one minute", () => {
@@ -191,6 +223,20 @@ describe("several contracts in one minute", () => {
     expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true); // -$21 at the next open
     setNow(T0 + 2 * MIN);
     expect((await orders(call)).find((o: any) => o.contractId === "BT.MES" && o.size === 2)).toMatchObject({ statusName: "rejected", rejectReason: expect.stringMatching(/daily loss/) });
+  });
+
+  it("a client's reducing market order at a loss counts before another contract's entry at the same open", async () => {
+    const data = {
+      NQ: [...flat(T0 - 30 * MIN, 30, 20000), [T0, 20000, 20000, 20000, 20000] as Row, ...flat(T0 + MIN, 30, 19990)],
+      ES: [...flat(T0 - 30 * MIN, 31, 5000), ...flat(T0 + MIN, 30, 5000)],
+    };
+    const { call, setNow } = await setup({ data, env: { BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2", BACKTESTER_MAX_DAILY_LOSS: "10", BACKTESTER_SLIPPAGE_TICKS: "1" } });
+    await call("place_order", { ...base, contractId: "BT.MNQ", side: "buy", type: "market", size: 1 });
+    setNow(T0 + 30000);
+    await call("place_order", { ...base, contractId: "BT.MES", side: "buy", type: "market", size: 1 });
+    expect((await call("place_order", { ...base, contractId: "BT.MNQ", side: "sell", type: "market", size: 1 })).data.success).toBe(true);
+    setNow(T0 + 2 * MIN);
+    expect((await orders(call)).find((o: any) => o.contractId === "BT.MES")).toMatchObject({ statusName: "rejected" });
   });
 
   it("fills every contract's orders in a minute, at its open and at its close", async () => {

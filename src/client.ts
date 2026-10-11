@@ -884,7 +884,16 @@ export class ReplayExchange {
       // beside a waiting close_position is redundant (OrderPending); partial closes together may not
       // exceed the position.
       const closes = state.orders.filter((o) => o.contractId === contractId && o.status === STATUS.open && o.role === "close");
-      if (closes.some((o) => o.flatten)) return size === null ? OK : refuse(7, "A close_position is already waiting for the next bar; it closes the whole position.");
+      const flat = closes.filter((o) => o.flatten).at(-1);
+      if (flat) {
+        if (size !== null) return refuse(7, "A close_position is already waiting for the next bar; it closes the whole position.");
+        // "Flat after everything sent before it": the same request again is a no-op, unless a client
+        // market order arrived after the waiting close; then the close moves to the end of the
+        // arrival order (the waiting one is cancelled, a new one goes in after that order).
+        const later = state.orders.some((o) => o.contractId === contractId && o.status === STATUS.open && o.role === "order" && o.type === ORDER_TYPES.market && o.id > flat.id);
+        if (!later) return OK;
+        Object.assign(flat, { status: STATUS.cancelled, updatedAt: now.getTime() });
+      }
       const waiting = closes.reduce((n, o) => n + o.size, 0);
       if (size !== null && waiting + qty > Math.abs(pos.net)) return refuse(7, `Partial closes for ${waiting} are already waiting for the next bar; ${Math.abs(pos.net) - waiting} left to close.`);
       const s = this.store.get(c.dataRoot);
@@ -919,6 +928,15 @@ export class ReplayExchange {
       if (ended) this.fillAtEnd(state, contractId, c, s, now, id);
       else this.fillNowIfDue(state, contractId, c, s, next.index, now, id);
       return OK;
+    }, [contractId]);
+  }
+
+  /** The id of a close_position waiting on the contract (it will leave it flat), or null. */
+  waitingClose(accountId: number, contractId: string): number | null {
+    return this.tx((state) => {
+      this.assertAccount(state, accountId);
+      const o = state.orders.filter((x) => x.contractId === contractId && x.status === STATUS.open && x.role === "close" && x.flatten).at(-1);
+      return o ? o.id : null;
     }, [contractId]);
   }
 
