@@ -64,12 +64,36 @@ This server is a **replay broker**. It answers with the same tools, inputs and r
 | errorCode 5 `OutsideTradingHours` | The market is closed at the replay time (daily break, weekend, holiday, or past the data). Wait for the clock. |
 | `before BACKTESTER_START` / `after BACKTESTER_END` | The clock is outside the replay window: orders that add risk are refused. Closes, cancels and exits still work; once no bar is left before the end they fill at the last close. |
 
+### Trade metrics: grade whole trades
+
+The server groups your fills into **round trips**: from the fill that takes a contract's position away from flat to the fill that brings it back to flat (or reverses it; a reversal ends one round trip and starts the next). Adds and partial exits belong to the same round trip. All of it is computed only from bars closed by the replay clock.
+
+- `search_trades`: every fill has `roundTripId`; a fill that reduced the position has `exitReason` (`partial`, or the round trip's reason); the fill that ended a round trip carries `roundTrip`.
+- `list_open_positions` / `get_account_snapshot`: each position has `roundTrip`, the trade so far (MAE/MFE, bars held, initial stop and risk).
+- `get_performance`: `roundTrips.overall` / `byContract` grade the round trips that ended in the window.
+
+| Field | Meaning |
+|---|---|
+| `reason` | `stop` (a stop not moved during the trade), `trail` (trailing stop, a stop you moved with `modify_order` during the trade, or a stop you cancelled and replaced at another price after the first minute), `target` (take-profit leg or limit order), `close` (close/partial close/market order), `end` (closed after the replay window), `other` |
+| `initialStop`, `riskDollars` | The stop that protected the trade from the start: its stop-loss bracket, or the closest stop on the closing side working at the entry or placed within a minute after it. Risk $ = \|entry − stop\| ÷ tickSize × tickValue × entry size. No such stop: every R field is `null`, so attach the stop at once to get graded in R. |
+| `r`, `rNet` | Gross P&L ÷ risk $, net P&L ÷ risk $ |
+| `maeDollars` / `maeR` / `maeTicks` / `maePoints` / `maeTime` | Worst point of the trade's running P&L (realized so far + open), ≤ 0, starting at 0 at entry |
+| `mfeDollars` / `mfeR` / … / `mfeTime` | Best point of the same, ≥ 0 |
+| `barsHeld` | One-minute bars the trade was open from open to close |
+| `gross`, `fees`, `net`, `partialExits`, `reversed` | P&L of the whole round trip; scale-outs; whether it ended by reversing |
+
+Excursions use the high and low of each closed bar held whole, plus every fill price. On a bar where a fill happened inside the bar (a stop, target or limit/stop entry), only that bar's open (when you held the position into the bar) and the fill price count, because whether its high or low came before the fill is unknown. Ticks and points are per contract open at that moment.
+
+Aggregates: `winRate`, `avgWin` / `avgLoss` / `expectancy` ($, net), `avgWinR` / `avgLossR` / `expectancyR` (net R, trades with a stop only, counted in `tradesWithR`), `profitFactor`, `maxDrawdown` (realized equity curve, $), `avgMaeRWinners` / `avgMfeRWinners` / `avgMaeRLosers` / `avgMfeRLosers`, `winnersPastMinus1R` (share of winners that were down a full R first), `avgBarsHeld`. A win is `net > 0`.
+
+Use them in reviews: a winner with `maeR` near −1 was nearly stopped (entry timing); a loser with high `mfeR` gave back a winner (exit or target placement); `reason: "trail"` on a loss means a moved stop failed.
+
 ### How to learn
 
 The journal is where learning happens. Write entries that future-you can act on:
 
 - **plan**: market context, setup name, entry trigger, invalidation, target, size, $ risk, and what would make you skip the trade.
-- **review** (after every closed trade): what you planned vs. what you did, the result in R (P&L ÷ planned risk), whether the trade followed the plan, and the setup tag. Grade the process, not only the P&L.
+- **review** (after every closed trade): what you planned vs. what you did, the result in R (P&L ÷ planned risk; the closing fill's `roundTrip` has `r`, `maeR`, `mfeR`), whether the trade followed the plan, and the setup tag. Grade the process, not only the P&L.
 - **lesson**: short rules that have evidence behind them. Tag lessons (`tags: ["setup:orb", "MNQ"]`) so `journal_read {tag}` finds them.
 
 Journal entries are stamped with the replay time. `place_order` saves your `rationale` automatically, and blocked orders are journaled as `order_blocked`. Review these too.
@@ -80,13 +104,13 @@ Journal entries are stamped with the replay time. `place_order` saves your `rati
 |---|---|
 | `get_server_config` | Whether trading is enabled, guardrail limits, trading-day start, the replay window, clock and data ranges |
 | `list_accounts` | The simulated account, balance, `canTrade`, `mcpTradingAllowed` |
-| `get_account_snapshot` | Balance, positions, working orders, today's P&L and remaining loss allowance |
+| `get_account_snapshot` | Balance, positions (with `roundTrip`), working orders, today's P&L and remaining loss allowance |
 | `search_contracts` / `get_contract` / `list_available_contracts` | Contract IDs (`BT.MNQ`), tick size, tick value |
 | `get_bars` | Historical OHLCV bars up to the replay clock |
 | `get_quote` | Last price as of the replay clock |
 | `list_open_orders` / `search_orders` | Working orders / order history |
-| `list_open_positions` | Open positions |
-| `search_trades` / `get_performance` | Fills / statistics (win rate, expectancy, profit factor) |
+| `list_open_positions` | Open positions, each with its trade so far (`roundTrip`) |
+| `search_trades` / `get_performance` | Fills with round-trip metrics / statistics (win rate, expectancy, profit factor; `roundTrips`: $ and R, drawdown, MAE/MFE) |
 | `place_order` / `modify_order` / `cancel_order` | Order entry and management |
 | `close_position` / `partial_close_position` | Flatten or scale out at market |
 | `journal_add` / `journal_read` | Long-term memory |
