@@ -195,7 +195,7 @@ export interface BarsRequest {
 
 const iso = (ms: number) => new Date(ms).toISOString();
 const sleep = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-const LOCK_WAIT_MS = 15000;
+const LOCK_WAIT_MS = 60000; // longer than LOCK_STALE_MS, so a crashed holder's lock is cleared before callers give up
 const LOCK_STALE_MS = 30000;
 
 export interface ExchangeOptions {
@@ -259,10 +259,14 @@ export class ReplayExchange {
     const deadline = Date.now() + LOCK_WAIT_MS;
     for (;;) {
       try {
-        closeSync(openSync(path, "wx"));
+        const token = `${process.pid}-${Math.random()}`;
+        const fd = openSync(path, "wx");
+        writeFileSync(fd, token);
+        closeSync(fd);
         return () => {
           try {
-            unlinkSync(path);
+            // Only remove our own lock (a stale-lock sweep may have handed it to another process).
+            if (readFileSync(path, "utf8") === token) unlinkSync(path);
           } catch {
             /* already gone */
           }
@@ -297,9 +301,10 @@ export class ReplayExchange {
 
   /** Lock the run, sync it to the clock, run `fn`, save. */
   private tx<T>(fn: (state: State, now: Date) => T): T {
-    const now = this.clock();
     const unlock = this.lock();
     try {
+      // Read the clock under the lock: another process may have synced to a newer clock while this one waited.
+      const now = this.clock();
       const state = this.load();
       this.sync(state, now);
       const out = fn(state, now);
@@ -601,17 +606,17 @@ export class ReplayExchange {
     if (i >= s.length) return { reason: `no data after ${now.toISOString()}` };
     if (this.config.end !== null && s.t[i] > this.config.end) return { reason: "the next bar is after BACKTESTER_END" };
     if (tradingDayStart(new Date(s.t[i])).getTime() !== tradingDayStart(now).getTime()) {
-      return { reason: `the market is closed at ${now.toISOString()} (next bar ${iso(s.t[i])})` };
+      return { reason: `the market is closed at ${now.toISOString()}` };
     }
     return { index: i };
   }
 
   /** Fill a market order at once when the bar it fills on opens exactly now (the clock sits on a bar boundary). */
-  private fillNowIfDue(state: State, contractId: string, c: ContractSpec, s: BarSeries, index: number, now: Date): void {
+  private fillNowIfDue(state: State, contractId: string, c: ContractSpec, s: BarSeries, index: number, now: Date, orderId: number): void {
     if (s.t[index] > now.getTime()) return;
     const book = this.book(state, contractId);
     const fs = this.spec(c);
-    const o = book.orders.find((x) => x.status === STATUS.open && x.type === ORDER_TYPES.market && x.placedAt <= s.t[index]);
+    const o = book.orders.find((x) => x.id === orderId && x.status === STATUS.open);
     if (!o) return;
     const { fill } = fillOrder(book, o, marketFillPrice(s.o[index], o.side, fs), s.t[index], fs, this.ids(state));
     this.adopt(state, book, contractId);
@@ -683,7 +688,7 @@ export class ReplayExchange {
         customTag: req.customTag,
       };
       state.orders.push(order);
-      if (req.type === ORDER_TYPES.market) this.fillNowIfDue(state, req.contractId, c, s, next.index, now);
+      if (req.type === ORDER_TYPES.market) this.fillNowIfDue(state, req.contractId, c, s, next.index, now, order.id);
       return { orderId: order.id, ...OK };
     });
   }
@@ -711,8 +716,15 @@ export class ReplayExchange {
         patch.stopPrice = req.trailPrice;
         patch.trailDistance = Math.round(Math.abs(last - req.trailPrice) * 1e9) / 1e9;
       }
-      // The new terms apply from the bar that opens at or after now.
-      Object.assign(o, patch, { updatedAt: now.getTime(), activeFrom: Math.max(o.activeFrom, now.getTime()) });
+      // The new terms apply from the bar that opens at or after now; the bar in progress
+      // (bars open on whole minutes) settles on the terms it opened with.
+      const t = now.getTime();
+      const barOpen = Math.floor(t / MINUTE) * MINUTE;
+      if (t === barOpen) o.prior = null;
+      else if (o.activeFrom <= barOpen) {
+        o.prior = { from: o.activeFrom, limitPrice: o.limitPrice, stopPrice: o.stopPrice, size: o.size, trailDistance: o.trailDistance };
+      } // else: placed or already modified inside this bar; keep what it has
+      Object.assign(o, patch, { updatedAt: t, activeFrom: Math.max(o.activeFrom, t) });
       return OK;
     });
   }
@@ -747,8 +759,9 @@ export class ReplayExchange {
       const next = this.nextBar(s, now);
       if ("reason" in next) return refuse(6, `Order rejected: ${next.reason}.`);
       const t = now.getTime();
+      const id = state.nextOrderId++;
       state.orders.push({
-        id: state.nextOrderId++,
+        id,
         accountId,
         contractId,
         side,
@@ -761,7 +774,7 @@ export class ReplayExchange {
         placedAt: t,
         activeFrom: t,
         updatedAt: t,
-        role: "order",
+        role: "close",
         parentId: null,
         stopLossBracket: null,
         takeProfitBracket: null,
@@ -769,7 +782,7 @@ export class ReplayExchange {
         filledPrice: null,
         customTag: null,
       });
-      this.fillNowIfDue(state, contractId, c, s, next.index, now);
+      this.fillNowIfDue(state, contractId, c, s, next.index, now, id);
       return OK;
     });
   }

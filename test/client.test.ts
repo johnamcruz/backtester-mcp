@@ -2,7 +2,7 @@ import { utimesSync, writeFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { CONTRACTS, ReplayExchange, frontMonthName, specOf, type PlaceRequest } from "../src/client.js";
 import { loadConfig } from "../src/config.js";
-import { MIN, T0, flat, iso, seq, setup, tmp, writeData } from "./helpers.js";
+import { MIN, T0, flat, iso, seq, setup, tmp, writeData, type Row } from "./helpers.js";
 
 const req = (p: Partial<PlaceRequest> = {}): PlaceRequest => ({
   accountId: 1, contractId: "BT.MNQ", type: 2, side: 0, size: 1, limitPrice: null, stopPrice: null, trailPrice: null,
@@ -142,6 +142,41 @@ describe("order management", () => {
     const fills = exchange.trades(1, iso(T0));
     expect(fills.map((t) => [t.side, t.size, t.price, t.profitAndLoss])).toEqual([[0, 2, 20000.25, null], [1, 1, 19999.75, -1], [1, 1, 19999.75, -1]]);
     expect(exchange.accounts()[0]).toMatchObject({ balance: 100000 - 2 - 4 * 0.37, canTrade: true });
+  });
+});
+
+describe("inside a bar", () => {
+  // Bar T0+1 trades down to 19990.
+  const data = () => ({ NQ: [...flat(T0 - 5 * MIN, 6, 20000), [T0 + MIN, 20000, 20000, 19990, 19992] as Row, ...flat(T0 + 2 * MIN, 5, 19992)] });
+
+  it("a close placed inside a bar never opens a position when the stop fills first", async () => {
+    const { exchange, setNow } = await setup({ data: data() });
+    exchange.place(req({ stopLossBracket: { ticks: 20, type: 4 } }));
+    setNow(T0 + 90000);
+    expect(exchange.close(1, "BT.MNQ", null)).toMatchObject({ success: true });
+    setNow(T0 + 3 * MIN);
+    expect(exchange.positions(1)).toEqual([]);
+    expect(exchange.trades(1, iso(T0)).map((t) => [t.side, t.price])).toEqual([[0, 20000.25], [1, 19995]]);
+    expect(exchange.searchOrders(1, iso(T0)).at(-1)).toMatchObject({ type: 2, status: 3 });
+  });
+
+  it("a stop modified inside a bar still settles that bar on its old terms", async () => {
+    const { exchange, setNow } = await setup({ data: data() });
+    exchange.place(req({ stopLossBracket: { ticks: 20, type: 4 } })); // stop 19995.25
+    setNow(T0 + 90000);
+    expect(exchange.modify({ accountId: 1, orderId: 2, size: 2, limitPrice: null, stopPrice: 19980, trailPrice: null })).toMatchObject({ success: true });
+    setNow(T0 + 2 * MIN);
+    expect(exchange.trades(1, iso(T0)).map((t) => [t.side, t.size, t.price])).toEqual([[0, 1, 20000.25], [1, 1, 19995]]);
+  });
+
+  it("creates a mid-bar market order's bracket in one sync and fills it in a later one", async () => {
+    const { exchange, setNow } = await setup({ now: T0 + 30000, data: data() });
+    exchange.place(req({ stopLossBracket: { ticks: 8, type: 4 } }));
+    setNow(T0 + MIN + 10000); // opens at T0+1: long at 20000.25, stop 19998.25
+    expect(exchange.openOrders(1)).toMatchObject([{ id: 2, type: 4, stopPrice: 19998.25 }]);
+    setNow(T0 + 2 * MIN);
+    expect(exchange.positions(1)).toEqual([]);
+    expect(exchange.trades(1, iso(T0)).map((t) => [t.orderId, t.price])).toEqual([[1, 20000.25], [2, 19998]]);
   });
 });
 

@@ -30,7 +30,7 @@ The same checks and semantics as projectx-mcp's, with `BACKTESTER_` names:
 | `BACKTESTER_ALLOWED_ACCOUNT_IDS` | any | Only these accounts can be traded. |
 | `BACKTESTER_ALLOWED_SYMBOLS` | any | Contract roots, e.g. `MNQ,MES` (ids are `BT.<ROOT>`). |
 | `BACKTESTER_MAX_ORDER_SIZE` | `1` | Maximum contracts per order. |
-| `BACKTESTER_MAX_POSITION_SIZE` | `2` | Maximum absolute net position per contract, counting resting same-side entry orders (and market orders waiting for the next bar). Orders that reduce the position are always allowed. |
+| `BACKTESTER_MAX_POSITION_SIZE` | `2` | Maximum absolute net position per contract, counting resting same-side entry orders (limit and join orders, market orders waiting for the next bar, and same-side stop entries while they add to the position), also when `modify_order` grows a resting order. Orders that reduce the position are always allowed. |
 | `BACKTESTER_MAX_DAILY_LOSS` | `500` | Once realized P&L after fees for the trading day (from 17:00 CT / 18:00 ET, replay time) reaches −this amount, only orders that reduce the position are allowed. `0` turns it off. |
 | `BACKTESTER_START` / `BACKTESTER_END` | none | Orders are refused while the replay clock is outside the window. |
 
@@ -127,13 +127,14 @@ The fill engine (`src/fills.ts`) is ported from the harness backtester (`scripts
 
 | Order | Fill |
 |---|---|
-| Market (entries, `close_position`, `partial_close_position`) | The next one-minute bar's open plus `BACKTESTER_SLIPPAGE_TICKS` in the order's direction. If the clock is on a bar's open, that bar; otherwise the order waits for the next minute. |
+| Market (entries, `close_position`, `partial_close_position`) | The next one-minute bar's open plus `BACKTESTER_SLIPPAGE_TICKS` in the order's direction. If the clock is on a bar's open, that bar; otherwise the order waits for the next minute. A waiting close only reduces: if a stop flattens the position first, it is cancelled. |
 | Stop (`stop`, stop-loss legs, trailing stops) | The stop price less slippage; if the bar opens through the stop, the bar's open less slippage. |
 | Limit (`limit`, take-profit legs, `join_bid`/`join_ask`) | The limit price, or a better open. No slippage. Touch fills. |
 | Stop and target touched in one bar | The stop fills (the conservative reading). |
-| Brackets | Legs sit `ticks` from the entry's fill price (slippage included); a market entry's legs are checked on the fill bar itself. A filled leg cancels its sibling (OCO); all bracket legs are cancelled when the position is flat, and a leg never opens a new position. |
+| Brackets | Legs sit `ticks` from the entry's fill price (slippage included); a market entry's legs are checked on the fill bar itself. A filled leg cancels its sibling (OCO); all bracket legs are cancelled when the position is flat or reverses, and a leg never opens a new position. |
 | Limit or stop entries filled inside a bar | Their stop-loss leg is checked on the same bar too (pessimistic); the take-profit leg from the next bar. |
-| Orders placed or modified inside a bar | Checked from the next bar that opens at or after that moment (no look-back). |
+| Orders placed inside a bar | Checked from the next bar that opens at or after that moment (no look-back). |
+| Orders modified inside a bar | The bar in progress settles on the terms the order had when it opened; the new terms apply from the next bar. A resting order is never skipped for a bar. |
 | Trailing stop | Placed at `trailPrice` (a level); after each bar the stop follows the bar's extreme at the original distance, never loosening. The harness runner trails with `modify_order` instead. |
 | P&L and fees | Ticks × tick value × size; fees per side per contract on every fill. Daily P&L resets at 17:00 CT (18:00 ET). |
 

@@ -103,6 +103,26 @@ export function createServer(deps: Deps): McpServer {
   const openOrders = async (acct: number) => client.openOrders(acct).map(decorateOrder);
   const trades = async (acct: number, start: string, end?: string) => client.trades(acct, start, end);
   const dayStart = () => tradingDayStart(client.now()).toISOString();
+  /**
+   * Net position and worst-case exposure of an order, as projectx-mcp: resting same-side entry
+   * orders count (limit/join), plus market orders waiting for the next bar's open (live, they
+   * would have filled) and same-side stop entries while they add to the position (a buy stop
+   * when flat or long); a protective stop is on the other side, or reduces.
+   */
+  async function exposureOf(acct: number, cid: string, side: "buy" | "sell", size: number, except?: number) {
+    const [positions, orders] = await Promise.all([openPositions(acct), openOrders(acct)]);
+    const currentNet = positions
+      .filter((p) => p.contractId === cid)
+      .reduce((n, p) => n + (p.type === 1 ? 1 : p.type === 2 ? -1 : 0) * (p.size as number), 0);
+    const sign = side === "buy" ? 1 : -1;
+    const entryTypes: number[] = [ORDER_TYPES.limit, ORDER_TYPES.join_bid, ORDER_TYPES.join_ask, ORDER_TYPES.market];
+    if (currentNet * sign >= 0) entryTypes.push(ORDER_TYPES.stop, ORDER_TYPES.trailing_stop);
+    const pendingSameSide = orders
+      .filter((o) => o.id !== except && o.contractId === cid && o.side === SIDES[side] && entryTypes.includes(o.type as number))
+      .reduce((n, o) => n + (o.size as number), 0);
+    return { currentNet, exposure: { currentNet, pendingSameSide, side, size } };
+  }
+
   const orderGuard = (acct: number) => {
     assertTradingAllowed(config, acct);
     assertInWindow(config, client.now());
@@ -386,16 +406,7 @@ export function createServer(deps: Deps): McpServer {
         assertSymbolAllowed(config, a.contractId);
         assertOrderSize(config, a.size);
 
-        const [positions, orders] = await Promise.all([openPositions(a.accountId), openOrders(a.accountId)]);
-        const currentNet = positions
-          .filter((p) => p.contractId === a.contractId)
-          .reduce((n, p) => n + (p.type === 1 ? 1 : p.type === 2 ? -1 : 0) * (p.size as number), 0);
-        // As projectx-mcp, plus market orders still waiting for the next bar's open (live, they would have filled).
-        const entryTypes: number[] = [ORDER_TYPES.limit, ORDER_TYPES.join_bid, ORDER_TYPES.join_ask, ORDER_TYPES.market];
-        const pendingSameSide = orders
-          .filter((o) => o.contractId === a.contractId && o.side === SIDES[a.side] && entryTypes.includes(o.type as number))
-          .reduce((n, o) => n + (o.size as number), 0);
-        const exposure = { currentNet, pendingSameSide, side: a.side, size: a.size };
+        const { currentNet, exposure } = await exposureOf(a.accountId, a.contractId, a.side, a.size);
 
         if (increasesExposure(exposure)) {
           if (config.maxDailyLoss > 0) {
@@ -457,7 +468,19 @@ export function createServer(deps: Deps): McpServer {
     },
     handler(async (a: { accountId: number; orderId: number; size?: number; limitPrice?: number; stopPrice?: number; trailPrice?: number; reason?: string }) => {
       orderGuard(a.accountId);
-      if (a.size !== undefined) assertOrderSize(config, a.size);
+      if (a.size !== undefined) {
+        assertOrderSize(config, a.size);
+        // A bigger resting order is more exposure: the same position and daily loss checks as place_order.
+        const o = (await openOrders(a.accountId)).find((x) => x.id === a.orderId);
+        if (o && a.size > (o.size as number)) {
+          const side = o.side === SIDES.buy ? "buy" : "sell";
+          const { exposure } = await exposureOf(a.accountId, o.contractId as string, side, a.size, a.orderId);
+          if (increasesExposure(exposure)) {
+            if (config.maxDailyLoss > 0) assertDailyLoss(config, realizedNet(await trades(a.accountId, dayStart())));
+            assertPositionLimit(config, exposure);
+          }
+        }
+      }
       const res = client.modify({
         accountId: a.accountId,
         orderId: a.orderId,

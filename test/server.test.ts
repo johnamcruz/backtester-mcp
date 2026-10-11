@@ -75,7 +75,7 @@ describe("read tools", () => {
     const { data } = await (await setup({ env: { BACKTESTER_START: "2024-03-01", BACKTESTER_END: "2024-03-31" } })).call("get_server_config");
     expect(data).toMatchObject({
       tradingEnabled: true, maxOrderSize: 1, maxPositionSize: 2, maxDailyLoss: 500, allowedAccountIds: "any", allowedSymbols: "any",
-      mode: "replay", window: { start: "2024-03-01T00:00:00.000Z", end: "2024-03-31T00:00:00.000Z" },
+      mode: "replay", replay: true, window: { start: "2024-03-01T00:00:00.000Z", end: "2024-03-31T00:00:00.000Z" },
       serverTime: iso(T0), tradingDayStartedAt: "2024-03-04T23:00:00.000Z",
       data: { NQ: { file: "NQ_1min.csv" }, MNQ: { file: "NQ_1min.csv" } },
     });
@@ -234,6 +234,17 @@ describe("place_order", () => {
     expect((await call("get_account_snapshot", { accountId: 1 })).data.today.realizedNetPnL).toBeLessThan(-200);
     expect((await call("place_order", { ...order, side: "sell" })).text).toMatch(/Daily loss limit reached/);
     expect((await call("place_order", { ...order, side: "buy" })).isError).toBe(false); // covers the short
+  });
+
+  it("counts same-side stop entries, and checks a resting order whose size grows", async () => {
+    const { call } = await setup({ env: { BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2" } });
+    await call("place_order", { ...order, type: "stop", stopPrice: 20010, size: 2 }); // a buy stop entry while flat
+    expect((await call("place_order", { ...order, size: 1 })).text).toMatch(/net position to 3/);
+    const m = await setup({ env: { BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2" } });
+    await m.call("place_order", { ...order, type: "limit", limitPrice: 19990 });
+    await m.call("place_order", { ...order, type: "limit", limitPrice: 19985 });
+    expect((await m.call("modify_order", { accountId: 1, orderId: 2, size: 2 })).text).toMatch(/net position to 3/);
+    expect((await m.call("modify_order", { accountId: 1, orderId: 2, size: 1 })).data.success).toBe(true);
   });
 
   it("refuses orders outside the replay window", async () => {

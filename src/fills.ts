@@ -55,14 +55,24 @@ export interface SimOrder {
   /** First bar (by open time) the order is checked against. */
   activeFrom: number;
   updatedAt: number;
-  /** "order" is any order the client placed; "sl"/"tp" are bracket legs of `parentId`. */
-  role: "order" | "sl" | "tp";
+  /**
+   * "order" is any order the client placed; "sl"/"tp" are bracket legs of
+   * `parentId`; "close" is a close_position/partial_close_position market
+   * order. Legs and closes only reduce the position.
+   */
+  role: "order" | "sl" | "tp" | "close";
   parentId: number | null;
   stopLossBracket: BracketSpec | null;
   takeProfitBracket: BracketSpec | null;
   fillVolume: number;
   filledPrice: number | null;
   customTag: string | null;
+  /**
+   * The terms the order had when the bar in progress opened, kept when it is
+   * modified inside a bar: that bar is settled on them (activeFrom moves to
+   * the next bar), so a resting order is never skipped for a bar.
+   */
+  prior?: { from: number; limitPrice: number | null; stopPrice: number | null; size: number; trailDistance: number | null } | null;
 }
 
 export interface SimPosition {
@@ -233,7 +243,7 @@ export function fillOrder(book: Book, o: SimOrder, price: number, time: number, 
   const pos = book.position;
   let size = o.size;
   if (o.role !== "order") {
-    // A bracket leg protects the position; it never opens or adds to one.
+    // Bracket legs and closes protect or flatten the position; they never open or add to one.
     const reduces = pos.net !== 0 && Math.sign(pos.net) !== sideSign(o.side);
     if (!reduces) {
       cancel(o, time);
@@ -241,19 +251,22 @@ export function fillOrder(book: Book, o: SimOrder, price: number, time: number, 
     }
     size = Math.min(size, Math.abs(pos.net));
   }
+  const before = pos.net;
   const pnl = applyFill(pos, o.side, size, price, time, spec, ids);
   Object.assign(o, { status: STATUS.filled, fillVolume: size, filledPrice: price, updatedAt: time });
   const fill: SimFill = { orderId: o.id, side: o.side, size, price, time, profitAndLoss: pnl, fees: feesFor(size, spec) };
+  if (o.role === "sl" || o.role === "tp") {
+    for (const s of book.orders) if (s.parentId === o.parentId && s.id !== o.id && s.status === STATUS.open) cancel(s, time);
+  }
+  // Flat, or reversed through flat: the old position's legs (and waiting closes) have nothing left to protect.
+  if (pos.net === 0 || Math.sign(pos.net) !== Math.sign(before)) {
+    for (const s of book.orders) if (s.role !== "order" && s.status === STATUS.open) cancel(s, time);
+  }
   const legs: SimOrder[] = [];
-  if (o.role === "order") {
+  if (o.role === "order" && pos.net !== 0) {
     if (o.stopLossBracket) legs.push(newLeg(o, "sl", o.stopLossBracket, price, size, time, spec.tickSize, ids));
     if (o.takeProfitBracket) legs.push(newLeg(o, "tp", o.takeProfitBracket, price, size, time, spec.tickSize, ids));
     book.orders.push(...legs);
-  } else {
-    for (const s of book.orders) if (s.parentId === o.parentId && s.id !== o.id && s.status === STATUS.open) cancel(s, time);
-  }
-  if (pos.net === 0) {
-    for (const s of book.orders) if (s.role !== "order" && s.status === STATUS.open) cancel(s, time);
   }
   return { fill, legs };
 }
@@ -291,11 +304,14 @@ export function closeBar(book: Book, bar: BarOHLC, spec: FillSpec, ids: Ids): Si
   const end = bar.t + MINUTE;
   const fills: SimFill[] = [];
   const hit = book.orders
-    .filter((o) => o.status === STATUS.open && o.type !== ORDER_TYPES.market && o.activeFrom <= bar.t && triggers(o, bar))
-    .sort((a, b) => Number(isStopType(b.type)) - Number(isStopType(a.type)) || a.id - b.id);
-  for (const o of hit) {
+    .filter((o) => o.status === STATUS.open && o.type !== ORDER_TYPES.market)
+    .map((o) => ({ o, terms: termsOn(o, bar) }))
+    .filter((x): x is { o: SimOrder; terms: SimOrder } => x.terms !== null && triggers(x.terms, bar))
+    .sort((a, b) => Number(isStopType(b.o.type)) - Number(isStopType(a.o.type)) || a.o.id - b.o.id);
+  for (const { o, terms } of hit) {
     if (o.status !== STATUS.open) continue;
-    const { fill, legs } = fillOrder(book, o, restingFillPrice(o, bar, spec), end, spec, ids);
+    if (terms !== o) Object.assign(o, { size: terms.size }); // a size changed inside the bar applies from the next bar
+    const { fill, legs } = fillOrder(book, o, restingFillPrice(terms, bar, spec), end, spec, ids);
     if (fill) fills.push(fill);
     for (const leg of legs) {
       if (leg.role !== "sl" || !isStopType(leg.type) || leg.status !== STATUS.open || !triggers(leg, bar)) continue;
@@ -306,6 +322,17 @@ export function closeBar(book: Book, bar: BarOHLC, spec: FillSpec, ids: Ids): Si
   }
   for (const o of book.orders) if (o.status === STATUS.open && o.activeFrom <= bar.t) trailStep(o, bar, spec.tickSize, end);
   return fills;
+}
+
+/**
+ * The terms an order is checked on for a bar: its own once live (activeFrom
+ * at or before the bar's open), the terms it had when the bar opened if it
+ * was modified inside the bar, else none (placed inside the bar: from the next one).
+ */
+export function termsOn(o: SimOrder, bar: BarOHLC): SimOrder | null {
+  if (o.activeFrom <= bar.t) return o;
+  if (o.prior && o.prior.from <= bar.t) return { ...o, ...o.prior };
+  return null;
 }
 
 /** A broker-side trailing stop: after the bar, the stop follows the bar's extreme at the trail distance, never loosening. */

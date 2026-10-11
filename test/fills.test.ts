@@ -14,6 +14,7 @@ import {
   openBar,
   stopFillPrice,
   stopTriggered,
+  termsOn,
   trailStep,
   type Book,
   type FillSpec,
@@ -199,5 +200,49 @@ describe("bars", () => {
     const book = emptyBook([order({ id: 7, type: 5, side: 1, stopPrice: 99, trailDistance: 1 })]);
     book.position = { id: 1, net: 1, averagePrice: 100, openedAt: T - M };
     expect(closeBar(book, bar(100, 100, 98.5, 99), MNQ, ids())).toMatchObject([{ orderId: 7, price: 98.75, profitAndLoss: -2.5 }]);
+  });
+
+  it("fills stops before limits on a bar that touches both, whatever their order ids", () => {
+    const target = order({ id: 1, type: 1, side: 1, limitPrice: 102 });
+    const stop = order({ id: 2, type: 4, side: 1, stopPrice: 98 });
+    const book = emptyBook([target, stop]);
+    book.position = { id: 1, net: 1, averagePrice: 100, openedAt: T - M };
+    const fills = closeBar(book, bar(100, 103, 97, 100), MNQ, ids());
+    expect(fills[0]).toMatchObject({ orderId: 2, price: 97.75 });
+    // The client's own target is not a bracket leg: it then fills too and opens a short, as at a real broker.
+    expect(fills[1]).toMatchObject({ orderId: 1, price: 102 });
+  });
+
+  it("a close order only reduces: cancelled once a stop has flattened the position", () => {
+    const book = emptyBook([order({ stopLossBracket: { ticks: 4, type: 4 } })]);
+    const i = ids();
+    openBar(book, bar(100, 100, 100, 100), MNQ, i);
+    const close = order({ id: 60, side: 1, role: "close", placedAt: T + 30000 });
+    book.orders.push(close);
+    closeBar(book, bar(100, 100, 98, 99), MNQ, i); // the stop (99.25) fills
+    expect(openBar(book, bar(99, 99, 99, 99, T + M), MNQ, i)).toEqual([]);
+    expect(close.status).toBe(STATUS.cancelled);
+    expect(book.position.net).toBe(0);
+  });
+
+  it("cancels the old position's legs when a fill reverses it through flat", () => {
+    const book = emptyBook([order({ stopLossBracket: { ticks: 20, type: 4 } })]);
+    const i = ids();
+    openBar(book, bar(100, 100, 100, 100), MNQ, i);
+    book.orders.push(order({ id: 70, side: 1, size: 2, placedAt: T + M }));
+    openBar(book, bar(101, 101, 101, 101, T + M), MNQ, i);
+    expect(book.position.net).toBe(-1);
+    expect(book.orders.filter((o) => o.status === STATUS.open)).toEqual([]);
+  });
+
+  it("settles the bar in progress on the terms an order had when it opened", () => {
+    const o = order({ type: 4, side: 1, stopPrice: 99.5, activeFrom: T + 30000, prior: { from: T - M, limitPrice: null, stopPrice: 98, size: 1, trailDistance: null } });
+    expect(termsOn(o, bar(100, 100, 99, 99))?.stopPrice).toBe(98);
+    expect(termsOn(o, bar(100, 100, 99, 99, T + M))).toBe(o);
+    expect(termsOn(order({ activeFrom: T + 30000 }), bar(100, 100, 99, 99))).toBeNull();
+    const book = emptyBook([o]);
+    book.position = { id: 1, net: 1, averagePrice: 100, openedAt: T - M };
+    expect(closeBar(book, bar(100, 100, 99, 99), MNQ, ids())).toEqual([]); // the old stop (98) was not reached
+    expect(closeBar(book, bar(99.5, 99.5, 99, 99, T + M), MNQ, ids())).toMatchObject([{ price: 99.25 }]);
   });
 });
