@@ -880,13 +880,14 @@ export class ReplayExchange {
       const flat = closes.filter((o) => o.flatten).at(-1);
       // With a close_position waiting, what is left to close is what the client sent after it.
       const after = (o: StoredOrder) => !flat || o.id > flat.id;
-      const ref = flat
-        ? state.orders
-            .filter((o) => o.contractId === contractId && o.status === STATUS.open && o.role === "order" && o.type === ORDER_TYPES.market && after(o))
-            .reduce((n, o) => n + sideSign(o.side) * o.size, 0)
-        : held;
+      const later = flat
+        ? state.orders.filter((o) => o.contractId === contractId && o.status === STATUS.open && o.role === "order" && o.type === ORDER_TYPES.market && after(o))
+        : [];
+      const ref = flat ? later.reduce((n, o) => n + sideSign(o.side) * o.size, 0) : held;
       if (size === null) {
-        if (flat && ref === 0) return OK; // the same request again: nothing sent since
+        // The same request again is a no-op only with no market order sent since; any later one (even
+        // if they net to zero: one may be rejected at fill) moves the close after them.
+        if (flat && later.length === 0) return OK;
         if (!flat && held === 0) return refuse(2, `No open position in ${contractId}.`);
       } else {
         if (ref === 0) {

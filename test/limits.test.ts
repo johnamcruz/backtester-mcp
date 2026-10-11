@@ -201,6 +201,41 @@ describe("close_position means flat after everything sent before it", () => {
     expect(await net(call)).toBe(1); // flat, long 2, then the partial sells 1
   });
 
+  it("a repeated close moves after later market orders even when they net to zero (one may be rejected at fill)", async () => {
+    const { call, setNow } = await setup({ data: { NQ: flat(T0 - 30 * MIN, 60, 20000) }, env: { BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2", BACKTESTER_MAX_DAILY_LOSS: "1.5", BACKTESTER_FEES_MICRO: "0" }, now: T0 - 2 * MIN });
+    await call("place_order", { ...base, side: "buy", type: "market", size: 1 }); // long 1 at 20000.25
+    setNow(T0 - 30000);
+    expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true); // -$1.00 at T0
+    for (const o of [{ side: "buy", size: 2 }, { side: "sell", size: 1 }, { side: "sell", size: 2 }, { side: "buy", size: 1 }]) await call("place_order", { ...base, type: "market", ...o });
+    expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true);
+    setNow(T0 + MIN);
+    expect((await orders(call)).some((o: any) => o.statusName === "rejected")).toBe(true);
+    expect(await net(call)).toBe(0);
+  });
+
+  it("a partial after a close and a reversing sell reduces the short", async () => {
+    const { call, setNow } = await setup({ data: swings(), env, now: T0 - 2 * MIN });
+    await call("place_order", { ...base, side: "buy", type: "market", size: 1 });
+    setNow(T0 - 30000);
+    await call("close_position", { accountId: 1, contractId: "BT.MNQ" });
+    await call("place_order", { ...base, side: "sell", type: "market", size: 2 }); // short 2 after the close
+    expect((await call("partial_close_position", { accountId: 1, contractId: "BT.MNQ", size: 1 })).data.success).toBe(true);
+    setNow(T0 + MIN);
+    expect(await net(call)).toBe(-1);
+  });
+
+  it("a partial sent before the close doesn't count against partials after it", async () => {
+    const { call, setNow } = await setup({ data: swings(), env, now: T0 - 2 * MIN });
+    await call("place_order", { ...base, side: "buy", type: "market", size: 2 });
+    setNow(T0 - 30000);
+    expect((await call("partial_close_position", { accountId: 1, contractId: "BT.MNQ", size: 1 })).data.success).toBe(true);
+    await call("close_position", { accountId: 1, contractId: "BT.MNQ" });
+    await call("place_order", { ...base, side: "buy", type: "market", size: 2 });
+    expect((await call("partial_close_position", { accountId: 1, contractId: "BT.MNQ", size: 2 })).data.success).toBe(true);
+    setNow(T0 + MIN);
+    expect(await net(call)).toBe(0);
+  });
+
   it("only market orders sent after a waiting close count as reopening it, not resting ones", async () => {
     const { call, setNow } = await setup({ data: swings(), env, now: T0 - 2 * MIN });
     await call("place_order", { ...base, side: "buy", type: "market", size: 1 }); // long 1
