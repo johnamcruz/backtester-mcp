@@ -291,6 +291,45 @@ describe("round trips through the exchange", () => {
     expect(exchange.tradeReport(1, iso(T0)).roundTrips[0]).toMatchObject({ initialStop: 19995, partialExits: 1, reason: "stop", exitPrice: 19992.25 });
   });
 
+  describe("trail by cancel and replace: only the client's own cancel or move of the initial stop, before the exit", () => {
+    // Long 1 MNQ at T0 (20000.25); bar T0+3 trades down to 19994.
+    const data = { NQ: [...flat(T0 - 5 * MIN, 5, 20000), ...flat(T0, 3, 20000), ...seq(T0 + 3 * MIN, [[20000, 20000, 19994, 19995]]), ...flat(T0 + 4 * MIN, 5, 19995)] };
+    const replay = async (initial: Partial<PlaceRequest>, then: (x: ReplayExchange) => void, after?: (x: ReplayExchange) => void) => {
+      const { exchange, setNow } = await setup({ data });
+      exchange.place(req(initial));
+      if (!initial.stopLossBracket) exchange.place(req({ side: 1, type: 4, stopPrice: 19990 }));
+      setNow(T0 + 2 * MIN);
+      then(exchange);
+      exchange.place(req({ side: 1, type: 4, stopPrice: 19996 })); // fills at T0+3: 19995.75
+      setNow(T0 + 5 * MIN);
+      after?.(exchange);
+      return exchange.tradeReport(1, iso(T0)).roundTrips[0];
+    };
+    const sl = { stopLossBracket: { ticks: 40, type: 4 } }; // leg at 19990.25 (order 2)
+    it("a bracket leg cancelled by the client and replaced: trail", async () => {
+      expect(await replay(sl, (x) => x.cancel(1, 2))).toMatchObject({ initialStop: 19990.25, exitPrice: 19995.75, reason: "trail" });
+    });
+    it("a bracket leg left alone (cancelled by the engine at the exit): stop", async () => {
+      expect(await replay(sl, () => {})).toMatchObject({ initialStop: 19990.25, reason: "stop" });
+    });
+    it("a client stop moved before the exit: trail; moved or cancelled after it: stop", async () => {
+      const move = (price: number) => (x: ReplayExchange) => x.modify({ accountId: 1, orderId: 2, size: null, limitPrice: null, stopPrice: price, trailPrice: null });
+      expect(await replay({}, move(19985))).toMatchObject({ initialStop: 19990, reason: "trail" });
+      expect(await replay({}, () => {}, move(19980))).toMatchObject({ initialStop: 19990, reason: "stop" });
+      expect(await replay({}, () => {}, (x) => x.cancel(1, 2))).toMatchObject({ initialStop: 19990, reason: "stop" });
+    });
+    it("a leg cancelled by OCO at a target scale-out: the later stop for the rest reads stop", async () => {
+      const d = { NQ: [...flat(T0 - 5 * MIN, 5, 20000), ...seq(T0, [[20000, 20000, 20000, 20000], [20000, 20003, 20000, 20002], [20002, 20002, 20002, 20002], [20002, 20002, 20002, 20002], [20002, 20002, 19994, 19995]]), ...flat(T0 + 5 * MIN, 3, 19995)] };
+      const { exchange, setNow } = await setup({ data: d });
+      exchange.place(req({ stopLossBracket: { ticks: 40, type: 4 }, takeProfitBracket: { ticks: 8, type: 1 } })); // TP 20002.25
+      exchange.place(req());
+      setNow(T0 + 3 * MIN);
+      exchange.place(req({ side: 1, type: 4, stopPrice: 19995 }));
+      setNow(T0 + 6 * MIN);
+      expect(exchange.tradeReport(1, iso(T0)).roundTrips[0]).toMatchObject({ initialStop: 19990.25, partialExits: 1, reason: "stop" });
+    });
+  });
+
   it("a stop cancelled and replaced after the first minute reads trail", async () => {
     const data = { NQ: [...flat(T0 - 5 * MIN, 5, 20000), ...seq(T0, [[20000, 20003, 19999, 20002], [20002, 20004, 20001, 20003], [20003, 20003, 20000, 20001], [20001, 20001, 20001, 20001]])] };
     const { exchange, setNow } = await setup({ data });

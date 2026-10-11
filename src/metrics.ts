@@ -57,8 +57,9 @@
  * Exit reason "trail" (sim-broker.js#onBar: stop !== initialStop) is a
  * trailing stop, a stop whose price was modified during the trade, or a
  * client stop placed after the trade's first minute away from the initial
- * stop once the initial stop's order was cancelled or moved before the exit
- * (a cancel-and-replace move). Other stops (scale-out stops, an add's stop)
+ * stop once the client cancelled or moved the initial stop's order before
+ * the exit (a cancel-and-replace move; the engine's OCO and flat cancels don't
+ * count). Other stops (scale-out stops, an add's stop)
  * read "stop". Initial risk = |entry - stop| /
  * tickSize x tickValue x opening size. No such stop: R fields are null.
  */
@@ -295,13 +296,16 @@ export function roundTrips(contractId: string, fills: Trade[], orders: MetricOrd
       const moved = differs(o.stopPrice, stopPriceAt(o, e.id, e.entryTime));
       // Moved by cancel and replace: the initial stop's order was cancelled or moved before this exit, and this is a
       // client stop placed after the trade's first minute, away from the initial stop.
+      // Only the client's own acts count (a cancel or modify recorded before the exit fill); the engine's OCO and
+      // flat cancels don't, nor anything after the exit.
       const src = stop?.source;
       const exitFill = e.exits.at(-1)?.fillId ?? Infinity;
-      const gone =
-        !!src &&
-        src.id !== o.id &&
-        ((src.status === STATUS.cancelled && (src.cancelSeq !== undefined ? src.cancelSeq <= exitFill : src.updatedAt < (e.endTime ?? Infinity))) ||
-          differs(src.stopPrice, stop?.price));
+      const movedBefore = (x: MetricOrder) => {
+        let price: number | undefined;
+        for (const [, p, seq] of x.stopAt ?? []) if (seq !== undefined && seq <= exitFill) price = p;
+        return differs(price, stop?.price);
+      };
+      const gone = !!src && src.id !== o.id && ((src.cancelSeq !== undefined && src.cancelSeq <= exitFill) || movedBefore(src));
       const replaced = gone && o.role === "order" && o.placedAt >= e.entryTime + MINUTE && differs(o.stopPrice, stop?.price);
       return o.type === ORDER_TYPES.trailing_stop || moved || replaced ? "trail" : "stop";
     }
