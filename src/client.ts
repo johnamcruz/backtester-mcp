@@ -848,11 +848,13 @@ export class ReplayExchange {
   /**
    * No bar is left to fill on before BACKTESTER_END: the clock is at or past END (">=": a bar
    * opening at END would close after it), or the next bar after the clock opens after END (or
-   * there is none) while a window is set.
+   * there is none) while a window is set. With marketFill "now", a clock before END inside a bar
+   * still has that bar to fill market orders on (they fill at its open, at the moment).
    */
   private ended(now: Date, s: BarSeries): boolean {
     if (this.config.end === null) return false;
     if (now.getTime() >= this.config.end) return true;
+    if (this.arrivalBar(s, now) >= 0) return false;
     const i = s.lowerBound(now.getTime());
     return i >= s.length || s.t[i] > this.config.end;
   }

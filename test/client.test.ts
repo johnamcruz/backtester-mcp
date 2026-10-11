@@ -195,6 +195,32 @@ describe("market orders at the replay moment (BACKTESTER_MARKET_FILL=now, the de
     expect(next.exchange.place(req())).toMatchObject({ errorCode: 5, errorMessage: expect.stringMatching(/market is closed/) });
   });
 
+  it("are rejected at fill when the fill would breach a limit (the broker's fill-time guard)", async () => {
+    // The exchange directly, past the server's placement checks: a buy of 2 with a max position of 1.
+    const { exchange } = await setup({ now: t, data: { NQ: rows() }, env: { BACKTESTER_MAX_POSITION_SIZE: "1", BACKTESTER_MAX_ORDER_SIZE: "2" } });
+    expect(exchange.place(req({ size: 2 }))).toMatchObject({ success: true });
+    expect(exchange.searchOrders(1, iso(T0))[0]).toMatchObject({ status: 5, rejectReason: expect.stringMatching(/would be 2/) });
+    expect(exchange.positions(1)).toEqual([]);
+    // Past the daily loss limit: an opening fill on arrival is rejected, a reducing one fills.
+    const dl = await setup({ now: t, data: { NQ: rows() }, env: { BACKTESTER_MAX_DAILY_LOSS: "1", BACKTESTER_MAX_ORDER_SIZE: "2", BACKTESTER_MAX_POSITION_SIZE: "2" } });
+    dl.exchange.place(req({ size: 2 }));
+    dl.exchange.close(1, "BT.MNQ", 1); // -1 tick x 2 sides = -$1, fees $0.74: past the limit
+    expect(dl.exchange.place(req())).toMatchObject({ success: true });
+    expect(dl.exchange.searchOrders(1, iso(T0)).at(-1)).toMatchObject({ status: 5, rejectReason: expect.stringMatching(/daily loss limit/) });
+    dl.exchange.place(req({ side: 1 }));
+    expect(dl.exchange.positions(1)).toEqual([]);
+  });
+
+  it("fill in the last minute before BACKTESTER_END at that minute's open", async () => {
+    const data = { NQ: [...flat(Date.parse("2024-03-05T21:50:00Z"), 9, 20000), [Date.parse("2024-03-05T21:59:00Z"), 20010, 20010, 20010, 20010] as Row, ...flat(Date.parse("2024-03-05T23:00:00Z"), 5, 20020)] };
+    const at = Date.parse("2024-03-05T21:59:30Z");
+    const { exchange } = await setup({ now: at, data, env: { BACKTESTER_END: "2024-03-05T22:00:00Z" } });
+    expect(exchange.place(req())).toMatchObject({ success: true });
+    expect(exchange.place(req({ type: 1, limitPrice: 19990 }))).toMatchObject({ errorCode: 5 });
+    expect(exchange.close(1, "BT.MNQ", null)).toMatchObject({ success: true });
+    expect(exchange.trades(1, iso(T0)).map((x) => [x.price, x.creationTimestamp])).toEqual([[20010.25, iso(at)], [20009.75, iso(at)]]);
+  });
+
   it("join_bid / join_ask fill on arrival only when marketable at the containing bar's open", async () => {
     // Last close 20000; bar T0 opens at 20002.
     const data = { NQ: [...flat(T0 - 5 * MIN, 5, 20000), ...seq(T0, [[20002, 20003, 20001, 20002], [20002, 20002, 20002, 20002]])] };
