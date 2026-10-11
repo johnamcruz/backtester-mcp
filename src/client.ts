@@ -469,10 +469,11 @@ export class ReplayExchange {
       for (const k of curs) if (active(k)) t = Math.min(t, k.s.t[k.i]);
       if (t === Infinity) break;
       const group = curs.filter((k) => active(k) && k.s.t[k.i] === t);
-      // Each moment (the minute's open, then its close) runs in two passes over every contract:
-      // first the fills that reduce a position (exits, stops, closes), then the ones that open
-      // exposure. A loss realized at that moment on any contract counts before any opening fill,
-      // whatever the contracts' order.
+      // Each moment (the minute's open, then its close) runs in two passes over every contract.
+      // Pass 1 walks each book in its normal order (markets by arrival; resting orders stops first,
+      // then by id) and stops at its first fill that would open exposure; pass 2 continues every
+      // book from there in the same order. So a contract's own fills keep their order, and the
+      // leading reductions on every contract count before an opening fill on any other.
       const pass = (fn: (k: (typeof curs)[number], hooks: Hooks, last: boolean) => void) => {
         for (const k of group) fn(k, { ...this.hooks(state, k.contractId), deferOpening: true }, false);
         for (const k of group) fn(k, this.hooks(state, k.contractId), true);

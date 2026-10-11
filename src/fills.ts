@@ -117,9 +117,10 @@ export interface Hooks {
   guard?(o: SimOrder, size: number, pos: SimPosition, time: number): string | null;
   onFill?(fill: SimFill): void;
   /**
-   * Exits first: when set, a client order's fill that would open exposure is skipped (the order
-   * stays open) so the caller can run every contract's reducing fills of a moment first, then
-   * call again without it for the opening fills.
+   * Exits first across contracts: when set, openBar/closeBar walk the book in its normal order
+   * and stop at the first client order whose fill would open exposure (it and everything after
+   * it stay as they are), so the caller can run every contract's leading reducing fills of a
+   * moment first, then call again without it to continue each book from there in normal order.
    */
   deferOpening?: boolean;
 }
@@ -264,12 +265,12 @@ const cancel = (o: SimOrder, time: number) => Object.assign(o, { status: STATUS.
  * sibling (OCO), and cancel every bracket leg once the position is flat.
  * Returns the fill (null when a leg had nothing left to close) and the legs created.
  */
-export function fillOrder(book: Book, o: SimOrder, price: number, time: number, spec: FillSpec, ids: Ids, hooks: Hooks = {}): { fill: SimFill | null; legs: SimOrder[] } {
+export function fillOrder(book: Book, o: SimOrder, price: number, time: number, spec: FillSpec, ids: Ids, hooks: Hooks = {}): { fill: SimFill | null; legs: SimOrder[]; deferred?: boolean } {
   const pos = book.position;
   if (o.role === "close" && o.flatten && pos.net !== 0) Object.assign(o, { side: pos.net > 0 ? 1 : 0, size: Math.abs(pos.net) });
   let size = o.size;
   if (o.role === "order") {
-    if (hooks.deferOpening && exposureAfter(pos.net, o.side, size).opens) return { fill: null, legs: [] };
+    if (hooks.deferOpening && exposureAfter(pos.net, o.side, size).opens) return { fill: null, legs: [], deferred: true };
     const reason = hooks.guard?.(o, size, pos, time) ?? null;
     if (reason) {
       Object.assign(o, { status: STATUS.rejected, updatedAt: time, rejectReason: reason });
@@ -319,7 +320,8 @@ export function openBar(book: Book, bar: BarOHLC, spec: FillSpec, ids: Ids, hook
   const due = book.orders.filter((o) => o.status === STATUS.open && o.type === ORDER_TYPES.market && o.placedAt <= bar.t);
   for (const o of due.sort((a, b) => a.id - b.id)) {
     if (o.status !== STATUS.open) continue;
-    const { fill } = fillOrder(book, o, marketFillPrice(bar.o, o.side, spec), bar.t, spec, ids, hooks);
+    const { fill, deferred } = fillOrder(book, o, marketFillPrice(bar.o, o.side, spec), bar.t, spec, ids, hooks);
+    if (deferred) break; // pass 1 stops at the first opening fill; pass 2 continues in order
     if (fill) fills.push(fill);
   }
   return fills;
@@ -348,7 +350,8 @@ export function closeBar(book: Book, bar: BarOHLC, spec: FillSpec, ids: Ids, hoo
     .sort((a, b) => Number(isStopType(b.type)) - Number(isStopType(a.type)) || a.id - b.id);
   for (const o of hit) {
     if (o.status !== STATUS.open) continue;
-    const { fill, legs } = fillOrder(book, o, restingFillPrice(o, bar, spec), end, spec, ids, hooks);
+    const { fill, legs, deferred } = fillOrder(book, o, restingFillPrice(o, bar, spec), end, spec, ids, hooks);
+    if (deferred) break; // pass 1 stops at the first opening fill; pass 2 continues in order
     if (fill) fills.push(fill);
     for (const leg of legs) {
       if (leg.role !== "sl" || !isStopType(leg.type) || leg.status !== STATUS.open || !triggers(leg, bar)) continue;

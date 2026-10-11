@@ -69,17 +69,41 @@ describe("fill-time limits: the review's repros", () => {
 });
 
 describe("closes", () => {
-  it("close_position is taken beside a waiting reversing market order: exits fill first", async () => {
+  it("close_position is taken beside a waiting reversing market order, and still ends flat", async () => {
     const { call, setNow } = await setup({ data: swings(), env: { BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2" } });
     await call("place_order", { ...base, side: "sell", type: "market", size: 1 });
     setNow(T0 + 30000);
     expect((await call("place_order", { ...base, side: "buy", type: "market", size: 2 })).data.success).toBe(true);
     expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true);
     setNow(T0 + 2 * MIN);
-    // At the next open the close (an exit) fills first and flattens the short; then the buy opens long 2.
+    // Arrival order at the next open: the buy (long 1), then the close flattens what is open.
     const fills = (await call("search_trades", { accountId: 1, startTimestamp: iso(T0) })).data;
-    expect(fills.slice(1).map((t: any) => [t.orderId, t.sideName, t.size])).toEqual([[3, "buy", 1], [2, "buy", 2]]);
-    expect(await net(call)).toBe(2);
+    expect(fills.slice(1).map((t: any) => [t.orderId, t.sideName, t.size])).toEqual([[2, "buy", 2], [3, "sell", 1]]);
+    expect(await net(call)).toBe(0);
+  });
+
+  it("close_position flattens an add waiting with it, inside a bar and on a bar's open", async () => {
+    for (const at of [T0 + 30000, T0]) {
+      const { call, setNow } = await setup({ data: swings(), env: { BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2" }, now: T0 - 2 * MIN });
+      await call("place_order", { ...base, side: "buy", type: "market", size: 1 }); // long 1 (the clock is on a bar's open)
+      setNow(at);
+      await call("place_order", { ...base, side: "buy", type: "market", size: 1 });
+      expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true);
+      setNow(T0 + 2 * MIN);
+      expect(await net(call)).toBe(0);
+    }
+  });
+
+  it("keeps a contract's own fills in order: a buy stop (stops first) fills before the target, which then flattens", async () => {
+    const data = { NQ: [...flat(T0 - 30 * MIN, 30, 20000), ...seq(T0, [[20000, 20000, 20000, 20000], [20000, 20010, 20000, 20005]]), ...flat(T0 + 2 * MIN, 30, 20005)] };
+    const { call, setNow } = await setup({ data, env: { BACKTESTER_MAX_POSITION_SIZE: "3", BACKTESTER_MAX_ORDER_SIZE: "3", BACKTESTER_SLIPPAGE_TICKS: "0" } });
+    await call("place_order", { ...base, side: "buy", type: "market", size: 2, stopLossBracket: { ticks: 40, type: "stop" }, takeProfitBracket: { ticks: 32, type: "limit" } }); // TP sells 2 at 20008
+    await call("partial_close_position", { accountId: 1, contractId: "BT.MNQ", size: 1 }); // long 1
+    await call("place_order", { ...base, side: "buy", type: "stop", size: 1, stopPrice: 20004 });
+    setNow(T0 + 3 * MIN);
+    // In the bar: the buy stop (long 2), then the target sells 2: flat, nothing left unprotected.
+    expect(await net(call)).toBe(0);
+    expect((await orders(call)).find((o: any) => o.stopPrice === 20004)).toMatchObject({ statusName: "filled" });
   });
 
   it("close_position is taken while a partial close waits, and a second one is the same request", async () => {
@@ -89,7 +113,7 @@ describe("closes", () => {
     expect((await call("partial_close_position", { accountId: 1, contractId: "BT.MNQ", size: 1 })).data.success).toBe(true);
     expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true);
     expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true); // idempotent
-    expect((await call("partial_close_position", { accountId: 1, contractId: "BT.MNQ", size: 1 })).data).toMatchObject({ errorName: "OrderPending" });
+    expect((await call("partial_close_position", { accountId: 1, contractId: "BT.MNQ", size: 1 })).data).toMatchObject({ errorName: "OrderPending", errorMessage: expect.stringMatching(/close_position is already waiting/) });
     expect((await call("list_open_orders", { accountId: 1 })).data).toHaveLength(2); // the partial and one close
     setNow(T0 + 2 * MIN);
     expect(await net(call)).toBe(0);
@@ -98,11 +122,12 @@ describe("closes", () => {
 
   it("an order that only reduces gets no bracket legs; one going through flat gets them for the new part", async () => {
     const { call } = await setup({ env: { BACKTESTER_MAX_POSITION_SIZE: "3", BACKTESTER_MAX_ORDER_SIZE: "3" } });
-    await call("place_order", { ...base, side: "buy", type: "market", size: 2 });
-    await call("place_order", { ...base, side: "sell", type: "market", size: 1, takeProfitBracket: { ticks: 8, type: "limit" } });
+    await call("place_order", { ...base, side: "buy", type: "market", size: 3 });
+    await call("place_order", { ...base, side: "sell", type: "market", size: 2, takeProfitBracket: { ticks: 8, type: "limit" } }); // long 3 -> 1: only reduces
     expect((await call("list_open_orders", { accountId: 1 })).data).toEqual([]);
-    await call("place_order", { ...base, side: "sell", type: "market", size: 3, stopLossBracket: { ticks: 8, type: "stop" } }); // long 1 -> short 2
-    expect((await call("list_open_orders", { accountId: 1 })).data).toMatchObject([{ sideName: "buy", typeName: "stop", size: 2 }]);
+    await call("place_order", { ...base, side: "buy", type: "market", size: 1 }); // long 2
+    await call("place_order", { ...base, side: "sell", type: "market", size: 3, stopLossBracket: { ticks: 8, type: "stop" } }); // long 2 -> short 1
+    expect((await call("list_open_orders", { accountId: 1 })).data).toMatchObject([{ sideName: "buy", typeName: "stop", size: 1 }]);
   });
 
   it("a reducing market order isn't refused for the opposite orders resting beside it", async () => {
@@ -153,6 +178,21 @@ describe("several contracts in one minute", () => {
     expect(await net(call)).toBe(0);
   });
 
+  it("at a minute's open too: a loss closing on one contract counts before a reversal on another that sorts first", async () => {
+    const data = {
+      NQ: [...flat(T0 - 30 * MIN, 30, 20000), [T0, 20000, 20000, 20000, 20000] as Row, ...flat(T0 + MIN, 30, 19990)],
+      ES: [...flat(T0 - 30 * MIN, 31, 5000), ...flat(T0 + MIN, 30, 5000)],
+    };
+    const { call, setNow } = await setup({ data, env: { ...env, BACKTESTER_SLIPPAGE_TICKS: "1" } });
+    await call("place_order", { ...base, contractId: "BT.MES", side: "buy", type: "market", size: 1 });
+    await call("place_order", { ...base, contractId: "BT.MNQ", side: "buy", type: "market", size: 1 });
+    setNow(T0 + 30000);
+    expect((await call("place_order", { ...base, contractId: "BT.MES", side: "sell", type: "market", size: 2 })).data.success).toBe(true); // through flat
+    expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true); // -$21 at the next open
+    setNow(T0 + 2 * MIN);
+    expect((await orders(call)).find((o: any) => o.contractId === "BT.MES" && o.size === 2)).toMatchObject({ statusName: "rejected", rejectReason: expect.stringMatching(/daily loss/) });
+  });
+
   it("fills every contract's orders in a minute, at its open and at its close", async () => {
     const { call, setNow } = await setup({ data: two(), env: { ...env, BACKTESTER_MAX_DAILY_LOSS: "0" } });
     setNow(T0 + 30000);
@@ -184,6 +224,27 @@ describe("several contracts in one minute", () => {
     setNow(T0 + 3 * MIN);
     expect((await call("search_trades", { accountId: 1, startTimestamp: iso(T0) })).data.at(-1)).toMatchObject({ profitAndLoss: -2 });
     expect((await orders(call)).find((o: any) => o.stopPrice === 20002 && !o.reduceOnly)).toMatchObject({ statusName: "rejected" });
+  });
+});
+
+describe("trailing stops in the sync", () => {
+  // T0+1 rises to 20010 but dips to 19995 first; T0+2 opens 20002 and dips to 19998.
+  const data = () => ({ NQ: [...flat(T0 - 30 * MIN, 30, 20000), ...seq(T0, [[20000, 20000, 20000, 20000], [20000, 20010, 19995, 20008], [20002, 20003, 19998, 20000]]), ...flat(T0 + 3 * MIN, 30, 20000)] });
+  const env = { BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2" };
+
+  it.each([
+    ["protecting a long", true],
+    ["opening a short", false],
+  ])("ratchet once per bar, after its fills: never triggered on the bar that moved them (%s)", async (_name, long) => {
+    const { call, setNow } = await setup({ data: data(), env });
+    if (long) await call("place_order", { ...base, side: "buy", type: "market", size: 1 });
+    await call("place_order", { ...base, side: "sell", type: "trailing_stop", size: 1, trailPrice: 19990 }); // 10 points under the last close
+    setNow(T0 + 2 * MIN);
+    const stop = (await orders(call)).find((o: any) => o.typeName === "trailing_stop");
+    expect(stop).toMatchObject({ statusName: "open", stopPrice: 20000 }); // moved by T0+1's high, not filled on it
+    setNow(T0 + 3 * MIN);
+    expect((await orders(call)).find((o: any) => o.typeName === "trailing_stop")).toMatchObject({ statusName: "filled", filledPrice: 19999.75 });
+    expect(await net(call)).toBe(long ? 0 : -1);
   });
 });
 
