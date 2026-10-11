@@ -14,9 +14,12 @@ implements the broker MCP interface of
 the same contract and the same tools as
 [projectx-mcp](https://github.com/johnamcruz/projectx-mcp) (TopstepX), over
 local historical one-minute bars with a replay clock and simulated fills. It is
-a drop-in replacement: a harness switches to it by broker config alone
-(`FTH_BROKER=backtester`) and runs unchanged; only data, clock and fills are
-simulated.
+a drop-in replacement at the MCP-interface level (same tools, schemas,
+results): a harness selects it by broker config (`FTH_BROKER=backtester`).
+Replaying through the harness also needs the harness's replay clock (pending:
+the gateway honours `FTH_REPLAY_NOW` only for a broker reporting
+`replay: true` and a `serverTime` near it); set `FTH_REPLAY_NOW` equal to the
+clock file's time.
 
 ## Layout
 
@@ -31,8 +34,8 @@ the ProjectX REST client.
   state file (locked per call, shared by every process of a run), syncing to
   the clock, orders, positions, fills, bars, quotes.
 - `src/fills.ts`: the fill engine, pure functions over one contract's book and
-  one bar, ported from the harness backtester with line citations
-  (`engine.js:<line>`). The parity target.
+  one bar, ported from the harness simulated broker with citations
+  (`sim-broker.js#<function>`). The parity target.
 - `src/bars.ts`: CSV loading and aggregation of one-minute bars.
 - `src/clock.ts`: reading the replay clock; also the clock CLI (`dist/clock.js`).
 - `src/risk.ts`: guardrails and trading-day math (pure functions).
@@ -67,8 +70,9 @@ BACKTESTER_DATA_DIR=<data> BACKTESTER_NOW=2024-03-05T15:00:00Z BACKTESTER_STATE_
   a result are allowed; missing or renamed ones are not. `test/server.test.ts`
   pins projectx-mcp's tool and input lists.
 - **Fills match the harness backtester.** The rules in `src/fills.ts` are those
-  of `scripts/lib/backtest/engine.js`, cited by line; a parity test in the
-  harness compares them. Change a rule only together with the backtester, and
+  of the harness's simulated broker, `scripts/lib/backtest/sim-broker.js`
+  (extracted from `engine.js` in harness PR #23), cited by function; a parity
+  test in the harness that compares them is planned. Change a rule only together with the backtester, and
   keep the citations current.
 - **Deterministic.** A run's results depend only on the data, the window, the
   clock sequence and the orders. No wall clock in fills, state or journal

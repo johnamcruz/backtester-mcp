@@ -2,7 +2,10 @@
 
 **A replay broker: an MCP server that implements the futures-trading-harness broker interface over local historical bars, with a replay clock and simulated fills.**
 
-It answers with the same tools, inputs, results and errors as [projectx-mcp](https://github.com/johnamcruz/projectx-mcp) (TopstepX), so any harness that speaks the [broker MCP interface](https://github.com/johnamcruz/futures-trading-harness/blob/main/docs/BROKER-MCP-INTERFACE.md) runs against it unchanged: the agents, the order gate, the runner. Only three things are simulated: the **data** (your one-minute CSVs), the **clock** (a file the replay driver advances), and the **fills** (the harness backtester's rules). Use it to backtest a harness end to end, or to replay a day the way it would have traded live.
+It answers with the same tools, inputs, results and errors as [projectx-mcp](https://github.com/johnamcruz/projectx-mcp) (TopstepX), so it is a drop-in replacement at the level of the [broker MCP interface](https://github.com/johnamcruz/futures-trading-harness/blob/main/docs/BROKER-MCP-INTERFACE.md): same tools, schemas and results. Only three things are simulated: the **data** (your one-minute CSVs), the **clock** (a file the replay driver advances), and the **fills** (the harness backtester's rules). Use it to backtest a harness end to end, or to replay a day the way it would have traded live.
+
+> [!IMPORTANT]
+> Replaying through the futures-trading-harness also needs the harness's own replay clock, which is still pending (a harness pull request). Until it lands, the harness's order gate uses the wall clock. Once it lands, set `FTH_REPLAY_NOW` to the same time as the clock file: the harness honours it only for a broker whose `get_server_config` reports `replay: true` and a `serverTime` within about 5 minutes of it, which this server does.
 
 > [!NOTE]
 > This repository holds code only. It ships no market data: bring your own, keep it outside the repo, and point `BACKTESTER_DATA_DIR` at it. Market data is usually licensed; don't commit or redistribute it.
@@ -30,9 +33,9 @@ The same checks and semantics as projectx-mcp's, with `BACKTESTER_` names:
 | `BACKTESTER_ALLOWED_ACCOUNT_IDS` | any | Only these accounts can be traded. |
 | `BACKTESTER_ALLOWED_SYMBOLS` | any | Contract roots, e.g. `MNQ,MES` (ids are `BT.<ROOT>`). |
 | `BACKTESTER_MAX_ORDER_SIZE` | `1` | Maximum contracts per order. |
-| `BACKTESTER_MAX_POSITION_SIZE` | `2` | Maximum absolute net position per contract, counting resting same-side entry orders (limit and join orders, market orders waiting for the next bar, and same-side stops beyond the position they protect; bracket legs and closes never count), also when `modify_order` grows a resting order. Orders that reduce the position are always allowed. |
+| `BACKTESTER_MAX_POSITION_SIZE` | `2` | Maximum absolute net position per contract, counting every resting same-side order that could fill (limit, join, stop and trailing stop orders, and market orders waiting for the next bar when they add to the position; bracket legs and closes never count), also when `modify_order` grows a resting order. An order adds exposure only when that worst case ends further from flat than the position is now, so protective and risk-reducing orders (a stop and a target covering the position) are always allowed. |
 | `BACKTESTER_MAX_DAILY_LOSS` | `500` | Once realized P&L after fees for the trading day (from 17:00 CT / 18:00 ET, replay time) reaches −this amount, only orders that reduce the position are allowed. `0` turns it off. |
-| `BACKTESTER_START` / `BACKTESTER_END` | none | Orders are refused while the replay clock is outside the window. |
+| `BACKTESTER_START` / `BACKTESTER_END` | none | Orders that add exposure are refused while the replay clock is outside the window; closes, cancels and risk-reducing orders are not. |
 
 Refusals read `Blocked by risk guardrail: …` and are journaled as `order_blocked`, as with projectx-mcp.
 
@@ -117,13 +120,13 @@ node dist/clock.js --file /tmp/clock.json                 # print it
 
 ### The replay window and runs
 
-`BACKTESTER_START` and `BACKTESTER_END` bound a run. Bars before `START` stay available to `get_bars` as lookback history; trading and the account begin at `START`. After `END`, `get_bars` is capped at `END` and orders are refused. While the clock is before `START` or after `END`, every order tool answers `Blocked by risk guardrail: …`.
+`BACKTESTER_START` and `BACKTESTER_END` bound a run. Bars before `START` stay available to `get_bars` as lookback history; trading and the account begin at `START`. After `END`, `get_bars` is capped at `END`. While the clock is before `START` or after `END`, orders that add exposure answer `Blocked by risk guardrail: …`. Closes, cancels and risk-reducing orders are still taken, so a position open at `END` can be flattened: after `END`, `close_position`, `partial_close_position` and market orders that reduce the position fill at the last close at or before `END`, without slippage (as the harness backtester settles a trade still open at the end of its data); other orders are refused with `OutsideTradingHours`.
 
-All mutable state lives in the run's folder (`BACKTESTER_STATE_DIR`, by default `~/.backtester-mcp/runs/<BACKTESTER_RUN_ID>`): `state.json` and, unless `BACKTESTER_JOURNAL_PATH` says otherwise, `journal.jsonl`. Every process started with the same folder shares the run (the harness starts the server more than once: its gateway and its runner); a lock file serializes their calls. Give parallel replays different run ids. To replay again from the start, use a new run id or delete the folder.
+All mutable state lives in the run's folder (`BACKTESTER_STATE_DIR`, by default `~/.backtester-mcp/runs/<BACKTESTER_RUN_ID>`): `state.json` and, unless `BACKTESTER_JOURNAL_PATH` says otherwise, `journal.jsonl`. Every process started with the same folder shares the run (the harness starts the server more than once: its gateway and its runner); a lock file serializes their calls (data files load before the lock). A run records its account and fill settings (account id, start balance, slippage, fees) when it is created, and refuses a process configured differently. Give parallel replays different run ids. To replay again from the start, use a new run id or delete the folder.
 
 ## Fills
 
-The fill engine (`src/fills.ts`) is ported from the harness backtester (`scripts/lib/backtest/engine.js`, cited by line in the code), so a replay fills the way a backtest does:
+The fill engine (`src/fills.ts`) is ported from the harness's simulated broker (`scripts/lib/backtest/sim-broker.js`, extracted from the backtester's `engine.js` in harness PR #23; cited by function in the code), so a replay fills the way a backtest does:
 
 | Order | Fill |
 |---|---|
@@ -134,7 +137,7 @@ The fill engine (`src/fills.ts`) is ported from the harness backtester (`scripts
 | Brackets | Legs sit `ticks` from the entry's fill price (slippage included); a market entry's legs are checked on the fill bar itself. A filled leg cancels its sibling (OCO); all bracket legs are cancelled when the position is flat or reverses, and a leg never opens a new position. |
 | Limit or stop entries filled inside a bar | Their stop-loss leg is checked on the same bar too (pessimistic); the take-profit leg from the next bar. |
 | Orders placed inside a bar | Checked from the next bar that opens at or after that moment (no look-back). |
-| Orders modified inside a bar | The bar in progress settles on the terms the order had when it opened; the new terms apply from the next bar. A resting order is never skipped for a bar. |
+| Orders modified or cancelled inside a bar | The bar in progress settles on the terms the order had when it opened (a cancelled order can still fill on that bar: too late to cancel); new terms apply, and a cancel takes effect, from the next bar. A resting order is never skipped for a bar. On a bar's open (a whole minute), both take effect at once. |
 | Trailing stop | Placed at `trailPrice` (a level); after each bar the stop follows the bar's extreme at the original distance, never loosening. The harness runner trails with `modify_order` instead. |
 | P&L and fees | Ticks × tick value × size; fees per side per contract on every fill. Daily P&L resets at 17:00 CT (18:00 ET). |
 
@@ -181,7 +184,7 @@ BACKTESTER_START=2024-03-01T00:00:00Z
 BACKTESTER_END=2024-04-01T00:00:00Z
 ```
 
-Set `BACKTESTER_JOURNAL_PATH` explicitly whenever you change the run id or state folder: the harness's order gate reads the journal from that path. Everything else in the harness stays the same: the gateway, the contract translator (`MNQ` → `BT.MNQ`), the order gate and the runner talk to it through the interface.
+Set `BACKTESTER_JOURNAL_PATH` explicitly whenever you change the run id or state folder: the harness's order gate reads the journal from that path. The gateway, the contract translator (`MNQ` → `BT.MNQ`), the order gate and the runner talk to it through the interface as to any broker; for a replay, also set the harness's `FTH_REPLAY_NOW` to the clock's time once the harness's replay clock lands (see the note at the top).
 
 ### Conformance check
 

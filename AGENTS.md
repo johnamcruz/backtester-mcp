@@ -58,7 +58,7 @@ This server is a **replay broker**. It answers with the same tools, inputs and r
 | Bars | `get_bars` returns closed bars oldest→newest; `t` is the bar's open time in UTC. Units: minute, hour, day, week (built from one-minute data). |
 | Fills | In `search_trades`, `profitAndLoss: null` (`halfTurn: true`) marks an opening fill. Realized P&L is on the closing fill. Fees are separate. |
 | errorCode 5 `OutsideTradingHours` | The market is closed at the replay time (daily break, weekend, holiday, or past the data). Wait for the clock. |
-| `before BACKTESTER_START` / `after BACKTESTER_END` | The clock is outside the replay window; orders are refused. |
+| `before BACKTESTER_START` / `after BACKTESTER_END` | The clock is outside the replay window: orders that add risk are refused. Closes, cancels and exits still work; after the end they fill at the last close. |
 
 ### How to learn
 
@@ -93,4 +93,4 @@ Journal entries are stamped with the replay time. `place_order` saves your `rati
 
 Read [`CLAUDE.md`](CLAUDE.md): project, layout, commands, the rules for changes, and what to do before a pull request. It applies to every coding agent.
 
-The short version: this repo holds **code only** (never commit market data); the tool contract stays identical to the harness's `docs/BROKER-MCP-INTERFACE.md` and to projectx-mcp's tools; the fill rules stay those of the harness backtester (`scripts/lib/backtest/engine.js`); every change comes with tests; and before every pull request `npm run typecheck`, `npm test`, `npm run build` and the harness's conformance check pass, and a reviewer other than the author has tried to break the change.
+The short version: this repo holds **code only** (never commit market data); the tool contract stays identical to the harness's `docs/BROKER-MCP-INTERFACE.md` and to projectx-mcp's tools; the fill rules stay those of the harness's simulated broker (`scripts/lib/backtest/sim-broker.js`); every change comes with tests; and before every pull request `npm run typecheck`, `npm test`, `npm run build` and the harness's conformance check pass, and a reviewer other than the author has tried to break the change.
