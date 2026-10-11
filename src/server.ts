@@ -22,7 +22,7 @@ import {
   assertPositionLimit,
   assertSymbolAllowed,
   assertTradingAllowed,
-  increasesExposure,
+  opensExposure,
   type ExposureInput,
   realizedNet,
   tradingDayStart,
@@ -105,26 +105,29 @@ export function createServer(deps: Deps): McpServer {
   const trades = async (acct: number, start: string, end?: string) => client.trades(acct, start, end);
   const dayStart = () => tradingDayStart(client.now()).toISOString();
   /**
-   * Net position and worst-case exposure of an order, as projectx-mcp: every resting same-side
-   * order that could fill counts (limit, join, stop, trailing stop), and the order adds exposure
-   * only when the worst case ends further from flat than the position is now. So a stop and a
-   * target protecting a position no larger than the limit always pass. Market orders waiting for
-   * the next bar's open count only when they add to the position (live, they would already be in
-   * it); a waiting exit doesn't count, as projectx-mcp counts no market orders. Bracket legs and
-   * closes are reduce-only and never count.
+   * Net position and worst-case exposure of an order, as projectx-mcp would see it (there market
+   * orders fill at once). The position counts market orders waiting for the next bar's open: all
+   * of them when they add to it or go through flat, none when they only reduce it (so a
+   * protective stop beside a waiting exit is still protective). Every resting same-side order
+   * that could fill counts (limit, join, stop, trailing stop). Bracket legs and closes are
+   * reduce-only and never count.
    */
   async function exposureOf(acct: number, cid: string, side: "buy" | "sell", size: number, except?: number) {
     const [positions, orders] = await Promise.all([openPositions(acct), openOrders(acct)]);
-    const currentNet = positions
+    const held = positions
       .filter((p) => p.contractId === cid)
       .reduce((n, p) => n + (p.type === 1 ? 1 : p.type === 2 ? -1 : 0) * (p.size as number), 0);
-    const sign = side === "buy" ? 1 : -1;
-    const counted: number[] = [ORDER_TYPES.limit, ORDER_TYPES.join_bid, ORDER_TYPES.join_ask, ORDER_TYPES.stop, ORDER_TYPES.trailing_stop];
-    if (currentNet * sign >= 0) counted.push(ORDER_TYPES.market);
-    const pendingSameSide = orders
-      .filter((o) => o.id !== except && o.contractId === cid && o.side === SIDES[side] && !o.reduceOnly && counted.includes(o.type as number))
+    const mine = orders.filter((o) => o.id !== except && o.contractId === cid && !o.reduceOnly);
+    const waiting = mine
+      .filter((o) => o.type === ORDER_TYPES.market)
+      .reduce((n, o) => n + (o.side === SIDES.buy ? 1 : -1) * (o.size as number), 0);
+    const addsOrReverses = held === 0 || Math.sign(waiting) === Math.sign(held) || Math.abs(waiting) > Math.abs(held);
+    const currentNet = addsOrReverses ? held + waiting : held;
+    const resting: number[] = [ORDER_TYPES.limit, ORDER_TYPES.join_bid, ORDER_TYPES.join_ask, ORDER_TYPES.stop, ORDER_TYPES.trailing_stop];
+    const pendingSameSide = mine
+      .filter((o) => o.side === SIDES[side] && resting.includes(o.type as number))
       .reduce((n, o) => n + (o.size as number), 0);
-    return { currentNet, exposure: { currentNet, pendingSameSide, side, size } };
+    return { position: held, exposure: { currentNet, pendingSameSide, side, size } };
   }
 
   /** Adding exposure needs the replay window; protective and risk-reducing orders never do. */
@@ -414,9 +417,9 @@ export function createServer(deps: Deps): McpServer {
         assertSymbolAllowed(config, a.contractId);
         assertOrderSize(config, a.size);
 
-        const { currentNet, exposure } = await exposureOf(a.accountId, a.contractId, a.side, a.size);
+        const { position: currentNet, exposure } = await exposureOf(a.accountId, a.contractId, a.side, a.size);
 
-        if (increasesExposure(exposure)) await addGuard(exposure, a.accountId);
+        if (opensExposure(exposure)) await addGuard(exposure, a.accountId);
 
         const res = client.place({
           accountId: a.accountId,
@@ -479,7 +482,7 @@ export function createServer(deps: Deps): McpServer {
           const side = o.side === SIDES.buy ? "buy" : "sell";
           const { exposure } = await exposureOf(a.accountId, o.contractId as string, side, a.size, a.orderId);
           // Protective growth (orders against the position staying within it) never increases exposure.
-          if (increasesExposure(exposure)) await addGuard(exposure, a.accountId);
+          if (opensExposure(exposure)) await addGuard(exposure, a.accountId);
         }
       }
       const res = client.modify({

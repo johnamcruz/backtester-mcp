@@ -54,11 +54,12 @@ This server is a **replay broker**. It answers with the same tools, inputs and r
 | Brackets | `stopLossBracket` / `takeProfitBracket` are in ticks from the entry fill and always work here (auto OCO). Check the legs with `list_open_orders`. When the position goes flat, its bracket legs are cancelled. |
 | Sides | `buy` opens or adds to a long and closes a short. `sell` does the opposite. |
 | Order types | `market`; `limit` needs `limitPrice`; `stop` needs `stopPrice`; `trailing_stop` needs `trailPrice` (an **absolute price level**, not a distance); `join_bid` / `join_ask` rest at the last price. |
+| Modify / cancel | Take effect at once. A cancelled order never fills; a modified order is checked on its new terms from the current bar on. |
 | Prices | Must be multiples of `tickSize` (MNQ/MES tick size is 0.25), or the order is rejected. |
 | Bars | `get_bars` returns closed bars oldest→newest; `t` is the bar's open time in UTC. Units: minute, hour, day, week (built from one-minute data). |
 | Fills | In `search_trades`, `profitAndLoss: null` (`halfTurn: true`) marks an opening fill. Realized P&L is on the closing fill. Fees are separate. |
 | errorCode 5 `OutsideTradingHours` | The market is closed at the replay time (daily break, weekend, holiday, or past the data). Wait for the clock. |
-| `before BACKTESTER_START` / `after BACKTESTER_END` | The clock is outside the replay window: orders that add risk are refused. Closes, cancels and exits still work; after the end they fill at the last close. |
+| `before BACKTESTER_START` / `after BACKTESTER_END` | The clock is outside the replay window: orders that add risk are refused. Closes, cancels and exits still work; once no bar is left before the end they fill at the last close. |
 
 ### How to learn
 

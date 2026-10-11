@@ -304,6 +304,27 @@ describe("place_order", () => {
     expect((await call("place_order", { ...order, side: "buy" })).text).toMatch(/Daily loss limit reached/);
   });
 
+  it("counts waiting market orders that go through flat", async () => {
+    const env = { BACKTESTER_MAX_POSITION_SIZE: "1", BACKTESTER_MAX_ORDER_SIZE: "5", BACKTESTER_MAX_DAILY_LOSS: "0" };
+    const { call, setNow } = await setup({ env });
+    await call("place_order", order); // long 1
+    setNow(T0 + 30000);
+    expect((await call("place_order", { ...order, side: "sell", size: 2 })).data.success).toBe(true); // waits: short 1 at the next open
+    expect((await call("place_order", { ...order, side: "sell", size: 2 })).text).toMatch(/net position to -3/);
+    expect((await call("place_order", { ...order, side: "sell", type: "stop", stopPrice: 19990, size: 2 })).text).toMatch(/net position to -3/);
+  });
+
+  it("checks the new position a reversal opens, even when it ends no larger", async () => {
+    const data = { NQ: [...flat(T0 - 10 * MIN, 12, 20000), ...flat(T0 + 2 * MIN, 10, 19999)] };
+    const { call, setNow } = await setup({ data, env: { BACKTESTER_MAX_DAILY_LOSS: "1", BACKTESTER_MAX_ORDER_SIZE: "2" } });
+    await call("place_order", order); // long 1 MNQ
+    await call("place_order", { ...order, contractId: "BT.NQ" });
+    setNow(T0 + 2 * MIN);
+    await call("close_position", { accountId: 1, contractId: "BT.NQ" }); // past the daily loss limit
+    expect((await call("place_order", { ...order, side: "sell", size: 2 })).text).toMatch(/Daily loss limit reached/);
+    expect((await call("place_order", { ...order, side: "sell", size: 1 })).data.success).toBe(true); // pure reduction
+  });
+
   it("refuses orders outside the replay window", async () => {
     const before = await setup({ env: { BACKTESTER_START: iso(T0 + MIN) } });
     expect((await before.call("place_order", order)).text).toMatch(/Blocked by risk guardrail: .*before BACKTESTER_START/);

@@ -14,7 +14,7 @@ import {
   openBar,
   stopFillPrice,
   stopTriggered,
-  termsOn,
+  restingFillPrice,
   trailStep,
   type Book,
   type FillSpec,
@@ -235,15 +235,9 @@ describe("bars", () => {
     expect(book.orders.filter((o) => o.status === STATUS.open)).toEqual([]);
   });
 
-  it("settles the bar in progress on the terms an order had when it opened", () => {
-    const o = order({ type: 4, side: 1, stopPrice: 99.5, activeFrom: T + 30000, prior: { from: T - M, limitPrice: null, stopPrice: 98, size: 1, trailDistance: null } });
-    expect(termsOn(o, bar(100, 100, 99, 99))?.stopPrice).toBe(98);
-    expect(termsOn(o, bar(100, 100, 99, 99, T + M))).toBe(o);
-    expect(termsOn(order({ activeFrom: T + 30000 }), bar(100, 100, 99, 99))).toBeNull();
-    const book = emptyBook([o]);
-    book.position = { id: 1, net: 1, averagePrice: 100, openedAt: T - M };
-    expect(closeBar(book, bar(100, 100, 99, 99), MNQ, ids())).toEqual([]); // the old stop (98) was not reached
-    expect(closeBar(book, bar(99.5, 99.5, 99, 99, T + M), MNQ, ids())).toMatchObject([{ price: 99.25 }]);
+  it("snaps a limit fill to the tick when the bar's open carries float noise", () => {
+    const o = order({ type: 1, side: 1, limitPrice: 2158.2 });
+    expect(restingFillPrice(o, bar(2158.3000000000006, 2158.5, 2158.1, 2158.4), { ...MNQ, tickSize: 0.1 })).toBe(2158.3);
   });
 
   it("creates no bracket legs for an order that flattens the position", () => {

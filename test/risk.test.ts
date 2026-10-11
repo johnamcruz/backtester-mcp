@@ -9,6 +9,7 @@ import {
   assertSymbolAllowed,
   assertTradingAllowed,
   increasesExposure,
+  opensExposure,
   realizedNet,
   symbolRoot,
   tradingDayStart,
@@ -47,6 +48,13 @@ describe("guardrails", () => {
   it("treats a reversal through flat as increasing exposure only if it ends larger", () => {
     expect(increasesExposure({ currentNet: 1, pendingSameSide: 0, side: "sell", size: 2 })).toBe(false);
     expect(increasesExposure({ currentNet: 1, pendingSameSide: 0, side: "sell", size: 3 })).toBe(true);
+  });
+
+  it("treats any part of an order beyond flat as new exposure", () => {
+    expect(opensExposure({ currentNet: 1, pendingSameSide: 0, side: "sell", size: 2 })).toBe(true);
+    expect(opensExposure({ currentNet: 1, pendingSameSide: 0, side: "sell", size: 1 })).toBe(false);
+    expect(opensExposure({ currentNet: 0, pendingSameSide: 0, side: "buy", size: 1 })).toBe(true);
+    expect(() => assertPositionLimit(cfg({ BACKTESTER_MAX_POSITION_SIZE: "1" }), { currentNet: 1, pendingSameSide: 0, side: "sell", size: 3 })).toThrow(/net position to -2/);
   });
 
   it("enforces the daily loss limit on realized net P&L", () => {

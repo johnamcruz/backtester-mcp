@@ -116,9 +116,20 @@ export function increasesExposure(input: ExposureInput): boolean {
   return Math.abs(projectedNet(input)) > Math.abs(input.currentNet);
 }
 
+/**
+ * True when the order opens new exposure: the worst case ends further from flat, or the order
+ * itself goes through flat (the part beyond flattening is a new position on the other side,
+ * even when it ends no larger). Pure reduction never does.
+ */
+export function opensExposure(input: ExposureInput): boolean {
+  const sign = input.side === "buy" ? 1 : -1;
+  const reverses = input.currentNet * sign < 0 && input.size > Math.abs(input.currentNet);
+  return increasesExposure(input) || reverses;
+}
+
 export function assertPositionLimit(config: Config, input: ExposureInput): void {
   const projected = projectedNet(input);
-  if (increasesExposure(input) && Math.abs(projected) > config.maxPositionSize) {
+  if (opensExposure(input) && Math.abs(projected) > config.maxPositionSize) {
     throw new RiskError(
       `Order would take net position to ${projected} (current ${input.currentNet}, resting same-side entries ${input.pendingSameSide}); ` +
         `BACKTESTER_MAX_POSITION_SIZE is ${config.maxPositionSize}.`,

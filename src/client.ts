@@ -344,7 +344,7 @@ export class ReplayExchange {
     contractIds.forEach(add);
     try {
       const st = JSON.parse(readFileSync(this.config.statePath, "utf8")) as State;
-      for (const o of st.orders ?? []) if (o.status === STATUS.open || o.cancelledAt != null) add(o.contractId);
+      for (const o of st.orders ?? []) if (o.status === STATUS.open) add(o.contractId);
     } catch {
       /* no state yet, or mid-write: the locked read decides */
     }
@@ -421,8 +421,7 @@ export class ReplayExchange {
       );
     }
     const from = state.syncedTo;
-    const pending = (o: SimOrder) => o.status === STATUS.open || (o.cancelledAt != null && o.cancelledAt > from - MINUTE);
-    const contracts = [...new Set(state.orders.filter(pending).map((o) => o.contractId))].sort();
+    const contracts = [...new Set(state.orders.filter((o) => o.status === STATUS.open).map((o) => o.contractId))].sort();
     const found: Array<{ contractId: string; fill: SimFill }> = [];
     for (const contractId of contracts) {
       const c = specOf(contractId);
@@ -437,7 +436,7 @@ export class ReplayExchange {
         if (bar.t > from) fills.push(...openBar(book, bar, fs, ids));
         if (bar.t + MINUTE <= cutoff) fills.push(...closeBar(book, bar, fs, ids));
         for (const fill of fills) found.push({ contractId, fill });
-        if (!book.orders.some((o) => o.status === STATUS.open || (o.cancelledAt != null && o.cancelledAt > bar.t + MINUTE))) break;
+        if (!book.orders.some((o) => o.status === STATUS.open)) break;
       }
       this.adopt(state, book, contractId);
     }
@@ -679,9 +678,16 @@ export class ReplayExchange {
     if (fill) this.record(state, contractId, [fill]);
   }
 
-  /** The clock has reached BACKTESTER_END: no more bars will be processed. */
-  private ended(now: Date): boolean {
-    return this.config.end !== null && now.getTime() >= this.config.end;
+  /**
+   * No bar is left to fill on before BACKTESTER_END: the clock is at or past END (">=": a bar
+   * opening at END would close after it), or the next bar after the clock opens after END (or
+   * there is none) while a window is set.
+   */
+  private ended(now: Date, s: BarSeries): boolean {
+    if (this.config.end === null) return false;
+    if (now.getTime() >= this.config.end) return true;
+    const i = s.lowerBound(now.getTime());
+    return i >= s.length || s.t[i] > this.config.end;
   }
 
   /**
@@ -712,12 +718,12 @@ export class ReplayExchange {
       if (!c) return no(8, `Contract ${req.contractId} not found.`);
       if (!this.store.has(c.dataRoot)) return no(9, `No data for ${c.root} (${c.dataRoot}_1min.csv) in BACKTESTER_DATA_DIR.`);
       const s = this.store.get(c.dataRoot);
-      const ended = this.ended(now);
+      const ended = this.ended(now, s);
       if (ended) {
         // After BACKTESTER_END only a market order that reduces the position is taken: it fills at the last close.
         const net = state.positions[req.contractId]?.net ?? 0;
         const reduces = req.type === ORDER_TYPES.market && net !== 0 && Math.sign(net) !== sideSign(req.side) && req.size <= Math.abs(net);
-        if (!reduces) return no(5, "The replay is over (BACKTESTER_END): only market orders that reduce the position are taken, at the last close.");
+        if (!reduces) return no(5, "The replay is over (no bar left before BACKTESTER_END): only market orders that reduce the position are taken, at the last close.");
       }
       const next = ended ? { index: -1 } : this.nextBar(s, now);
       if ("reason" in next) return no(5, `Outside trading hours: ${next.reason}.`);
@@ -800,15 +806,10 @@ export class ReplayExchange {
         patch.stopPrice = req.trailPrice;
         patch.trailDistance = Math.round(Math.abs(last - req.trailPrice) * 1e9) / 1e9;
       }
-      // The new terms apply from the bar that opens at or after now; the bar in progress
-      // (bars open on whole minutes) settles on the terms it opened with.
-      const t = now.getTime();
-      const barOpen = Math.floor(t / MINUTE) * MINUTE;
-      if (t === barOpen) o.prior = null;
-      else if (o.activeFrom <= barOpen) {
-        o.prior = { from: o.activeFrom, limitPrice: o.limitPrice, stopPrice: o.stopPrice, size: o.size, trailDistance: o.trailDistance };
-      } // else: placed or already modified inside this bar; keep what it has
-      Object.assign(o, patch, { updatedAt: t, activeFrom: Math.max(o.activeFrom, t) });
+      // A modify takes effect at once, as at a live broker: the bar in progress (not yet settled)
+      // is checked on the new terms, so a resting order is never skipped for a bar, and a smaller
+      // order can't fill at its old size beside a replacement.
+      Object.assign(o, patch, { updatedAt: now.getTime() });
       return OK;
     });
   }
@@ -818,11 +819,8 @@ export class ReplayExchange {
       if (accountId !== state.accountId) return refuse(1, `Account ${accountId} not found.`);
       const o = state.orders.find((x) => x.id === orderId);
       if (!o || o.status !== STATUS.open) return refuse(2, `No working order ${orderId}.`);
-      // Like a modify: inside a bar, the bar in progress still settles on the order's terms (bars open on whole minutes).
-      const t = now.getTime();
-      const barOpen = Math.floor(t / MINUTE) * MINUTE;
-      const live = o.type !== ORDER_TYPES.market && t !== barOpen && (o.activeFrom <= barOpen || (o.prior != null && o.prior.from <= barOpen));
-      Object.assign(o, { status: STATUS.cancelled, updatedAt: t, cancelledAt: live ? t : null });
+      // A cancel takes effect at once, as at a live broker and the harness sim-broker's cancel().
+      Object.assign(o, { status: STATUS.cancelled, updatedAt: now.getTime() });
       return OK;
     });
   }
@@ -844,7 +842,7 @@ export class ReplayExchange {
         .reduce((n, o) => n + o.size, 0);
       if (waiting + qty > Math.abs(pos.net)) return refuse(7, `A market order closing ${waiting} is already waiting for the next bar.`);
       const s = this.store.get(c.dataRoot);
-      const ended = this.ended(now);
+      const ended = this.ended(now, s);
       const next = ended ? { index: -1 } : this.nextBar(s, now);
       if ("reason" in next) return refuse(6, `Order rejected: ${next.reason}.`);
       const t = now.getTime();

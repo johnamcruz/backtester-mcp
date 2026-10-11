@@ -161,44 +161,33 @@ describe("inside a bar", () => {
     expect(exchange.searchOrders(1, iso(T0)).at(-1)).toMatchObject({ type: 2, status: 3 });
   });
 
-  it("a stop modified inside a bar still settles that bar on its old terms", async () => {
+  it("a modify takes effect at once, on the bar in progress too", async () => {
     const { exchange, setNow } = await setup({ data: data() });
     exchange.place(req({ stopLossBracket: { ticks: 20, type: 4 } })); // stop 19995.25
     setNow(T0 + 90000);
-    expect(exchange.modify({ accountId: 1, orderId: 2, size: 2, limitPrice: null, stopPrice: 19980, trailPrice: null })).toMatchObject({ success: true });
-    setNow(T0 + 2 * MIN);
-    expect(exchange.trades(1, iso(T0)).map((t) => [t.side, t.size, t.price])).toEqual([[0, 1, 20000.25], [1, 1, 19995]]);
+    expect(exchange.modify({ accountId: 1, orderId: 2, size: null, limitPrice: null, stopPrice: 19980, trailPrice: null })).toMatchObject({ success: true });
+    setNow(T0 + 2 * MIN); // bar T0+1 dips to 19990: above the moved stop
+    expect(exchange.positions(1)).toMatchObject([{ size: 1 }]);
   });
 
-  it("a stop cancelled inside a bar still settles that bar; one cancelled on a bar's open does not", async () => {
-    const mid = await setup({ data: data() });
-    mid.exchange.place(req({ size: 1 }));
-    mid.exchange.place(req({ type: 4, side: 1, stopPrice: 19995 }));
-    mid.setNow(T0 + 90000);
-    expect(mid.exchange.cancel(1, 2)).toMatchObject({ success: true });
-    expect(mid.exchange.openOrders(1)).toEqual([]);
-    mid.setNow(T0 + 2 * MIN);
-    expect(mid.exchange.positions(1)).toEqual([]);
-    expect(mid.exchange.searchOrders(1, iso(T0))[1]).toMatchObject({ id: 2, status: 2, filledPrice: 19994.75 });
-    const open = await setup({ data: data() });
-    open.exchange.place(req({ size: 1 }));
-    open.exchange.place(req({ type: 4, side: 1, stopPrice: 19995 }));
-    open.setNow(T0 + MIN);
-    open.exchange.cancel(1, 2);
-    open.setNow(T0 + 2 * MIN);
-    expect(open.exchange.positions(1)).toMatchObject([{ size: 1 }]);
-    expect(open.exchange.searchOrders(1, iso(T0))[1]).toMatchObject({ id: 2, status: 3 });
-  });
-
-  it("a size changed inside a bar applies from the next bar", async () => {
+  it("an order shrunk inside a bar fills at its new size, never its old one", async () => {
     const { exchange, setNow } = await setup({ data: data() });
-    exchange.place(req({ size: 2 }));
+    exchange.place(req({ type: 1, limitPrice: 19995, size: 2 }));
+    setNow(T0 + 90000);
+    exchange.modify({ accountId: 1, orderId: 1, size: 1, limitPrice: null, stopPrice: null, trailPrice: null });
+    setNow(T0 + 2 * MIN);
+    expect(exchange.positions(1)).toMatchObject([{ size: 1 }]);
+  });
+
+  it("a cancel takes effect at once, inside a bar too", async () => {
+    const { exchange, setNow } = await setup({ data: data() });
+    exchange.place(req());
     exchange.place(req({ type: 4, side: 1, stopPrice: 19995 }));
     setNow(T0 + 90000);
-    expect(exchange.modify({ accountId: 1, orderId: 2, size: 2, limitPrice: null, stopPrice: null, trailPrice: null })).toMatchObject({ success: true });
+    expect(exchange.cancel(1, 2)).toMatchObject({ success: true });
     setNow(T0 + 2 * MIN);
-    expect(exchange.trades(1, iso(T0)).map((t) => [t.side, t.size])).toEqual([[0, 2], [1, 1]]);
     expect(exchange.positions(1)).toMatchObject([{ size: 1 }]);
+    expect(exchange.searchOrders(1, iso(T0))[1]).toMatchObject({ id: 2, status: 3 });
   });
 
   it("creates a mid-bar market order's bracket in one sync and fills it in a later one", async () => {
@@ -223,6 +212,28 @@ describe("after BACKTESTER_END", () => {
     expect(exchange.place(req({ side: 1 }))).toMatchObject({ success: true });
     expect(exchange.close(1, "BT.MNQ", null)).toMatchObject({ success: true });
     expect(exchange.trades(1, iso(T0)).slice(1).map((t) => [t.side, t.price, t.creationTimestamp])).toEqual([[1, 20000, iso(T0 + 10 * MIN)], [1, 20000, iso(T0 + 10 * MIN)]]);
+  });
+});
+
+describe("no bar left before BACKTESTER_END", () => {
+  // Data ends at T0+9 (the last bar closes at T0+10); END is an hour later.
+  it("flattens at the last close at or before the clock", async () => {
+    const { exchange, setNow } = await setup({ data: { NQ: [...flat(T0 - 5 * MIN, 10, 20000), ...flat(T0 + 5 * MIN, 5, 20004)] }, env: { BACKTESTER_END: iso(T0 + 60 * MIN) } });
+    exchange.place(req({ size: 2 }));
+    setNow(T0 + 30 * MIN);
+    expect(exchange.place(req({ side: 0 }))).toMatchObject({ errorCode: 5, errorMessage: expect.stringMatching(/no bar left/) });
+    expect(exchange.close(1, "BT.MNQ", 1)).toMatchObject({ success: true });
+    expect(exchange.place(req({ side: 1 }))).toMatchObject({ success: true });
+    expect(exchange.trades(1, iso(T0)).slice(1).map((t) => [t.price, t.creationTimestamp])).toEqual([[20004, iso(T0 + 30 * MIN)], [20004, iso(T0 + 30 * MIN)]]);
+  });
+
+  it("counts a clock exactly at END as ended", async () => {
+    const { exchange, setNow } = await setup({ env: { BACKTESTER_END: iso(T0 + 10 * MIN) } });
+    exchange.place(req());
+    setNow(T0 + 10 * MIN); // a bar opens at END but would close after it
+    expect(exchange.place(req({ side: 0 }))).toMatchObject({ errorCode: 5 });
+    expect(exchange.close(1, "BT.MNQ", null)).toMatchObject({ success: true });
+    expect(exchange.trades(1, iso(T0))[1]).toMatchObject({ price: 20000, creationTimestamp: iso(T0 + 10 * MIN) });
   });
 });
 

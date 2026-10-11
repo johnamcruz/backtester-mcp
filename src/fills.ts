@@ -70,18 +70,6 @@ export interface SimOrder {
   fillVolume: number;
   filledPrice: number | null;
   customTag: string | null;
-  /**
-   * The terms the order had when the bar in progress opened, kept when it is
-   * modified inside a bar: that bar is settled on them (activeFrom moves to
-   * the next bar), so a resting order is never skipped for a bar.
-   */
-  prior?: { from: number; limitPrice: number | null; stopPrice: number | null; size: number; trailDistance: number | null } | null;
-  /**
-   * When the client cancelled it inside a bar: like a modify, the bar in
-   * progress still settles on the terms it opened with (too late to cancel),
-   * so the order can still fill on that bar.
-   */
-  cancelledAt?: number | null;
 }
 
 export interface SimPosition {
@@ -240,8 +228,7 @@ function newLeg(parent: SimOrder, leg: "sl" | "tp", spec: BracketSpec, fill: num
   };
 }
 
-// The engine's own cancels (OCO, flat) take effect at once: no grace for the bar in progress.
-const cancel = (o: SimOrder, time: number) => Object.assign(o, { status: STATUS.cancelled, updatedAt: time, cancelledAt: null });
+const cancel = (o: SimOrder, time: number) => Object.assign(o, { status: STATUS.cancelled, updatedAt: time });
 
 /**
  * Fill an order (whole size; a bracket leg only as far as it reduces the
@@ -314,14 +301,11 @@ export function closeBar(book: Book, bar: BarOHLC, spec: FillSpec, ids: Ids): Si
   const end = bar.t + MINUTE;
   const fills: SimFill[] = [];
   const hit = book.orders
-    .filter((o) => o.type !== ORDER_TYPES.market && (o.status === STATUS.open || cancelledDuring(o, bar)))
-    .map((o) => ({ o, terms: termsOn(o, bar) }))
-    .filter((x): x is { o: SimOrder; terms: SimOrder } => x.terms !== null && triggers(x.terms, bar))
-    .sort((a, b) => Number(isStopType(b.o.type)) - Number(isStopType(a.o.type)) || a.o.id - b.o.id);
-  for (const { o, terms } of hit) {
-    if (o.status !== STATUS.open && !cancelledDuring(o, bar)) continue;
-    if (terms !== o) Object.assign(o, { size: terms.size }); // a size changed inside the bar applies from the next bar
-    const { fill, legs } = fillOrder(book, o, restingFillPrice(terms, bar, spec), end, spec, ids);
+    .filter((o) => o.status === STATUS.open && o.type !== ORDER_TYPES.market && o.activeFrom <= bar.t && triggers(o, bar))
+    .sort((a, b) => Number(isStopType(b.type)) - Number(isStopType(a.type)) || a.id - b.id);
+  for (const o of hit) {
+    if (o.status !== STATUS.open) continue;
+    const { fill, legs } = fillOrder(book, o, restingFillPrice(o, bar, spec), end, spec, ids);
     if (fill) fills.push(fill);
     for (const leg of legs) {
       if (leg.role !== "sl" || !isStopType(leg.type) || leg.status !== STATUS.open || !triggers(leg, bar)) continue;
@@ -339,17 +323,6 @@ export function closeBar(book: Book, bar: BarOHLC, spec: FillSpec, ids: Ids): Si
  * at or before the bar's open), the terms it had when the bar opened if it
  * was modified inside the bar, else none (placed inside the bar: from the next one).
  */
-/** Cancelled by the client inside this bar: the bar still settles on its terms. */
-export function cancelledDuring(o: SimOrder, bar: BarOHLC): boolean {
-  return o.status === STATUS.cancelled && o.cancelledAt != null && bar.t < o.cancelledAt && o.cancelledAt < bar.t + MINUTE;
-}
-
-export function termsOn(o: SimOrder, bar: BarOHLC): SimOrder | null {
-  if (o.activeFrom <= bar.t) return o;
-  if (o.prior && o.prior.from <= bar.t) return { ...o, ...o.prior };
-  return null;
-}
-
 /** A broker-side trailing stop: after the bar, the stop follows the bar's extreme at the trail distance, never loosening. */
 export function trailStep(o: SimOrder, bar: BarOHLC, tick: number, time: number): void {
   if (o.type !== ORDER_TYPES.trailing_stop || o.trailDistance === null || o.stopPrice === null) return;
