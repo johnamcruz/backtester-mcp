@@ -130,6 +130,14 @@ export function createServer(deps: Deps): McpServer {
     return { position: held, exposure: { currentNet, pendingSameSide, side, size } };
   }
 
+  /**
+   * An order that by itself only reduces the position (against it, no larger than it) is never
+   * refused at placement, whatever else rests on its side: reducing is reducing. If, once it
+   * fills, the position it meant to reduce is gone, the broker rejects that fill when it would
+   * breach a limit (fill-time enforcement in client.ts).
+   */
+  const reducesAlone = (e: ExposureInput) => e.currentNet * (e.side === "buy" ? 1 : -1) < 0 && e.size <= Math.abs(e.currentNet);
+
   /** Adding exposure needs the replay window; protective and risk-reducing orders never do. */
   const addGuard = async (exposure: ExposureInput, acct: number) => {
     assertInWindow(config, client.now());
@@ -419,7 +427,7 @@ export function createServer(deps: Deps): McpServer {
 
         const { position: currentNet, exposure } = await exposureOf(a.accountId, a.contractId, a.side, a.size);
 
-        if (opensExposure(exposure)) await addGuard(exposure, a.accountId);
+        if (opensExposure(exposure) && !reducesAlone(exposure)) await addGuard(exposure, a.accountId);
 
         const res = client.place({
           accountId: a.accountId,
@@ -482,7 +490,7 @@ export function createServer(deps: Deps): McpServer {
           const side = o.side === SIDES.buy ? "buy" : "sell";
           const { exposure } = await exposureOf(a.accountId, o.contractId as string, side, a.size, a.orderId);
           // Protective growth (orders against the position staying within it) never increases exposure.
-          if (opensExposure(exposure)) await addGuard(exposure, a.accountId);
+          if (opensExposure(exposure) && !reducesAlone(exposure)) await addGuard(exposure, a.accountId);
         }
       }
       const res = client.modify({

@@ -70,6 +70,10 @@ export interface SimOrder {
   fillVolume: number;
   filledPrice: number | null;
   customTag: string | null;
+  /** close_position: flattens whatever the position is when it fills (side and size set then). */
+  flatten?: boolean;
+  /** Why the broker rejected it at fill time (status rejected). */
+  rejectReason?: string | null;
 }
 
 export interface SimPosition {
@@ -101,6 +105,24 @@ export interface FillSpec {
   tickValue: number;
   feePerSide: number;
   slippageTicks: number;
+}
+
+/**
+ * Server-side limits, enforced at fill time as a real broker does: `guard`
+ * is asked before any fill of a client order (never a bracket leg or a close)
+ * and returns why it must be rejected, or null; `onFill` sees every fill as
+ * it happens (so the guard can count fills made earlier in the same bar).
+ */
+export interface Hooks {
+  guard?(o: SimOrder, size: number, pos: SimPosition, time: number): string | null;
+  onFill?(fill: SimFill): void;
+}
+
+/** The net position after a fill, and whether it opens exposure (grows |net| or goes through flat). */
+export function exposureAfter(net: number, side: Side, size: number): { after: number; opens: boolean } {
+  const after = net + sideSign(side) * size;
+  const crosses = net !== 0 && after !== 0 && Math.sign(after) !== Math.sign(net);
+  return { after, opens: Math.abs(after) > Math.abs(net) || crosses };
 }
 
 export interface Ids {
@@ -236,10 +258,17 @@ const cancel = (o: SimOrder, time: number) => Object.assign(o, { status: STATUS.
  * sibling (OCO), and cancel every bracket leg once the position is flat.
  * Returns the fill (null when a leg had nothing left to close) and the legs created.
  */
-export function fillOrder(book: Book, o: SimOrder, price: number, time: number, spec: FillSpec, ids: Ids): { fill: SimFill | null; legs: SimOrder[] } {
+export function fillOrder(book: Book, o: SimOrder, price: number, time: number, spec: FillSpec, ids: Ids, hooks: Hooks = {}): { fill: SimFill | null; legs: SimOrder[] } {
   const pos = book.position;
+  if (o.role === "close" && o.flatten && pos.net !== 0) Object.assign(o, { side: pos.net > 0 ? 1 : 0, size: Math.abs(pos.net) });
   let size = o.size;
-  if (o.role !== "order") {
+  if (o.role === "order") {
+    const reason = hooks.guard?.(o, size, pos, time) ?? null;
+    if (reason) {
+      Object.assign(o, { status: STATUS.rejected, updatedAt: time, rejectReason: reason });
+      return { fill: null, legs: [] };
+    }
+  } else {
     // Bracket legs and closes protect or flatten the position; they never open or add to one.
     const reduces = pos.net !== 0 && Math.sign(pos.net) !== sideSign(o.side);
     if (!reduces) {
@@ -252,12 +281,14 @@ export function fillOrder(book: Book, o: SimOrder, price: number, time: number, 
   const pnl = applyFill(pos, o.side, size, price, time, spec, ids);
   Object.assign(o, { status: STATUS.filled, fillVolume: size, filledPrice: price, updatedAt: time });
   const fill: SimFill = { orderId: o.id, side: o.side, size, price, time, profitAndLoss: pnl, fees: feesFor(size, spec) };
+  hooks.onFill?.(fill);
   if (o.role === "sl" || o.role === "tp") {
     for (const s of book.orders) if (s.parentId === o.parentId && s.id !== o.id && s.status === STATUS.open) cancel(s, time);
   }
   // Flat, or reversed through flat: the old position's legs (and waiting closes) have nothing left to protect.
+  // A waiting close_position (flatten) survives a reversal: it closes whatever the position is.
   if (pos.net === 0 || Math.sign(pos.net) !== Math.sign(before)) {
-    for (const s of book.orders) if (s.role !== "order" && s.status === STATUS.open) cancel(s, time);
+    for (const s of book.orders) if (s.role !== "order" && s.status === STATUS.open && !(s.flatten && pos.net !== 0)) cancel(s, time);
   }
   const legs: SimOrder[] = [];
   if (o.role === "order" && pos.net !== 0) {
@@ -272,12 +303,12 @@ export function fillOrder(book: Book, o: SimOrder, price: number, time: number, 
  * The bar's open: market orders placed at or before it fill at the open plus
  * slippage (sim-broker.js#fillAtOpen). Their bracket legs are live from this bar on.
  */
-export function openBar(book: Book, bar: BarOHLC, spec: FillSpec, ids: Ids): SimFill[] {
+export function openBar(book: Book, bar: BarOHLC, spec: FillSpec, ids: Ids, hooks: Hooks = {}): SimFill[] {
   const fills: SimFill[] = [];
   const due = book.orders.filter((o) => o.status === STATUS.open && o.type === ORDER_TYPES.market && o.placedAt <= bar.t);
   for (const o of due.sort((a, b) => a.id - b.id)) {
     if (o.status !== STATUS.open) continue;
-    const { fill } = fillOrder(book, o, marketFillPrice(bar.o, o.side, spec), bar.t, spec, ids);
+    const { fill } = fillOrder(book, o, marketFillPrice(bar.o, o.side, spec), bar.t, spec, ids, hooks);
     if (fill) fills.push(fill);
   }
   return fills;
@@ -295,9 +326,10 @@ export function restingFillPrice(o: SimOrder, bar: BarOHLC, spec: FillSpec): num
  * checked against the same bar too (pessimistic: the stop is assumed hit
  * after the entry), at its own price less slippage, since the gap rule needs
  * an open that came before the entry. Trailing stops ratchet afterwards.
- * Fills inside the bar are stamped at the bar's close.
+ * Fills inside the bar are stamped at the bar's close. Limits are enforced
+ * per fill, in this order, against the position left by the fills before it.
  */
-export function closeBar(book: Book, bar: BarOHLC, spec: FillSpec, ids: Ids): SimFill[] {
+export function closeBar(book: Book, bar: BarOHLC, spec: FillSpec, ids: Ids, hooks: Hooks = {}): SimFill[] {
   const end = bar.t + MINUTE;
   const fills: SimFill[] = [];
   const hit = book.orders
@@ -305,12 +337,12 @@ export function closeBar(book: Book, bar: BarOHLC, spec: FillSpec, ids: Ids): Si
     .sort((a, b) => Number(isStopType(b.type)) - Number(isStopType(a.type)) || a.id - b.id);
   for (const o of hit) {
     if (o.status !== STATUS.open) continue;
-    const { fill, legs } = fillOrder(book, o, restingFillPrice(o, bar, spec), end, spec, ids);
+    const { fill, legs } = fillOrder(book, o, restingFillPrice(o, bar, spec), end, spec, ids, hooks);
     if (fill) fills.push(fill);
     for (const leg of legs) {
       if (leg.role !== "sl" || !isStopType(leg.type) || leg.status !== STATUS.open || !triggers(leg, bar)) continue;
       const price = onTick((leg.stopPrice as number) + sideSign(leg.side) * spec.slippageTicks * spec.tickSize, spec.tickSize);
-      const r = fillOrder(book, leg, price, end, spec, ids);
+      const r = fillOrder(book, leg, price, end, spec, ids, hooks);
       if (r.fill) fills.push(r.fill);
     }
   }
@@ -318,11 +350,6 @@ export function closeBar(book: Book, bar: BarOHLC, spec: FillSpec, ids: Ids): Si
   return fills;
 }
 
-/**
- * The terms an order is checked on for a bar: its own once live (activeFrom
- * at or before the bar's open), the terms it had when the bar opened if it
- * was modified inside the bar, else none (placed inside the bar: from the next one).
- */
 /** A broker-side trailing stop: after the bar, the stop follows the bar's extreme at the trail distance, never loosening. */
 export function trailStep(o: SimOrder, bar: BarOHLC, tick: number, time: number): void {
   if (o.type !== ORDER_TYPES.trailing_stop || o.trailDistance === null || o.stopPrice === null) return;

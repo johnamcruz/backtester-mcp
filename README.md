@@ -39,6 +39,8 @@ The same checks and semantics as projectx-mcp's, with `BACKTESTER_` names:
 
 Refusals read `Blocked by risk guardrail: …` and are journaled as `order_blocked`, as with projectx-mcp.
 
+The max position and the daily loss limit are also **enforced when an order fills**, as a broker enforces server-side limits. A placement check alone can't be sound here: a close, a bracket leg or a reducing market order can flatten the position first, and an opposite order accepted earlier would then fill as a new entry. So before any fill of a client order, the server checks the position the fill would leave: a fill that opens exposure (grows the position or goes through flat) past `BACKTESTER_MAX_POSITION_SIZE`, or while the daily loss limit is reached, is rejected whole: the order gets status `rejected` (5) with a `rejectReason` in `search_orders`, and nothing fills. Reducing fills, bracket legs and closes are never rejected. Fills inside a bar are checked one at a time, in fill order (stops first), against the position the fills before them left. At placement, an order that by itself only reduces the position is never refused, whatever rests beside it.
+
 ## Setup
 
 Requires Node.js 20.12 or later.
@@ -130,14 +132,14 @@ The fill engine (`src/fills.ts`) is ported from the harness's simulated broker (
 
 | Order | Fill |
 |---|---|
-| Market (entries, `close_position`, `partial_close_position`) | The next one-minute bar's open plus `BACKTESTER_SLIPPAGE_TICKS` in the order's direction. If the clock is on a bar's open, that bar; otherwise the order waits for the next minute. A waiting close only reduces: if a stop flattens the position first, it is cancelled. |
+| Market (entries, `close_position`, `partial_close_position`) | The next one-minute bar's open plus `BACKTESTER_SLIPPAGE_TICKS` in the order's direction. If the clock is on a bar's open, that bar; otherwise the order waits for the next minute. Closes only reduce: a waiting `close_position` flattens whatever the position is when it fills (also after a reversal), and is cancelled if a stop flattened it first; a partial close never closes more than is open. |
 | Stop (`stop`, stop-loss legs, trailing stops) | The stop price less slippage; if the bar opens through the stop, the bar's open less slippage. |
 | Limit (`limit`, take-profit legs, `join_bid`/`join_ask`) | The limit price, or a better open. No slippage. Touch fills. |
 | Stop and target touched in one bar | The stop fills (the conservative reading). |
 | Brackets | Legs sit `ticks` from the entry's fill price (slippage included); a market entry's legs are checked on the fill bar itself. A filled leg cancels its sibling (OCO); all bracket legs are cancelled when the position is flat or reverses, and a leg never opens a new position. |
 | Limit or stop entries filled inside a bar | Their stop-loss leg is checked on the same bar too (pessimistic); the take-profit leg from the next bar. |
 | Orders placed inside a bar | Checked from the next bar that opens at or after that moment (no look-back). |
-| Orders modified or cancelled | Take effect at once, as at a live broker (and the harness sim-broker's `cancel()`): a cancelled order never fills, and a modified order is checked on its new terms from the bar in progress on (not yet settled), so it is never skipped for a bar. |
+| Orders modified or cancelled | Take effect at once, as at a live broker (and the harness sim-broker's `cancel()`): a cancelled order never fills, and a modified order is checked on its new terms from the bar in progress on (not yet settled), so it is never skipped for a bar. Note that a modify inside a bar applies to that whole bar, up to 59 seconds before the modify: the bar's range is settled only when it closes, so no later price is used, but a moved stop can fill on a price from earlier in that minute. |
 | Trailing stop | Placed at `trailPrice` (a level); after each bar the stop follows the bar's extreme at the original distance, never loosening. The harness runner trails with `modify_order` instead. |
 | P&L and fees | Ticks × tick value × size; fees per side per contract on every fill. Daily P&L resets at 17:00 CT (18:00 ET). |
 

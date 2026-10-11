@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   STATUS,
   applyFill,
+  exposureAfter,
   bracketPrice,
   closeBar,
   closePnl,
@@ -246,5 +247,33 @@ describe("bars", () => {
     const { legs } = fillOrder(book, order({ side: 1, stopLossBracket: { ticks: 4, type: 4 } }), 101, T, MNQ, ids());
     expect(legs).toEqual([]);
     expect(book.orders).toEqual([]);
+  });
+
+  it("asks the guard before a client order's fill and rejects it whole; legs and closes never ask", () => {
+    const book = emptyBook([order({ id: 1, side: 0, size: 2 })]);
+    const asked: number[] = [];
+    const hooks = { guard: (o: SimOrder) => (asked.push(o.id), "no"), onFill: () => {} };
+    expect(openBar(book, bar(100, 100, 100, 100), MNQ, ids(), hooks)).toEqual([]);
+    expect(book.orders[0]).toMatchObject({ status: STATUS.rejected, rejectReason: "no" });
+    book.position = { id: 1, net: 1, averagePrice: 100, openedAt: T - M };
+    const leg = order({ id: 2, role: "sl", parentId: 9, side: 1, type: 4, stopPrice: 99 });
+    book.orders.push(leg);
+    expect(closeBar(book, bar(100, 100, 98, 99, T + M), MNQ, ids(), hooks)).toHaveLength(1);
+    expect(asked).toEqual([1]);
+  });
+
+  it("a close_position order flattens whatever the position is when it fills", () => {
+    const book = emptyBook([order({ id: 1, side: 0, size: 2, placedAt: T }), order({ id: 2, side: 0, size: 1, role: "close", flatten: true })]);
+    book.position = { id: 1, net: -1, averagePrice: 100, openedAt: T - M };
+    openBar(book, bar(100, 100, 100, 100), MNQ, ids()); // the buy 2 reverses to long 1, then the close sells 1
+    expect(book.position.net).toBe(0);
+    expect(book.orders[1]).toMatchObject({ status: STATUS.filled, side: 1, fillVolume: 1 });
+  });
+
+  it("says whether a fill opens exposure", () => {
+    expect(exposureAfter(1, 1, 1)).toEqual({ after: 0, opens: false });
+    expect(exposureAfter(1, 1, 2)).toEqual({ after: -1, opens: true });
+    expect(exposureAfter(0, 0, 1)).toEqual({ after: 1, opens: true });
+    expect(exposureAfter(-2, 0, 1)).toEqual({ after: -1, opens: false });
   });
 });

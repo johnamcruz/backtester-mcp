@@ -21,6 +21,8 @@ import {
   type Ids,
   type Side,
   type SimFill,
+  type Hooks,
+  exposureAfter,
   type SimOrder,
   type SimPosition,
 } from "./fills.js";
@@ -385,6 +387,36 @@ export class ReplayExchange {
     }
   }
 
+  /** Fill-time limits (as a broker enforces server-side) and immediate recording of fills. */
+  private hooks(state: State, contractId: string): Hooks {
+    return {
+      guard: (o, size, pos, time) => this.limitReason(state, o.side, size, pos.net, time),
+      onFill: (fill) => this.record(state, contractId, [fill]),
+    };
+  }
+
+  /**
+   * Why a fill of a client order must be rejected, or null. Only fills that open exposure (grow
+   * |net| or go through flat) are checked: past BACKTESTER_MAX_POSITION_SIZE, or with the daily
+   * loss limit reached. Reducing fills, bracket legs and closes are never rejected.
+   */
+  private limitReason(state: State, side: Side, size: number, net: number, time: number): string | null {
+    const { after, opens } = exposureAfter(net, side, size);
+    if (!opens) return null;
+    const c = this.config;
+    if (Math.abs(after) > c.maxPositionSize) {
+      return `Rejected at fill: the net position would be ${after} (from ${net}); BACKTESTER_MAX_POSITION_SIZE is ${c.maxPositionSize}.`;
+    }
+    if (c.maxDailyLoss > 0) {
+      const dayStart = tradingDayStart(new Date(time)).getTime();
+      const realized = realizedNet(state.trades.filter((t) => Date.parse(t.creationTimestamp) >= dayStart));
+      if (realized <= -c.maxDailyLoss) {
+        return `Rejected at fill: daily loss limit reached (realized net ${realized.toFixed(2)} today, limit -${c.maxDailyLoss}); only reducing fills until the next trading day.`;
+      }
+    }
+    return null;
+  }
+
   private record(state: State, contractId: string, fills: SimFill[]): void {
     for (const f of fills) {
       state.trades.push({
@@ -422,27 +454,28 @@ export class ReplayExchange {
     }
     const from = state.syncedTo;
     const contracts = [...new Set(state.orders.filter((o) => o.status === STATUS.open).map((o) => o.contractId))].sort();
-    const found: Array<{ contractId: string; fill: SimFill }> = [];
-    for (const contractId of contracts) {
+    // One cursor per contract; bars are processed in time order across contracts (opens of a
+    // minute, then its closes), so the account-wide daily loss sees fills as they happen.
+    const curs = contracts.flatMap((contractId) => {
       const c = specOf(contractId);
-      if (!c || !this.store.has(c.dataRoot)) continue;
+      if (!c || !this.store.has(c.dataRoot)) return [];
       const s = this.store.get(c.dataRoot);
-      const fs = this.spec(c);
-      const book = this.book(state, contractId);
-      const ids = this.ids(state);
-      for (let i = s.lowerBound(from - MINUTE + 1); i < s.length && s.t[i] <= cutoff; i++) {
-        const bar = s.bar(i);
-        const fills: SimFill[] = [];
-        if (bar.t > from) fills.push(...openBar(book, bar, fs, ids));
-        if (bar.t + MINUTE <= cutoff) fills.push(...closeBar(book, bar, fs, ids));
-        for (const fill of fills) found.push({ contractId, fill });
-        if (!book.orders.some((o) => o.status === STATUS.open)) break;
+      return [{ contractId, s, fs: this.spec(c), book: this.book(state, contractId), i: s.lowerBound(from - MINUTE + 1) }];
+    });
+    const ids = this.ids(state);
+    const active = (k: (typeof curs)[number]) => k.i < k.s.length && k.s.t[k.i] <= cutoff && k.book.orders.some((o) => o.status === STATUS.open);
+    for (;;) {
+      let t = Infinity;
+      for (const k of curs) if (active(k)) t = Math.min(t, k.s.t[k.i]);
+      if (t === Infinity) break;
+      const group = curs.filter((k) => active(k) && k.s.t[k.i] === t);
+      if (t > from) for (const k of group) openBar(k.book, k.s.bar(k.i), k.fs, ids, this.hooks(state, k.contractId));
+      for (const k of group) {
+        if (t + MINUTE <= cutoff) closeBar(k.book, k.s.bar(k.i), k.fs, ids, this.hooks(state, k.contractId));
+        k.i++;
       }
-      this.adopt(state, book, contractId);
     }
-    // Fills of all contracts in time order (then order id), so trade ids follow the replay.
-    found.sort((a, b) => a.fill.time - b.fill.time || a.fill.orderId - b.fill.orderId);
-    for (const p of found) this.record(state, p.contractId, [p.fill]);
+    for (const k of curs) this.adopt(state, k.book, k.contractId);
     state.syncedTo = cutoff;
   }
 
@@ -498,6 +531,8 @@ export class ReplayExchange {
       fillVolume: o.fillVolume,
       filledPrice: o.filledPrice,
       customTag: o.customTag,
+      // Extra field: why the broker rejected the order at fill time (status 5), else null.
+      rejectReason: o.rejectReason ?? null,
       // Extra field (allowed by the interface): bracket legs and closes only ever reduce the position.
       reduceOnly: o.role !== "order",
     };
@@ -673,9 +708,8 @@ export class ReplayExchange {
     const fs = this.spec(c);
     const o = book.orders.find((x) => x.id === orderId && x.status === STATUS.open);
     if (!o) return;
-    const { fill } = fillOrder(book, o, marketFillPrice(s.o[index], o.side, fs), s.t[index], fs, this.ids(state));
+    fillOrder(book, o, marketFillPrice(s.o[index], o.side, fs), s.t[index], fs, this.ids(state), this.hooks(state, contractId));
     this.adopt(state, book, contractId);
-    if (fill) this.record(state, contractId, [fill]);
   }
 
   /**
@@ -700,9 +734,8 @@ export class ReplayExchange {
     const o = book.orders.find((x) => x.id === orderId && x.status === STATUS.open);
     if (last === null || !o) return;
     const fs = this.spec(c);
-    const { fill } = fillOrder(book, o, onTick(last, c.tickSize), this.cutoff(now), fs, this.ids(state));
+    fillOrder(book, o, onTick(last, c.tickSize), this.cutoff(now), fs, this.ids(state), this.hooks(state, contractId));
     this.adopt(state, book, contractId);
-    if (fill) this.record(state, contractId, [fill]);
   }
 
   private lastClose(s: BarSeries, now: Date): number | null {
@@ -837,10 +870,12 @@ export class ReplayExchange {
       const qty = size ?? Math.abs(pos.net);
       if (qty > Math.abs(pos.net)) return refuse(5, `Close size ${qty} is larger than the position (${Math.abs(pos.net)}).`);
       const side: Side = pos.net > 0 ? 1 : 0;
-      const waiting = state.orders
-        .filter((o) => o.contractId === contractId && o.status === STATUS.open && o.type === ORDER_TYPES.market && o.side === side)
-        .reduce((n, o) => n + o.size, 0);
-      if (waiting + qty > Math.abs(pos.net)) return refuse(7, `A market order closing ${waiting} is already waiting for the next bar.`);
+      // Only other closes waiting for the next bar matter here: a client market order is the
+      // client's own (if it would breach a limit when it fills, the fill is rejected then).
+      const closes = state.orders.filter((o) => o.contractId === contractId && o.status === STATUS.open && o.role === "close");
+      if (closes.some((o) => o.flatten)) return refuse(7, "A close_position is already waiting for the next bar.");
+      const waiting = closes.reduce((n, o) => n + o.size, 0);
+      if (waiting + qty > Math.abs(pos.net)) return refuse(7, `Closes for ${waiting} are already waiting for the next bar; ${Math.abs(pos.net) - waiting} left to close.`);
       const s = this.store.get(c.dataRoot);
       const ended = this.ended(now, s);
       const next = ended ? { index: -1 } : this.nextBar(s, now);
@@ -862,6 +897,7 @@ export class ReplayExchange {
         activeFrom: t,
         updatedAt: t,
         role: "close",
+        flatten: size === null,
         parentId: null,
         stopLossBracket: null,
         takeProfitBracket: null,

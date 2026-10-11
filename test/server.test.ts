@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MIN, RATIONALE, T0, flat, iso, seq, setup } from "./helpers.js";
+import { MIN, RATIONALE, T0, flat, iso, seq, setup, type Row } from "./helpers.js";
 
 const order = { accountId: 1, contractId: "BT.MNQ", side: "buy", type: "market", size: 1, rationale: RATIONALE };
 
@@ -267,20 +267,28 @@ describe("place_order", () => {
     expect((await call("modify_order", { accountId: 1, orderId: stop.data.orderId, size: 2 })).data.success).toBe(true);
   });
 
-  it("doesn't let several orders against the position grow past it", async () => {
-    const { call } = await setup({ env: { BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2" } });
+  it("several orders against the position can't grow it past the limit: the excess fills are rejected", async () => {
+    const data = { NQ: [...flat(T0 - 10 * MIN, 11, 20000), [T0 + MIN, 20000, 20000, 19980, 19985] as Row, ...flat(T0 + 2 * MIN, 5, 19985)] };
+    const { call, setNow } = await setup({ data, env: { BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2", BACKTESTER_MAX_DAILY_LOSS: "0" } });
     await call("place_order", { ...order, side: "sell", size: 2 }); // short 2
     for (let k = 0; k < 4; k++) expect((await call("place_order", { ...order, type: "limit", limitPrice: 19990 })).data.success).toBe(true);
-    expect((await call("modify_order", { accountId: 1, orderId: 2, size: 2 })).text).toMatch(/net position to 3/);
+    for (const id of [2, 3, 4, 5]) expect((await call("modify_order", { accountId: 1, orderId: id, size: 2 })).data.success).toBe(true);
+    setNow(T0 + 3 * MIN); // the dip fills them in id order until the limit
+    expect((await call("list_open_positions", { accountId: 1 })).data).toMatchObject([{ direction: "long", size: 2 }]);
+    const orders = (await call("search_orders", { accountId: 1, startTimestamp: iso(T0) })).data;
+    expect(orders.filter((o: any) => o.statusName === "rejected").map((o: any) => o.id)).toEqual([4, 5]);
+    expect(orders.find((o: any) => o.id === 4).rejectReason).toMatch(/net position would be 4 .*BACKTESTER_MAX_POSITION_SIZE is 2/);
   });
 
-  it("counts every stop against the position: no stacking stops past the limit", async () => {
-    const { call } = await setup({ env: { BACKTESTER_MAX_POSITION_SIZE: "1", BACKTESTER_MAX_DAILY_LOSS: "0" } });
+  it("stacked stops against the position: fills past the limit are rejected", async () => {
+    const data = { NQ: [...flat(T0 - 10 * MIN, 11, 20000), [T0 + MIN, 20000, 20000, 19980, 19985] as Row, ...flat(T0 + 2 * MIN, 5, 19985)] };
+    const { call, setNow } = await setup({ data, env: { BACKTESTER_MAX_POSITION_SIZE: "1", BACKTESTER_MAX_DAILY_LOSS: "0" } });
     await call("place_order", order); // long 1
     const stop = { ...order, side: "sell", type: "stop", stopPrice: 19990 };
-    expect((await call("place_order", stop)).data.success).toBe(true); // projected 0
-    expect((await call("place_order", stop)).data.success).toBe(true); // projected -1: no further from flat
-    expect((await call("place_order", stop)).text).toMatch(/net position to -2/);
+    for (let k = 0; k < 3; k++) expect((await call("place_order", stop)).data.success).toBe(true); // each alone only reduces
+    setNow(T0 + 3 * MIN);
+    expect((await call("list_open_positions", { accountId: 1 })).data).toMatchObject([{ direction: "short", size: 1 }]);
+    expect((await call("search_orders", { accountId: 1, startTimestamp: iso(T0) })).data.map((o: any) => o.statusName)).toEqual(["filled", "filled", "filled", "rejected"]);
   });
 
   it("always allows a stop and a target protecting a position within the limit", async () => {
