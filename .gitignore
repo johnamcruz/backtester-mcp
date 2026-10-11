@@ -1,0 +1,28 @@
+# Node
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+*.log
+
+# Environments
+.env
+.envrc
+
+# Market data: this repo holds code only. Bring your own data and point
+# BACKTESTER_DATA_DIR at it; never commit it.
+data/
+*.csv
+*.parquet
+*.manifest.json
+
+# Replay state and journals (per run)
+.backtester-state/
+state.json
+journal.jsonl
+clock.json
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
