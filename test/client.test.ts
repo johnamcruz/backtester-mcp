@@ -5,6 +5,9 @@ import { CONTRACTS, ReplayExchange, frontMonthName, specOf, type PlaceRequest } 
 import { loadConfig } from "../src/config.js";
 import { MIN, T0, defaultData, flat, iso, seq, setup, tmp, writeData, type Row } from "./helpers.js";
 
+/** The rule runs were created with before market orders filled at the replay moment. */
+const NEXT_BAR = { BACKTESTER_MARKET_FILL: "next-bar" };
+
 const req = (p: Partial<PlaceRequest> = {}): PlaceRequest => ({
   accountId: 1, contractId: "BT.MNQ", type: 2, side: 0, size: 1, limitPrice: null, stopPrice: null, trailPrice: null,
   customTag: null, stopLossBracket: null, takeProfitBracket: null, ...p,
@@ -53,8 +56,8 @@ describe("market orders", () => {
     expect(exchange.openOrders(1)).toEqual([]);
   });
 
-  it("placed inside a bar, wait for the next bar's open", async () => {
-    const { exchange, setNow } = await setup({ now: T0 + 30000, data: { NQ: seq(T0, [[20000, 20003, 19999, 20002], [20004, 20005, 20003, 20004]]) } });
+  it("placed inside a bar in a next-bar run, wait for the next bar's open", async () => {
+    const { exchange, setNow } = await setup({ now: T0 + 30000, data: { NQ: seq(T0, [[20000, 20003, 19999, 20002], [20004, 20005, 20003, 20004]]) }, env: NEXT_BAR });
     exchange.place(req({ side: 1 }));
     expect(exchange.positions(1)).toEqual([]);
     expect(exchange.openOrders(1)).toMatchObject([{ id: 1, status: 1, type: 2 }]);
@@ -80,6 +83,192 @@ describe("market orders", () => {
   });
 });
 
+describe("market orders at the replay moment (BACKTESTER_MARKET_FILL=now, the default)", () => {
+  // Bar T0 opens at 20000 and ranges 19980..20020 (its high, low and close come during the minute); T0+1 is quiet.
+  const rows = (b0: [number, number, number, number] = [20000, 20020, 19980, 20005], after: Array<[number, number, number, number]> = [[20000, 20001, 19999, 20000], [20000, 20000, 19990, 19992], [19992, 19992, 19992, 19992]]): Row[] => [
+    ...flat(T0 - 5 * MIN, 5, 20000),
+    ...seq(T0, [b0, ...after]),
+  ];
+  const t = T0 + 30000;
+
+  it("fill at once at the containing bar's open plus slippage on the adverse side, stamped at the moment", async () => {
+    const buy = await setup({ now: t, data: { NQ: rows() } });
+    expect(buy.exchange.place(req())).toMatchObject({ success: true, orderId: 1 });
+    expect(buy.exchange.openOrders(1)).toEqual([]);
+    expect(buy.exchange.trades(1, iso(T0))).toMatchObject([{ price: 20000.25, creationTimestamp: iso(t), side: 0, fees: 0.37 }]);
+    expect(buy.exchange.positions(1)).toMatchObject([{ creationTimestamp: iso(t), type: 1, averagePrice: 20000.25 }]);
+    expect(buy.exchange.searchOrders(1, iso(T0))[0]).toMatchObject({ status: 2, filledPrice: 20000.25, updateTimestamp: iso(t) });
+    // A sell with 2 ticks of slippage: 20000 - 0.50.
+    const sell = await setup({ now: t, data: { NQ: rows() }, env: { BACKTESTER_SLIPPAGE_TICKS: "2" } });
+    sell.exchange.place(req({ side: 1 }));
+    expect(sell.exchange.trades(1, iso(T0))).toMatchObject([{ price: 19999.5, creationTimestamp: iso(t), side: 1 }]);
+  });
+
+  it("use nothing after the moment: the containing bar's high, low and close and later bars don't change the fill", async () => {
+    const fillOn = async (data: Row[]) => {
+      const { exchange } = await setup({ now: t, data: { NQ: data } });
+      exchange.place(req({ stopLossBracket: { ticks: 8, type: 4 } }));
+      return { trades: exchange.trades(1, iso(T0)), orders: exchange.openOrders(1), positions: exchange.positions(1) };
+    };
+    const a = await fillOn(rows());
+    const b = await fillOn(rows([20000, 20000, 19900, 19900], [[19900, 19900, 19800, 19800], [19800, 19800, 19800, 19800]]));
+    const c = await fillOn(rows([20000, 20100, 20000, 20100], [[20100, 20200, 20100, 20200]]));
+    expect(a.trades).toMatchObject([{ price: 20000.25, creationTimestamp: iso(t) }]);
+    expect(b).toEqual(a);
+    expect(c).toEqual(a);
+  });
+
+  it("check bracket legs from the first bar after the fill, never on the rest of the containing bar", async () => {
+    const run = async (after: Array<[number, number, number, number]>) => {
+      const { exchange, setNow } = await setup({ now: t, data: { NQ: rows(undefined, after) } });
+      // Long at 20000.25: stop 20 ticks under (19995.25), target 20 ticks over (20005.25). Bar T0 reaches both.
+      exchange.place(req({ stopLossBracket: { ticks: 20, type: 4 }, takeProfitBracket: { ticks: 20, type: 1 } }));
+      setNow(T0 + MIN);
+      expect(exchange.positions(1)).toMatchObject([{ size: 1 }]); // bar T0's 19980 and 20020 may have come before the fill
+      expect(exchange.openOrders(1).map((o) => [o.type, o.stopPrice ?? o.limitPrice])).toEqual([[4, 19995.25], [1, 20005.25]]);
+      setNow(T0 + 3 * MIN);
+      return exchange;
+    };
+    const stopped = await run([[20000, 20001, 19999, 20000], [20000, 20000, 19990, 19992], [19992, 19992, 19992, 19992]]);
+    expect(stopped.positions(1)).toEqual([]);
+    expect(stopped.trades(1, iso(T0)).map((x) => [x.orderId, x.price, x.creationTimestamp])).toEqual([[1, 20000.25, iso(t)], [2, 19995, iso(T0 + 3 * MIN)]]);
+    // Exit inside bar T0+2: bar T0 counts not at all (entered inside it), T0+1 whole, T0+2 its open and the fill.
+    // MFE 20001 - 20000.25 = 3 ticks ($1.50); MAE the stop fill, -21 ticks ($10.50); risk 20 ticks ($10).
+    expect(stopped.tradeReport(1, iso(T0)).roundTrips[0]).toMatchObject({ reason: "stop", mfeDollars: 1.5, maeDollars: -10.5, maeR: -1.05, mfeR: 0.15, barsHeld: 1, r: -1.05 });
+    const target = await run([[20000, 20001, 19999, 20000], [20000, 20010, 20000, 20008], [20008, 20008, 20008, 20008]]);
+    expect(target.trades(1, iso(T0)).map((x) => [x.orderId, x.price])).toEqual([[1, 20000.25], [3, 20005.25]]);
+    // A next bar that opens through the stop fills at that open less slippage (the first price after the fill).
+    const gapped = await run([[19990, 19991, 19989, 19990], [19990, 19990, 19990, 19990], [19990, 19990, 19990, 19990]]);
+    expect(gapped.trades(1, iso(T0))[1]).toMatchObject({ orderId: 2, price: 19989.75, creationTimestamp: iso(T0 + 2 * MIN) });
+  });
+
+  it("show an open position's metrics without the unclosed containing bar", async () => {
+    const { exchange } = await setup({ now: t, data: { NQ: rows() } });
+    exchange.place(req({ stopLossBracket: { ticks: 20, type: 4 } }));
+    expect(exchange.positions(1, true)[0].roundTrip).toMatchObject({ maeDollars: 0, mfeDollars: 0, barsHeld: 0, entryTime: iso(t) });
+    // An add at the moment to a position entered at T0's open: bar T0 (19980..20020) is not closed yet and is not read.
+    const add = await setup({ now: T0, data: { NQ: rows() }, env: { BACKTESTER_MAX_ORDER_SIZE: "2", BACKTESTER_MAX_POSITION_SIZE: "2" } });
+    add.exchange.place(req()); // 20000.25 at T0's open
+    add.setNow(t);
+    add.exchange.place(req()); // 20000.25 at the moment
+    expect(add.exchange.positions(1, true)[0]).toMatchObject({ size: 2, roundTrip: { maeDollars: 0, mfeDollars: 0, barsHeld: 0 } });
+    add.setNow(T0 + 2 * MIN);
+    // Bar T0 had a fill inside it: only its open counts (20000: -1 tick on 1 contract); T0+1 held whole (19999..20001 on 2).
+    // Both bars are held (bar T0 by the same round trip from its open to its close).
+    expect(add.exchange.positions(1, true)[0].roundTrip).toMatchObject({ mfeDollars: 1.5 * 2, maeDollars: -2.5 * 2, barsHeld: 2 });
+  });
+
+  it("an exit at the moment counts the containing bar's open and the fill, not its range", async () => {
+    const data = { NQ: [...flat(T0 - 5 * MIN, 5, 20000), ...seq(T0, [[20000, 20001, 19999, 20000], [20000, 20020, 19980, 20000], [20000, 20000, 20000, 20000]])] };
+    const { exchange, setNow } = await setup({ data });
+    exchange.place(req({ stopLossBracket: { ticks: 40, type: 4 } })); // at T0's open: 20000.25, stop 19990.25
+    setNow(T0 + MIN + 30000);
+    expect(exchange.close(1, "BT.MNQ", null)).toMatchObject({ success: true });
+    expect(exchange.positions(1)).toEqual([]);
+    expect(exchange.openOrders(1)).toEqual([]); // the stop leg is cancelled with the flat position
+    expect(exchange.trades(1, iso(T0)).at(-1)).toMatchObject({ price: 19999.75, creationTimestamp: iso(T0 + MIN + 30000), profitAndLoss: -1 });
+    setNow(T0 + 3 * MIN);
+    // Bar T0 held whole (19999..20001): MFE 3 ticks ($1.50), MAE -5 ticks ($2.50); bar T0+1's 19980 and 20020 don't count.
+    expect(exchange.tradeReport(1, iso(T0)).roundTrips[0]).toMatchObject({ reason: "close", mfeDollars: 1.5, maeDollars: -2.5, barsHeld: 1, exitTime: iso(T0 + MIN + 30000) });
+  });
+
+  it("wait for the next bar's open when no bar contains the moment (no trade in that minute)", async () => {
+    const data = { NQ: [...flat(T0 - 5 * MIN, 6, 20000), ...flat(T0 + 2 * MIN, 5, 20004)] }; // no bar at T0+1
+    const { exchange, setNow } = await setup({ now: T0 + MIN + 30000, data });
+    expect(exchange.place(req())).toMatchObject({ success: true });
+    expect(exchange.openOrders(1)).toMatchObject([{ id: 1, type: 2, status: 1 }]);
+    setNow(T0 + 2 * MIN);
+    expect(exchange.trades(1, iso(T0))).toMatchObject([{ price: 20004.25, creationTimestamp: iso(T0 + 2 * MIN) }]);
+  });
+
+  it("fill in the session's last minute, where a next-bar run finds the market closed", async () => {
+    const data = { NQ: [...flat(Date.parse("2024-03-05T21:50:00Z"), 10, 20000), ...flat(Date.parse("2024-03-05T23:00:00Z"), 5, 20010)] };
+    const at = Date.parse("2024-03-05T21:59:30Z");
+    const now = await setup({ now: at, data });
+    expect(now.exchange.place(req())).toMatchObject({ success: true });
+    expect(now.exchange.trades(1, iso(T0))).toMatchObject([{ price: 20000.25, creationTimestamp: iso(at) }]);
+    // A resting order still needs a next bar in this trading day.
+    expect(now.exchange.place(req({ type: 1, limitPrice: 19990 }))).toMatchObject({ errorCode: 5, errorMessage: expect.stringMatching(/market is closed/) });
+    expect(now.exchange.close(1, "BT.MNQ", null)).toMatchObject({ success: true });
+    expect(now.exchange.positions(1)).toEqual([]);
+    const next = await setup({ now: at, data, env: NEXT_BAR });
+    expect(next.exchange.place(req())).toMatchObject({ errorCode: 5, errorMessage: expect.stringMatching(/market is closed/) });
+  });
+
+  it("are rejected at fill when the fill would breach a limit (the broker's fill-time guard)", async () => {
+    // The exchange directly, past the server's placement checks: a buy of 2 with a max position of 1.
+    const { exchange } = await setup({ now: t, data: { NQ: rows() }, env: { BACKTESTER_MAX_POSITION_SIZE: "1", BACKTESTER_MAX_ORDER_SIZE: "2" } });
+    expect(exchange.place(req({ size: 2 }))).toMatchObject({ success: true });
+    expect(exchange.searchOrders(1, iso(T0))[0]).toMatchObject({ status: 5, rejectReason: expect.stringMatching(/would be 2/) });
+    expect(exchange.positions(1)).toEqual([]);
+    // Past the daily loss limit: an opening fill on arrival is rejected, a reducing one fills.
+    const dl = await setup({ now: t, data: { NQ: rows() }, env: { BACKTESTER_MAX_DAILY_LOSS: "1", BACKTESTER_MAX_ORDER_SIZE: "2", BACKTESTER_MAX_POSITION_SIZE: "2" } });
+    dl.exchange.place(req({ size: 2 }));
+    dl.exchange.close(1, "BT.MNQ", 1); // -1 tick x 2 sides = -$1, fees $0.74: past the limit
+    expect(dl.exchange.place(req())).toMatchObject({ success: true });
+    expect(dl.exchange.searchOrders(1, iso(T0)).at(-1)).toMatchObject({ status: 5, rejectReason: expect.stringMatching(/daily loss limit/) });
+    dl.exchange.place(req({ side: 1 }));
+    expect(dl.exchange.positions(1)).toEqual([]);
+  });
+
+  it("fill in the last minute before BACKTESTER_END at that minute's open", async () => {
+    const data = { NQ: [...flat(Date.parse("2024-03-05T21:50:00Z"), 9, 20000), [Date.parse("2024-03-05T21:59:00Z"), 20010, 20010, 20010, 20010] as Row, ...flat(Date.parse("2024-03-05T23:00:00Z"), 5, 20020)] };
+    const at = Date.parse("2024-03-05T21:59:30Z");
+    const { exchange } = await setup({ now: at, data, env: { BACKTESTER_END: "2024-03-05T22:00:00Z" } });
+    expect(exchange.place(req())).toMatchObject({ success: true });
+    expect(exchange.place(req({ type: 1, limitPrice: 19990 }))).toMatchObject({ errorCode: 5 });
+    expect(exchange.close(1, "BT.MNQ", null)).toMatchObject({ success: true });
+    expect(exchange.trades(1, iso(T0)).map((x) => [x.price, x.creationTimestamp])).toEqual([[20010.25, iso(at)], [20009.75, iso(at)]]);
+    // END inside that minute cuts the bar short: no bar is left, as before (an entry would settle at a close from before it).
+    const cut = await setup({ now: at, data, env: { BACKTESTER_END: "2024-03-05T21:59:40Z" } });
+    expect(cut.exchange.place(req())).toMatchObject({ errorCode: 5, errorMessage: expect.stringMatching(/replay is over/) });
+    const onOpen = await setup({ now: Date.parse("2024-03-05T21:59:00Z"), data, env: { BACKTESTER_END: "2024-03-05T21:59:40Z" } });
+    expect(onOpen.exchange.place(req())).toMatchObject({ errorCode: 5, errorMessage: expect.stringMatching(/replay is over/) });
+  });
+
+  it("join_bid / join_ask fill on arrival only when marketable at the containing bar's open", async () => {
+    // Last close 20000; bar T0 opens at 20002.
+    const data = { NQ: [...flat(T0 - 5 * MIN, 5, 20000), ...seq(T0, [[20002, 20003, 20001, 20002], [20002, 20002, 20002, 20002]])] };
+    const { exchange } = await setup({ now: t, data, env: { BACKTESTER_MAX_POSITION_SIZE: "1" } });
+    exchange.place(req({ type: 6 })); // buy at 20000, the market is at 20002: rests
+    expect(exchange.openOrders(1)).toMatchObject([{ id: 1, type: 6, limitPrice: 20000, status: 1 }]);
+    exchange.cancel(1, 1);
+    exchange.place(req({ type: 7, side: 1 })); // sell at 20000 or better, the market is at 20002: fills at 20002 (no slippage)
+    expect(exchange.trades(1, iso(T0))).toMatchObject([{ orderId: 2, side: 1, price: 20002, creationTimestamp: iso(t) }]);
+  });
+});
+
+describe("market fill rule pinned per run", () => {
+  const stateOf = (path: string) => JSON.parse(readFileSync(path, "utf8"));
+
+  it("a run created before the rule was pinned keeps next-bar: a default process is refused, a next-bar one continues", async () => {
+    for (const strip of ["marketFill", "settings"] as const) {
+      const dir = tmp();
+      const a = await setup({ dir, data: defaultData(), now: T0, env: NEXT_BAR });
+      a.exchange.accounts();
+      const st = stateOf(a.config.statePath);
+      if (strip === "settings") delete st.settings;
+      else delete st.settings.marketFill;
+      writeFileSync(a.config.statePath, JSON.stringify(st));
+      const b = await setup({ dir });
+      expect(() => b.exchange.accounts()).toThrow(/marketFill now vs next-bar.*BACKTESTER_MARKET_FILL=next-bar/);
+      const c = await setup({ dir, env: NEXT_BAR, now: T0 + 30000 });
+      c.exchange.place(req());
+      expect(c.exchange.openOrders(1)).toMatchObject([{ type: 2, status: 1 }]); // waits for the next bar, as the run always did
+      expect(stateOf(a.config.statePath).settings.marketFill).toBe("next-bar");
+    }
+  });
+
+  it("a run records its rule and refuses a process with the other one", async () => {
+    const dir = tmp();
+    const a = await setup({ dir, data: defaultData(), now: T0 });
+    a.exchange.accounts();
+    expect(stateOf(a.config.statePath).settings.marketFill).toBe("now");
+    const b = await setup({ dir, env: NEXT_BAR });
+    expect(() => b.exchange.accounts()).toThrow(/marketFill next-bar vs now.*BACKTESTER_MARKET_FILL=now/);
+  });
+});
+
 describe("order validation", () => {
   it("refuses with the interface's place codes", async () => {
     const { exchange } = await setup();
@@ -95,8 +284,10 @@ describe("order validation", () => {
 
   it("joins the last price and places trailing stops from it", async () => {
     const { exchange } = await setup();
+    // Joining the last price 20000 while the bar in progress opened at 20000: marketable, so it fills on arrival (no slippage).
     expect(exchange.place(req({ type: 6 }))).toMatchObject({ success: true });
-    expect(exchange.openOrders(1)[0]).toMatchObject({ type: 6, limitPrice: 20000 });
+    expect(exchange.searchOrders(1, iso(T0 - MIN))[0]).toMatchObject({ type: 6, limitPrice: 20000, status: 2, filledPrice: 20000 });
+    expect(exchange.positions(1)).toMatchObject([{ size: 1, averagePrice: 20000 }]);
     expect(exchange.place(req({ type: 5, side: 1, trailPrice: 20001 }))).toMatchObject({ errorCode: 2, errorMessage: expect.stringMatching(/below/) });
     expect(exchange.place(req({ type: 5, side: 1, trailPrice: 19995 }))).toMatchObject({ success: true });
     expect(exchange.searchOrders(1, iso(T0 - MIN))[1]).toMatchObject({ type: 5, stopPrice: 19995, trailPrice: 5 });
@@ -121,7 +312,7 @@ describe("order management", () => {
   });
 
   it("modifies a trailing stop's level and a limit's price; refuses a waiting market order", async () => {
-    const { exchange } = await setup({ now: T0 + 30000 });
+    const { exchange } = await setup({ now: T0 + 30000, env: NEXT_BAR }); // a market order waits only in a next-bar run (or a minute with no bar)
     exchange.place(req({ type: 5, side: 1, trailPrice: 19995 }));
     exchange.place(req({ type: 1, limitPrice: 19990 }));
     exchange.place(req());
@@ -131,8 +322,8 @@ describe("order management", () => {
     expect(exchange.openOrders(1).slice(0, 2)).toMatchObject([{ stopPrice: 19998, trailPrice: 2 }, { limitPrice: 19991 }]);
   });
 
-  it("closes and partially closes at market with the close codes", async () => {
-    const { exchange, setNow } = await setup();
+  it("closes and partially closes at market with the close codes (a next-bar run: closes wait for the next bar)", async () => {
+    const { exchange, setNow } = await setup({ env: NEXT_BAR });
     expect(exchange.close(1, "BT.MNQ", null)).toMatchObject({ errorCode: 2 });
     expect(exchange.close(1, "BT.ZZ", null)).toMatchObject({ errorCode: 3 });
     expect(exchange.close(1, "BT.ES", null)).toMatchObject({ errorCode: 4 });
@@ -156,8 +347,8 @@ describe("inside a bar", () => {
   // Bar T0+1 trades down to 19990.
   const data = () => ({ NQ: [...flat(T0 - 5 * MIN, 6, 20000), [T0 + MIN, 20000, 20000, 19990, 19992] as Row, ...flat(T0 + 2 * MIN, 5, 19992)] });
 
-  it("a close placed inside a bar never opens a position when the stop fills first", async () => {
-    const { exchange, setNow } = await setup({ data: data() });
+  it("a close placed inside a bar never opens a position when the stop fills first (a next-bar run)", async () => {
+    const { exchange, setNow } = await setup({ data: data(), env: NEXT_BAR });
     exchange.place(req({ stopLossBracket: { ticks: 20, type: 4 } }));
     setNow(T0 + 90000);
     expect(exchange.close(1, "BT.MNQ", null)).toMatchObject({ success: true });
@@ -199,7 +390,8 @@ describe("inside a bar", () => {
   it("creates a mid-bar market order's bracket in one sync and fills it in a later one", async () => {
     const { exchange, setNow } = await setup({ now: T0 + 30000, data: data() });
     exchange.place(req({ stopLossBracket: { ticks: 8, type: 4 } }));
-    setNow(T0 + MIN + 10000); // opens at T0+1: long at 20000.25, stop 19998.25
+    // Filled on arrival at T0+30s, at T0's open: long at 20000.25, stop 19998.25 (live from T0+1, the first bar after the fill).
+    setNow(T0 + MIN + 10000);
     expect(exchange.openOrders(1)).toMatchObject([{ id: 2, type: 4, stopPrice: 19998.25 }]);
     setNow(T0 + 2 * MIN);
     expect(exchange.positions(1)).toEqual([]);

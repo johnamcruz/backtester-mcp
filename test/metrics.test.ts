@@ -258,3 +258,44 @@ describe("round trips: tick arithmetic per contract", () => {
     });
   }
 });
+
+describe("round trips: fills on arrival (marketFill now)", () => {
+  // Bar 1 ranges 95..105; bars 0 and 2 are quiet.
+  const b = () => bars([[100, 100.5, 99.5, 100], [100, 105, 95, 100], [100, 100.5, 99.5, 100], [100, 100, 100, 100]]);
+
+  it("an entry and an exit inside bars: neither bar's range counts, only the exit bar's open and the fills", () => {
+    // Buy on arrival at t(1)+30s at bar 1's open 100 + 1 tick; sell on arrival at t(2)+20s at bar 2's open 100 - 1 tick.
+    const entry = order({ arrival: true, placedAt: t(1) + 30000, updatedAt: t(1) + 30000 });
+    const exit = order({ arrival: true, side: 1, role: "close", placedAt: t(2) + 20000, updatedAt: t(2) + 20000 });
+    const fills = [fill(1, entry, 0, 1, 100.25, t(1) + 30000, null), fill(2, exit, 1, 1, 99.75, t(2) + 20000, -0.5)];
+    const [trip] = roundTrips("BT.MNQ", fills, [entry, exit], b(), MNQ, t(4)).closed;
+    // Bar 1 (95..105) not at all; bar 2: its open 100 (-1 tick, $0.50) and the fill 99.75 (-2 ticks, $1).
+    expect(trip).toMatchObject({ entryTime: iso(t(1) + 30000), exitTime: iso(t(2) + 20000), maeDollars: -1, mfeDollars: 0, barsHeld: 0, reason: "close" });
+  });
+
+  it("a fill on arrival exactly at a bar's open is at that open: the bar's range after it counts", () => {
+    const entry = order({ arrival: true, placedAt: t(1), updatedAt: t(1) });
+    const fills = [fill(1, entry, 0, 1, 100.25, t(1), null)];
+    const r = roundTrips("BT.MNQ", fills, [entry], b(), MNQ, t(2));
+    // Bar 1 held whole: high 105 (+19 ticks, $9.50), low 95 (-21 ticks, $10.50).
+    expect(r.open).toMatchObject({ mfeDollars: 9.5, maeDollars: -10.5, barsHeld: 1 });
+  });
+
+  it("a join filled on arrival exactly at a bar's open is at that open, not inside the bar before", () => {
+    // Long at t(1)'s open 100.25; a join_ask sell fills on arrival exactly at t(2), at 100.
+    const entry = order({ arrival: true, placedAt: t(1), updatedAt: t(1) });
+    const exit = order({ arrival: true, side: 1, type: ORDER_TYPES.join_ask, placedAt: t(2), updatedAt: t(2) });
+    const fills = [fill(1, entry, 0, 1, 100.25, t(1), null), fill(2, exit, 1, 1, 100, t(2), -0.5)];
+    const [trip] = roundTrips("BT.MNQ", fills, [entry, exit], b(), MNQ, t(4)).closed;
+    // Bar 1 held whole before the exit: high 105 (+19 ticks, $9.50), low 95 (-21 ticks, $10.50).
+    expect(trip).toMatchObject({ mfeDollars: 9.5, maeDollars: -10.5, barsHeld: 1, reason: "target" });
+  });
+
+  it("an add inside the bar in progress at the cutoff reads nothing of that bar but its open", () => {
+    const first = order({ placedAt: t(1), updatedAt: t(1) });
+    const add = order({ arrival: true, placedAt: t(1) + 30000, updatedAt: t(1) + 30000 });
+    const fills = [fill(1, first, 0, 1, 100.25, t(1), null), fill(2, add, 0, 1, 100.25, t(1) + 30000, null)];
+    const r = roundTrips("BT.MNQ", fills, [first, add], b(), MNQ, t(1) + 30000);
+    expect(r.open).toMatchObject({ mfeDollars: 0, maeDollars: 0, barsHeld: 0 });
+  });
+});

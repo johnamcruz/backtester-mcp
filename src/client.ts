@@ -2,11 +2,14 @@ import { closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unl
 import { dirname } from "node:path";
 import { aggregate, BarStore, MINUTE, type AggUnit, type BarSeries, type OutBar } from "./bars.js";
 import { readNow } from "./clock.js";
-import type { Config } from "./config.js";
+import type { Config, MarketFill } from "./config.js";
 import { ORDER_TYPES } from "./enums.js";
 import {
   STATUS,
+  arrivalFillPrice,
   closeBar,
+  containingBar,
+  fillOnArrival,
   fillOrder,
   isLimitType,
   isOnTick,
@@ -154,6 +157,8 @@ interface StoredOrder extends SimOrder {
   cancelSeq?: number;
   /** Filled at the last close after BACKTESTER_END (a round trip's exit reason "end"). */
   endOfWindow?: boolean;
+  /** Filled on arrival at the replay moment it was placed (marketFill "now"), stamped at that moment. */
+  arrival?: boolean;
 }
 
 /** A fill as search_trades returns it: the stored fill plus its round-trip metrics (extra fields). */
@@ -182,6 +187,8 @@ interface RunSettings {
   slippageTicks: number;
   feesMicro: number;
   feesMini: number;
+  /** Missing in runs created before it was pinned: those filled market orders at the next bar ("next-bar"). */
+  marketFill: MarketFill;
 }
 
 export interface PlaceRequest {
@@ -336,18 +343,34 @@ export class ReplayExchange {
   /** Lock the run, sync it to the clock, run `fn`, save. */
   private settings(): RunSettings {
     const c = this.config;
-    return { accountId: c.accountId, startBalance: c.startBalance, slippageTicks: c.slippageTicks, feesMicro: c.feesMicro, feesMini: c.feesMini };
+    return {
+      accountId: c.accountId,
+      startBalance: c.startBalance,
+      slippageTicks: c.slippageTicks,
+      feesMicro: c.feesMicro,
+      feesMini: c.feesMini,
+      marketFill: c.marketFill,
+    };
   }
 
-  /** Every process on a run fills the same way: refuse one whose settings differ from the run's. */
+  /**
+   * Every process on a run fills the same way: refuse one whose settings differ from the run's. A run
+   * created before marketFill was pinned (its settings lack it, or it has no settings at all) filled
+   * market orders at the next bar's open, so it keeps "next-bar": a process configured for "now" is
+   * refused rather than silently changing how the run fills.
+   */
   private checkSettings(state: State): void {
     const mine = this.settings();
-    state.settings ??= mine;
+    state.settings = state.settings ? { ...state.settings, marketFill: state.settings.marketFill ?? "next-bar" } : { ...mine, marketFill: "next-bar" };
     const diff = (Object.keys(mine) as Array<keyof RunSettings>).filter((k) => state.settings?.[k] !== mine[k]);
     if (diff.length) {
+      const hint = diff.includes("marketFill")
+        ? ` To continue this run, set BACKTESTER_MARKET_FILL=${state.settings.marketFill} (runs created before market orders filled at the replay moment keep next-bar).`
+        : "";
       throw new ReplayError(
         `This process's settings differ from run ${this.config.runId}'s (${diff.map((k) => `${k} ${mine[k]} vs ${state.settings?.[k]}`).join(", ")}). ` +
-          "Use the run's settings, or a new BACKTESTER_RUN_ID.",
+          "Use the run's settings, or a new BACKTESTER_RUN_ID." +
+          hint,
       );
     }
   }
@@ -778,7 +801,8 @@ export class ReplayExchange {
   /**
    * Whether `contractId` trades at `now`: the next 1-minute bar at or after
    * now exists, inside the replay window, in the same trading day. A market
-   * order fills at that bar's open. Returns that bar's index, or a reason.
+   * order that doesn't fill on arrival (marketFill "next-bar", or no bar
+   * contains the moment) fills at that bar's open. Returns that bar's index, or a reason.
    */
   private nextBar(s: BarSeries, now: Date): { index: number } | { reason: string } {
     const i = s.lowerBound(now.getTime());
@@ -802,13 +826,37 @@ export class ReplayExchange {
   }
 
   /**
+   * marketFill "now": the bar containing the replay moment (its open is the last price known now),
+   * or -1 (the rule is "next-bar", or no bar contains the moment: no trade in that minute, so the
+   * order waits for the next bar's open, the next price there is, as a live order waits for a trade).
+   * Never after BACKTESTER_END: callers ask only while bars are left before it (so now < END).
+   */
+  private arrivalBar(s: BarSeries, now: Date): number {
+    return this.config.marketFill === "now" ? containingBar(s.t, s.length, now.getTime()) : -1;
+  }
+
+  /** marketFill "now": fill the order at once, at the replay moment, at its containing bar's open (fills.ts#fillOnArrival). */
+  private fillArrival(state: State, contractId: string, c: ContractSpec, s: BarSeries, index: number, now: Date, orderId: number): void {
+    const book = this.book(state, contractId);
+    const o = book.orders.find((x) => x.id === orderId && x.status === STATUS.open);
+    if (!o) return;
+    const fill = fillOnArrival(book, o, s.o[index], now.getTime(), this.spec(c), this.ids(state), this.hooks(state, contractId));
+    if (fill) (o as StoredOrder).arrival = true;
+    this.adopt(state, book, contractId);
+  }
+
+  /**
    * No bar is left to fill on before BACKTESTER_END: the clock is at or past END (">=": a bar
    * opening at END would close after it), or the next bar after the clock opens after END (or
-   * there is none) while a window is set.
+   * there is none) while a window is set. With marketFill "now", a clock inside a bar that closes
+   * at or before END still has that bar to fill market orders on (at its open, at the moment); a
+   * bar that END cuts short doesn't (its close, settled at END, would come from before the fill).
    */
   private ended(now: Date, s: BarSeries): boolean {
     if (this.config.end === null) return false;
     if (now.getTime() >= this.config.end) return true;
+    const at = this.arrivalBar(s, now);
+    if (at >= 0) return s.t[at] + MINUTE > this.config.end; // also with the clock exactly on that bar's open
     const i = s.lowerBound(now.getTime());
     return i >= s.length || s.t[i] > this.config.end;
   }
@@ -849,7 +897,10 @@ export class ReplayExchange {
         if (!reduces) return no(5, "The replay is over (no bar left before BACKTESTER_END): only market orders that reduce the position are taken, at the last close.");
       }
       const next = ended ? { index: -1 } : this.nextBar(s, now);
-      if ("reason" in next) return no(5, `Outside trading hours: ${next.reason}.`);
+      const at = ended ? -1 : this.arrivalBar(s, now);
+      // With a bar containing the moment the market trades now: market orders fill at once there.
+      // Other orders rest for the next bar, so they still need one in this trading day.
+      if ("reason" in next && at < 0) return no(5, `Outside trading hours: ${next.reason}.`);
       if (req.customTag !== null && state.orders.some((o) => o.customTag === req.customTag)) {
         return no(2, `customTag "${req.customTag}" is already used on this account.`);
       }
@@ -876,6 +927,8 @@ export class ReplayExchange {
         stopPrice = req.trailPrice;
         trailDistance = Math.round(Math.abs(last - req.trailPrice) * 1e9) / 1e9;
       }
+      const arrives = at >= 0 && arrivalFillPrice({ type: req.type, side: req.side, limitPrice }, s.o[at], this.spec(c)) !== null;
+      if ("reason" in next && !arrives) return no(5, `Outside trading hours: ${next.reason}.`);
       const t = now.getTime();
       const order: StoredOrder = {
         id: state.nextOrderId++,
@@ -902,7 +955,8 @@ export class ReplayExchange {
       if (stopPrice !== null) order.stopAt = [[t, stopPrice, state.nextTradeId]];
       state.orders.push(order);
       if (ended) this.fillAtEnd(state, req.contractId, c, s, now, order.id);
-      else if (req.type === ORDER_TYPES.market) this.fillNowIfDue(state, req.contractId, c, s, next.index, now, order.id);
+      else if (arrives) this.fillArrival(state, req.contractId, c, s, at, now, order.id);
+      else if (req.type === ORDER_TYPES.market) this.fillNowIfDue(state, req.contractId, c, s, (next as { index: number }).index, now, order.id);
       return { orderId: order.id, ...OK };
     }, [req.contractId]);
   }
@@ -953,7 +1007,10 @@ export class ReplayExchange {
     });
   }
 
-  /** Close `size` contracts (all when null) of a position at market: the next bar's open plus slippage. */
+  /**
+   * Close `size` contracts (all when null) of a position at market, plus slippage: at once at the
+   * open of the bar containing the moment (marketFill "now"), else at the next bar's open.
+   */
   close(accountId: number, contractId: string, size: number | null): Outcome {
     return this.tx((state, now) => {
       if (accountId !== state.accountId) return refuse(1, `Account ${accountId} not found.`);
@@ -964,6 +1021,7 @@ export class ReplayExchange {
       const s = this.store.get(c.dataRoot);
       const ended = this.ended(now, s);
       const next = ended ? { index: -1 } : this.nextBar(s, now);
+      const at = ended ? -1 : this.arrivalBar(s, now);
       const closes = state.orders.filter((o) => o.contractId === contractId && o.status === STATUS.open && o.role === "close");
       const flat = closes.filter((o) => o.flatten).at(-1);
       // With a close_position waiting, what is left to close is what the client sent after it.
@@ -988,7 +1046,7 @@ export class ReplayExchange {
         if (waiting + size > Math.abs(ref)) return refuse(7, `Partial closes for ${waiting} are already waiting for the next bar; ${Math.abs(ref) - waiting} left to close.`);
       }
       // Refuse before touching anything: a refusal never drops the waiting close.
-      if ("reason" in next) return refuse(6, `Order rejected: ${next.reason}.`);
+      if ("reason" in next && at < 0) return refuse(6, `Order rejected: ${next.reason}.`);
       // close_position is "flat after everything sent before it": with a client market order sent
       // after the waiting close, the close moves to the end of the arrival order.
       if (flat && size === null) Object.assign(flat, { status: STATUS.cancelled, updatedAt: now.getTime() });
@@ -1020,7 +1078,8 @@ export class ReplayExchange {
         customTag: null,
       });
       if (ended) this.fillAtEnd(state, contractId, c, s, now, id);
-      else this.fillNowIfDue(state, contractId, c, s, next.index, now, id);
+      else if (at >= 0) this.fillArrival(state, contractId, c, s, at, now, id);
+      else this.fillNowIfDue(state, contractId, c, s, (next as { index: number }).index, now, id);
       return OK;
     }, [contractId]);
   }

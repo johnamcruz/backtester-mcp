@@ -19,6 +19,12 @@ export interface Config {
   slippageTicks: number;
   feesMicro: number;
   feesMini: number;
+  /**
+   * When market orders fill (BACKTESTER_MARKET_FILL): "now" (the default) at the replay moment they
+   * are placed, at the open of the one-minute bar containing it, as live; "next-bar" at the open of
+   * the next bar starting at or after it (the rule before this setting existed). Pinned per run.
+   */
+  marketFill: MarketFill;
   accountId: number;
   accountName: string;
   tradingEnabled: boolean;
@@ -31,6 +37,16 @@ export interface Config {
 }
 
 type Env = Record<string, string | undefined>;
+
+export const MARKET_FILLS = ["now", "next-bar"] as const;
+export type MarketFill = (typeof MARKET_FILLS)[number];
+
+function marketFill(env: Env): MarketFill {
+  const raw = env.BACKTESTER_MARKET_FILL?.trim().toLowerCase();
+  if (!raw) return "now";
+  if (!(MARKET_FILLS as readonly string[]).includes(raw)) throw new Error(`BACKTESTER_MARKET_FILL must be "now" or "next-bar", got "${env.BACKTESTER_MARKET_FILL}"`);
+  return raw as MarketFill;
+}
 
 function list(value: string | undefined): string[] {
   return (value ?? "")
@@ -105,6 +121,7 @@ export function loadConfig(env: Env = process.env): Config {
     slippageTicks: num(env, "BACKTESTER_SLIPPAGE_TICKS", 1),
     feesMicro: num(env, "BACKTESTER_FEES_MICRO", 0.37),
     feesMini: num(env, "BACKTESTER_FEES_MINI", 1.4),
+    marketFill: marketFill(env),
     accountId,
     accountName: env.BACKTESTER_ACCOUNT_NAME?.trim() || `BACKTEST-${runId}`,
     tradingEnabled: env.BACKTESTER_TRADING_ENABLED?.trim().toLowerCase() === "true",
@@ -140,5 +157,6 @@ export function publicConfig(c: Config) {
     startBalance: c.startBalance,
     slippageTicks: c.slippageTicks,
     feesPerSide: { micro: c.feesMicro, mini: c.feesMini },
+    marketFill: c.marketFill,
   };
 }

@@ -14,10 +14,16 @@ const swings = () => ({
 const net = async (call: any) =>
   (await call("list_open_positions", { accountId: 1 })).data.reduce((n: number, p: any) => n + (p.type === 1 ? 1 : -1) * p.size, 0);
 const orders = async (call: any) => (await call("search_orders", { accountId: 1, startTimestamp: iso(T0 - 864e5) })).data;
+/**
+ * Tests of market orders and closes waiting for the next bar run with the next-bar rule: by default
+ * (BACKTESTER_MARKET_FILL=now) a market order placed inside a bar fills at once, and waits only when
+ * no bar contains the moment. The waiting rules still apply there and in next-bar runs.
+ */
+const NEXT_BAR = { BACKTESTER_MARKET_FILL: "next-bar" } as const;
 
 describe("fill-time limits: the review's repros", () => {
   it("A: a waiting exit flattens first; the opposite stop fills, the limit past the max is rejected", async () => {
-    const { call, setNow } = await setup({ data: swings(), env: { BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2", BACKTESTER_MAX_DAILY_LOSS: "0" } });
+    const { call, setNow } = await setup({ data: swings(), env: { ...NEXT_BAR, BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2", BACKTESTER_MAX_DAILY_LOSS: "0" } });
     await call("place_order", { ...base, side: "buy", type: "market", size: 2 });
     setNow(T0 + 30000);
     for (const o of [
@@ -57,7 +63,7 @@ describe("fill-time limits: the review's repros", () => {
   });
 
   it("D: close_position waiting, then a buy: checked against the flat position the close leaves", async () => {
-    const { call, setNow } = await setup({ data: swings(), env: { BACKTESTER_MAX_POSITION_SIZE: "1", BACKTESTER_MAX_ORDER_SIZE: "2" } });
+    const { call, setNow } = await setup({ data: swings(), env: { ...NEXT_BAR, BACKTESTER_MAX_POSITION_SIZE: "1", BACKTESTER_MAX_ORDER_SIZE: "2" } });
     await call("place_order", { ...base, side: "sell", type: "market", size: 1 });
     setNow(T0 + 30000);
     expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true);
@@ -71,7 +77,7 @@ describe("fill-time limits: the review's repros", () => {
 
 describe("closes", () => {
   it("close_position is taken beside a waiting reversing market order, and still ends flat", async () => {
-    const { call, setNow } = await setup({ data: swings(), env: { BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2" } });
+    const { call, setNow } = await setup({ data: swings(), env: { ...NEXT_BAR, BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2" } });
     await call("place_order", { ...base, side: "sell", type: "market", size: 1 });
     setNow(T0 + 30000);
     expect((await call("place_order", { ...base, side: "buy", type: "market", size: 2 })).data.success).toBe(true);
@@ -85,7 +91,7 @@ describe("closes", () => {
 
   it("close_position flattens an add waiting with it, inside a bar and on a bar's open", async () => {
     for (const at of [T0 + 30000, T0]) {
-      const { call, setNow } = await setup({ data: swings(), env: { BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2" }, now: T0 - 2 * MIN });
+      const { call, setNow } = await setup({ data: swings(), env: { ...NEXT_BAR, BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2" }, now: T0 - 2 * MIN });
       await call("place_order", { ...base, side: "buy", type: "market", size: 1 }); // long 1 (the clock is on a bar's open)
       setNow(at);
       await call("place_order", { ...base, side: "buy", type: "market", size: 1 });
@@ -108,7 +114,7 @@ describe("closes", () => {
   });
 
   it("close_position is taken while a partial close waits, and a second one is the same request", async () => {
-    const { call, setNow } = await setup({ env: { BACKTESTER_MAX_POSITION_SIZE: "3", BACKTESTER_MAX_ORDER_SIZE: "3" } });
+    const { call, setNow } = await setup({ env: { ...NEXT_BAR, BACKTESTER_MAX_POSITION_SIZE: "3", BACKTESTER_MAX_ORDER_SIZE: "3" } });
     await call("place_order", { ...base, side: "buy", type: "market", size: 2 });
     setNow(T0 + 30000);
     expect((await call("partial_close_position", { accountId: 1, contractId: "BT.MNQ", size: 1 })).data.success).toBe(true);
@@ -144,7 +150,7 @@ describe("closes", () => {
 });
 
 describe("close_position means flat after everything sent before it", () => {
-  const env = { BACKTESTER_MAX_POSITION_SIZE: "3", BACKTESTER_MAX_ORDER_SIZE: "3" };
+  const env = { ...NEXT_BAR, BACKTESTER_MAX_POSITION_SIZE: "3", BACKTESTER_MAX_ORDER_SIZE: "3" };
   it.each([
     ["an add", "buy", 1],
     ["a reversal", "sell", 2],
@@ -174,7 +180,7 @@ describe("close_position means flat after everything sent before it", () => {
   });
 
   it("checks new orders against the flat the close leaves plus market orders sent after it", async () => {
-    const { call, setNow } = await setup({ data: swings(), env: { BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2" }, now: T0 - 2 * MIN });
+    const { call, setNow } = await setup({ data: swings(), env: { ...NEXT_BAR, BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2" }, now: T0 - 2 * MIN });
     await call("place_order", { ...base, side: "buy", type: "market", size: 1 }); // long 1
     setNow(T0 - 30000);
     await call("place_order", { ...base, side: "buy", type: "market", size: 1 }); // sent before the close: flattened
@@ -186,7 +192,7 @@ describe("close_position means flat after everything sent before it", () => {
   });
 
   it("a partial close while a close waits reduces what was sent after it", async () => {
-    const { call, setNow } = await setup({ data: swings(), env: { BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2" }, now: T0 - 2 * MIN });
+    const { call, setNow } = await setup({ data: swings(), env: { ...NEXT_BAR, BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2" }, now: T0 - 2 * MIN });
     await call("place_order", { ...base, side: "buy", type: "market", size: 1 }); // long 1
     setNow(T0 - 30000);
     expect((await call("partial_close_position", { accountId: 1, contractId: "BT.MNQ", size: 1 })).data.success).toBe(true);
@@ -202,7 +208,7 @@ describe("close_position means flat after everything sent before it", () => {
   });
 
   it("a repeated close moves after later market orders even when they net to zero (one may be rejected at fill)", async () => {
-    const { call, setNow } = await setup({ data: { NQ: flat(T0 - 30 * MIN, 60, 20000) }, env: { BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2", BACKTESTER_MAX_DAILY_LOSS: "1.5", BACKTESTER_FEES_MICRO: "0" }, now: T0 - 2 * MIN });
+    const { call, setNow } = await setup({ data: { NQ: flat(T0 - 30 * MIN, 60, 20000) }, env: { ...NEXT_BAR, BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2", BACKTESTER_MAX_DAILY_LOSS: "1.5", BACKTESTER_FEES_MICRO: "0" }, now: T0 - 2 * MIN });
     await call("place_order", { ...base, side: "buy", type: "market", size: 1 }); // long 1 at 20000.25
     setNow(T0 - 30000);
     expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true); // -$1.00 at T0
@@ -249,7 +255,7 @@ describe("close_position means flat after everything sent before it", () => {
   });
 
   it("a sell placed after a waiting close is an opening order (limits and the daily loss apply)", async () => {
-    const { call, setNow } = await setup({ data: swings(), env: { ...env, BACKTESTER_MAX_DAILY_LOSS: "1" } });
+    const { call, setNow } = await setup({ data: swings(), env: { ...env, BACKTESTER_MAX_DAILY_LOSS: "1" } }); // env is next-bar
     await call("place_order", { ...base, side: "buy", type: "market", size: 2 });
     await call("partial_close_position", { accountId: 1, contractId: "BT.MNQ", size: 1 }); // past the daily loss limit, long 1
     setNow(T0 + 30000);
@@ -301,7 +307,7 @@ describe("several contracts in one minute", () => {
       NQ: [...flat(T0 - 30 * MIN, 30, 20000), [T0, 20000, 20000, 20000, 20000] as Row, ...flat(T0 + MIN, 30, 19990)],
       ES: [...flat(T0 - 30 * MIN, 31, 5000), ...flat(T0 + MIN, 30, 5000)],
     };
-    const { call, setNow } = await setup({ data, env: { ...env, BACKTESTER_SLIPPAGE_TICKS: "1" } });
+    const { call, setNow } = await setup({ data, env: { ...env, ...NEXT_BAR, BACKTESTER_SLIPPAGE_TICKS: "1" } });
     await call("place_order", { ...base, contractId: "BT.MES", side: "buy", type: "market", size: 1 });
     await call("place_order", { ...base, contractId: "BT.MNQ", side: "buy", type: "market", size: 1 });
     setNow(T0 + 30000);
@@ -316,7 +322,7 @@ describe("several contracts in one minute", () => {
       NQ: [...flat(T0 - 30 * MIN, 30, 20000), [T0, 20000, 20000, 20000, 20000] as Row, ...flat(T0 + MIN, 30, 19990)],
       ES: [...flat(T0 - 30 * MIN, 31, 5000), ...flat(T0 + MIN, 30, 5000)],
     };
-    const { call, setNow } = await setup({ data, env: { BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2", BACKTESTER_MAX_DAILY_LOSS: "10", BACKTESTER_SLIPPAGE_TICKS: "1" } });
+    const { call, setNow } = await setup({ data, env: { ...NEXT_BAR, BACKTESTER_MAX_POSITION_SIZE: "2", BACKTESTER_MAX_ORDER_SIZE: "2", BACKTESTER_MAX_DAILY_LOSS: "10", BACKTESTER_SLIPPAGE_TICKS: "1" } });
     await call("place_order", { ...base, contractId: "BT.MNQ", side: "buy", type: "market", size: 1 });
     setNow(T0 + 30000);
     await call("place_order", { ...base, contractId: "BT.MES", side: "buy", type: "market", size: 1 });
@@ -326,7 +332,7 @@ describe("several contracts in one minute", () => {
   });
 
   it("fills every contract's orders in a minute, at its open and at its close", async () => {
-    const { call, setNow } = await setup({ data: two(), env: { ...env, BACKTESTER_MAX_DAILY_LOSS: "0" } });
+    const { call, setNow } = await setup({ data: two(), env: { ...env, ...NEXT_BAR, BACKTESTER_MAX_DAILY_LOSS: "0" } });
     setNow(T0 + 30000);
     await call("place_order", { ...base, contractId: "BT.MES", side: "sell", type: "market", size: 1 });
     await call("place_order", { ...base, contractId: "BT.MNQ", side: "buy", type: "market", size: 1 });
@@ -340,7 +346,7 @@ describe("several contracts in one minute", () => {
   });
 
   it("all opens of a minute come before any of its closes: a loss at the close doesn't stop an entry at the open", async () => {
-    const { call, setNow } = await setup({ data: two(), env });
+    const { call, setNow } = await setup({ data: two(), env: { ...env, ...NEXT_BAR } });
     await call("place_order", { ...base, contractId: "BT.MES", side: "buy", type: "market", size: 1, stopLossBracket: { ticks: 40, type: "stop" } });
     setNow(T0 + 30000);
     expect((await call("place_order", { ...base, contractId: "BT.MNQ", side: "buy", type: "market", size: 1 })).data.success).toBe(true);
