@@ -282,10 +282,13 @@ describe("round trips: fills on arrival (marketFill now)", () => {
   });
 
   it("a join filled on arrival exactly at a bar's open is at that open, not inside the bar before", () => {
-    const entry = order({ arrival: true, type: ORDER_TYPES.join_bid, placedAt: t(1), updatedAt: t(1) });
-    const r = roundTrips("BT.MNQ", [fill(1, entry, 0, 1, 100, t(1), null)], [entry], b(), MNQ, t(2));
-    // Bar 1 held whole from its open: high 105 (+20 ticks, $10), low 95 (-20 ticks, $10).
-    expect(r.open).toMatchObject({ mfeDollars: 10, maeDollars: -10, barsHeld: 1 });
+    // Long at t(1)'s open 100.25; a join_ask sell fills on arrival exactly at t(2), at 100.
+    const entry = order({ arrival: true, placedAt: t(1), updatedAt: t(1) });
+    const exit = order({ arrival: true, side: 1, type: ORDER_TYPES.join_ask, placedAt: t(2), updatedAt: t(2) });
+    const fills = [fill(1, entry, 0, 1, 100.25, t(1), null), fill(2, exit, 1, 1, 100, t(2), -0.5)];
+    const [trip] = roundTrips("BT.MNQ", fills, [entry, exit], b(), MNQ, t(4)).closed;
+    // Bar 1 held whole before the exit: high 105 (+19 ticks, $9.50), low 95 (-21 ticks, $10.50).
+    expect(trip).toMatchObject({ mfeDollars: 9.5, maeDollars: -10.5, barsHeld: 1, reason: "target" });
   });
 
   it("an add inside the bar in progress at the cutoff reads nothing of that bar but its open", () => {

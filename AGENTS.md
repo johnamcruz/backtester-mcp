@@ -62,7 +62,7 @@ This server is a **replay broker**. It answers with the same tools, inputs and r
 | Bars | `get_bars` returns closed bars oldest→newest; `t` is the bar's open time in UTC. Units: minute, hour, day, week (built from one-minute data). |
 | Fills | In `search_trades`, `profitAndLoss: null` (`halfTurn: true`) marks an opening fill. Realized P&L is on the closing fill. Fees are separate. |
 | errorCode 5 `OutsideTradingHours` | The market is closed at the replay time (daily break, weekend, holiday, or past the data). Wait for the clock. |
-| `before BACKTESTER_START` / `after BACKTESTER_END` | The clock is outside the replay window: orders that add risk are refused. Closes, cancels and exits still work; once no bar is left before the end they fill at the last close. |
+| `before BACKTESTER_START` / `after BACKTESTER_END` | The clock is outside the replay window: orders that add risk are refused. Closes, cancels and exits still work; once no bar is left before the end they fill at the last close (in the last whole minute before the end, market orders still fill at once as usual). |
 
 ### Trade metrics: grade whole trades
 
