@@ -856,7 +856,7 @@ export class ReplayExchange {
     if (this.config.end === null) return false;
     if (now.getTime() >= this.config.end) return true;
     const at = this.arrivalBar(s, now);
-    if (at >= 0 && s.t[at] + MINUTE <= this.config.end) return false;
+    if (at >= 0) return s.t[at] + MINUTE > this.config.end; // also with the clock exactly on that bar's open
     const i = s.lowerBound(now.getTime());
     return i >= s.length || s.t[i] > this.config.end;
   }

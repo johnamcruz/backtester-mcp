@@ -222,6 +222,8 @@ describe("market orders at the replay moment (BACKTESTER_MARKET_FILL=now, the de
     // END inside that minute cuts the bar short: no bar is left, as before (an entry would settle at a close from before it).
     const cut = await setup({ now: at, data, env: { BACKTESTER_END: "2024-03-05T21:59:40Z" } });
     expect(cut.exchange.place(req())).toMatchObject({ errorCode: 5, errorMessage: expect.stringMatching(/replay is over/) });
+    const onOpen = await setup({ now: Date.parse("2024-03-05T21:59:00Z"), data, env: { BACKTESTER_END: "2024-03-05T21:59:40Z" } });
+    expect(onOpen.exchange.place(req())).toMatchObject({ errorCode: 5, errorMessage: expect.stringMatching(/replay is over/) });
   });
 
   it("join_bid / join_ask fill on arrival only when marketable at the containing bar's open", async () => {
