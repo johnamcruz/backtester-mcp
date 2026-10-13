@@ -208,6 +208,8 @@ describe("minute records served (completeness and the replay clock)", () => {
     // A day without Globex hours (Saturday) isn't listed; nor is a day after the clock.
     expect(flowRecords(reader(), summaryOf(), NQ_SCHEDULE, "H24", Z("2024-03-09T15:00:00Z"), Z("2024-03-11T15:00:00Z"), Z("2024-03-12T00:00:00Z")).missingDays).toEqual(["2024-03-10", "2024-03-11"]);
     expect(flowRecords(reader(), summaryOf(), NQ_SCHEDULE, "H24", Z("2024-03-06T15:00:00Z"), Z("2024-03-06T15:10:00Z"), T).missingDays).toEqual([]);
+    // A closed holiday (Good Friday 2024-03-29: Globex hours on the calendar, none by the CME calendar) is not missing.
+    expect(flowRecords(reader(), summaryOf(), NQ_SCHEDULE, "M24", Z("2024-03-28T15:00:00Z"), Z("2024-03-29T15:00:00Z"), Z("2024-03-30T00:00:00Z")).missingDays).toEqual(["2024-03-28"]);
   });
 
   it("a minute with an unsided print is not complete", () => {
@@ -258,6 +260,10 @@ describe("flow build in the store", () => {
     const day8 = readDay(b.dataDir, "NQ", "2024-03-08") as DayFile;
     const f8 = readFlowDay(b.dataDir, "NQ", "2024-03-08");
     expect(flowCurrent(f8, day8, prev, NQ_SCHEDULE)).toBe(true);
+    // Other hours for the day (a calendar change): not current. A file without recorded hours had globexRanges'.
+    expect(flowCurrent(f8, { ...day8, sessions: [] }, prev, NQ_SCHEDULE)).toBe(false);
+    expect(flowCurrent({ ...f8!, sessions: undefined }, day8, prev, NQ_SCHEDULE)).toBe(true);
+    expect(flowCurrent({ ...f8!, sessions: undefined }, { ...day8, sessions: [] }, prev, NQ_SCHEDULE)).toBe(false);
     // Change 03-07's end state: 03-08 (which continues its session) is no longer current.
     const changed = { ...prev, end: { ...prev.end, lastTrade: 1 } };
     writeFileSync(path, gzipSync(JSON.stringify(changed)));

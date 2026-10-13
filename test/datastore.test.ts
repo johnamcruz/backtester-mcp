@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { specOf } from "../src/client.js";
+import { specOf, storeRefusedMessage } from "../src/client.js";
 import { minuteBars, normalizeL1 } from "../src/events.js";
 import { ParquetFile } from "../src/parquet.js";
 import { symbolRoot } from "../src/risk.js";
@@ -35,6 +35,38 @@ const hourly = (date: string, hours: number[], price: number) => hours.flatMap((
 
 const bars = (call: (n: string, a: Record<string, unknown>) => Promise<{ data: any }>, contractId: string, extra: Record<string, unknown> = {}) =>
   call("get_bars", { contractId, unit: "minute", unitNumber: 1, limit: 100, ...extra }).then((r) => r.data);
+
+describe("a store that exists but is refused", () => {
+  it("says so in under 200 characters, the fix first, a long reason cut", () => {
+    const long = storeRefusedMessage(`months ${Array.from({ length: 55 }, (_, i) => String(202105 + i)).join(", ")} weren't assigned`);
+    expect(long.length).toBeLessThan(200);
+    expect(long).toMatch(/^Derived store refused: rebuild with npm run build-store/);
+    expect(long.endsWith("…")).toBe(true);
+    for (const reason of ["a build-store run is in progress or was interrupted", "built before day assignment (no assignment in manifest)"]) {
+      expect(storeRefusedMessage(reason).length).toBeLessThan(200);
+      expect(storeRefusedMessage(reason).endsWith(reason)).toBe(true);
+    }
+  });
+
+  it("fails a new run's calls with the reason and the rebuild command, and get_server_config shows it; never a silent CSV run", async () => {
+    const b = await builtStore();
+    writeData(b.dataDir, { NQ: flat(Z("2024-03-12T14:00:00Z"), 60, 20280) });
+    const p = join(b.dataDir, "derived", "NQ", "manifest.json");
+    const m = JSON.parse(readFileSync(p, "utf8"));
+    writeFileSync(p, JSON.stringify({ ...m, assignment: { ...m.assignment, quarantineHash: "0".repeat(64) } }));
+    const { call } = await setup({ dir: b.dir, now: Z("2024-03-12T14:35:00Z") });
+    const r = await call("get_bars", { contractId: "BT.MNQ", unit: "minute", unitNumber: 1, limit: 5 });
+    expect(r.isError).toBe(true);
+    expect(r.text).toBe(storeRefusedMessage("built with another quarantine table"));
+    expect(r.text).toMatch(/^Derived store refused: rebuild with npm run build-store .*Reason: built with another quarantine table$/);
+    expect(r.text.length).toBeLessThan(200);
+    const cfg = (await call("get_server_config", {})).data;
+    expect(cfg.dataStore).toEqual({ NQ: { usable: false, refused: "built with another quarantine table", fix: expect.stringMatching(/npm run build-store/) } });
+    // With the store off on purpose, the CSV series is served.
+    const off = await setup({ dir: b.dir, now: Z("2024-03-12T14:35:00Z"), env: { BACKTESTER_STORE: "off", BACKTESTER_RUN_ID: "csv" } });
+    expect((await off.call("get_bars", { contractId: "BT.MNQ", unit: "minute", unitNumber: 1, limit: 5 })).data.count).toBeGreaterThan(0);
+  });
+});
 
 describe("contracts from the derived store", () => {
   it("search, get and list give the front contract month at the clock, MNQ on NQ's data", async () => {
@@ -308,6 +340,16 @@ describe("the run's data source is pinned", () => {
     writeFileSync(p, JSON.stringify(state));
     const on = await setup({ dir: w.dir });
     expect((await on.call("search_contracts", { searchText: "MNQ" })).data.map((c: any) => c.id)).toEqual(["BT.MNQ"]);
+    // A refused store (built before day assignment) doesn't stop it either: it keeps the CSV it is on.
+    writeFileSync(p, JSON.stringify(state));
+    const mp = join(w.dataDir, "derived", "NQ", "manifest.json");
+    const m = JSON.parse(readFileSync(mp, "utf8"));
+    delete m.assignment;
+    writeFileSync(mp, JSON.stringify(m));
+    const refused = await setup({ dir: w.dir });
+    const r = await refused.call("search_contracts", { searchText: "MNQ" });
+    expect(r.isError).toBe(false);
+    expect(r.data.map((c: any) => c.id)).toEqual(["BT.MNQ"]);
   });
 });
 

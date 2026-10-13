@@ -58,6 +58,20 @@ export class ParquetFile {
   }
 
   /**
+   * The smallest and largest `ts` of row group `group`, UTC ms, from the file's
+   * column statistics (no rows read); null when the file has none for it.
+   * Statistics give milliseconds (a Date: the µs floored) or µs (a bigint: floored here too).
+   */
+  tsRange(group: number): { min: number; max: number } | null {
+    const col = this.metadata.row_groups[group]?.columns.find((c) => c.meta_data?.path_in_schema.join(".") === "ts");
+    const s = col?.meta_data?.statistics;
+    const ms = (v: unknown) => (v instanceof Date ? v.getTime() : typeof v === "bigint" ? Math.floor(Number(v) / 1000) : NaN);
+    const min = ms(s?.min_value ?? s?.min);
+    const max = ms(s?.max_value ?? s?.max);
+    return Number.isFinite(min) && Number.isFinite(max) ? { min, max } : null;
+  }
+
+  /**
    * Rows [from, to) of row group `group` (relative to the group), the named
    * columns as Float64Array. INT64 timestamps (µs since the epoch) stay exact:
    * they are below 2^53.

@@ -28,6 +28,18 @@ describe("derived store reader", () => {
     expect(s.manifest("NQ")).toBe(s.manifest("NQ"));
   });
 
+  it("doesn't use a store whose months weren't all assigned by the current day assignment and quarantine", async () => {
+    const { dataDir } = await builtStore();
+    const m = readManifest(dataDir, "NQ")!;
+    writeFileSync(manifestPath(dataDir, "NQ"), JSON.stringify({ ...m, assignment: { ...m.assignment, unchecked: ["202403"] } }));
+    expect(new DerivedStore(dataDir).manifest("NQ")).toBeNull();
+    expect(new DerivedStore(dataDir).refusal("NQ")).toBe("months 202403 not assigned by the current day assignment");
+    const { assignment: _a, ...old } = m;
+    writeFileSync(manifestPath(dataDir, "NQ"), JSON.stringify(old));
+    expect(new DerivedStore(dataDir).manifest("NQ")).toBeNull();
+    expect(new DerivedStore(dataDir).refusal("NQ")).toBe("built before day assignment (no assignment in manifest)");
+  });
+
   it("serves a contract's own raw bars, oldest first, cached", async () => {
     const { dataDir } = await builtStore();
     const s = new DerivedStore(dataDir);
@@ -113,6 +125,24 @@ describe("derived store reader", () => {
     expect(rowAt(index, 4 * MIN, 12)).toBe(12);
   });
 
+  it("refuses a store built with another quarantine table, an old store format, or an unreadable manifest, saying why", async () => {
+    const { dataDir } = await builtStore();
+    const p = manifestPath(dataDir, "NQ");
+    const m = JSON.parse(readFileSync(p, "utf8"));
+    expect(new DerivedStore(dataDir).refusal("NQ")).toBeNull();
+    writeFileSync(p, JSON.stringify({ ...m, assignment: { ...m.assignment, quarantineHash: "0".repeat(64) } }));
+    const s = new DerivedStore(dataDir);
+    expect(s.manifest("NQ")).toBeNull();
+    expect(s.manifestHash("NQ")).toBeNull();
+    expect(s.refusal("NQ")).toBe("built with another quarantine table");
+    writeFileSync(p, JSON.stringify({ ...m, format: 1 }));
+    expect(new DerivedStore(dataDir).refusal("NQ")).toBe("store format 1, not 2");
+    writeFileSync(p, "{");
+    expect(new DerivedStore(dataDir).refusal("NQ")).toBe("manifest unreadable");
+    rmSync(p);
+    expect(new DerivedStore(dataDir).refusal("NQ")).toBeNull(); // no store at all
+  });
+
   it("doesn't use a store built with another roll table, and has no store outside the table", async () => {
     const { dataDir } = await builtStore();
     const p = manifestPath(dataDir, "NQ");
@@ -122,6 +152,7 @@ describe("derived store reader", () => {
     const s = new DerivedStore(dataDir);
     expect(s.manifest("NQ")).toBeNull();
     expect(s.manifestHash("NQ")).toBeNull();
+    expect(s.refusal("NQ")).toBe("built with another roll table");
     expect(s.switchesBetween("NQ", 0, Date.now())).toEqual([]);
     const early = await builtStore({ "2021-03-05": { l1: [[Z("2021-03-05T15:00:00Z"), 2, 13000, 1]] } }, ["202103", "202103"]);
     expect(new DerivedStore(early.dataDir).covers("NQ", Z("2021-03-05T15:00:00Z"))).toBe(false);

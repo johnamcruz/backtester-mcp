@@ -34,6 +34,22 @@ describe("parquet", () => {
     await expect(f.read(0, ["nope"])).rejects.toThrow(/no column nope/);
   });
 
+  it("gives a row group's ts range from the statistics (µs floored to ms), or null without them", async () => {
+    const file = join(tmp(), "st.parquet");
+    writeL1(file, [[[T + 0.9, 2, 1, 1], [T + 5000.4, 2, 1, 1]]]);
+    const f = await ParquetFile.open(file);
+    expect(f.tsRange(0)).toEqual({ min: T, max: T + 5000 });
+    expect(f.tsRange(1)).toBeNull();
+    // Statistics given as µs (a bigint) are floored too; none at all: null.
+    const stats = f.metadata.row_groups[0].columns[0].meta_data!.statistics!;
+    stats.min_value = BigInt(T * 1000 + 999);
+    stats.max_value = BigInt(T * 1000 + 5000999);
+    expect(f.tsRange(0)).toEqual({ min: T, max: T + 5000 });
+    stats.min_value = undefined;
+    stats.min = undefined;
+    expect(f.tsRange(0)).toBeNull();
+  });
+
   it("reads snappy files too, and explains a Node without zstd", async () => {
     const file = join(tmp(), "s.parquet");
     writeL1(file, [[[T, 2, 1, 1]]], "SNAPPY");

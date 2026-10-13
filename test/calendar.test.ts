@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { CME_HOLIDAYS } from "../src/holidays-cme.js";
 import {
   addDays,
   etDate,
@@ -7,8 +8,11 @@ import {
   etToUtc,
   frontMonth,
   frontPeriod,
+  expectedRanges,
+  goodFriday,
   globexRanges,
   isFullHoliday,
+  sessionsOf,
   monthCode,
   parseMonthCode,
   expiryMoment,
@@ -102,13 +106,93 @@ describe("quarterly contracts", () => {
     ]);
   });
 
-  it("knows the full-closure holidays (New Year, Good Friday, Christmas) only", () => {
+  it("knows the full-closure holidays: the reviewed CME calendar's closed trade dates, else New Year, Good Friday, Christmas", () => {
     expect(isFullHoliday("2024-03-29")).toBe(true);
-    expect(isFullHoliday("2021-04-02")).toBe(true);
+    // Good Friday 2021 and 2023 traded until 09:15 ET (the reviewed CME calendar): not full closures.
+    expect(isFullHoliday("2021-04-02")).toBe(false);
+    expect(isFullHoliday("2023-04-07")).toBe(false);
+    expect(isFullHoliday("2022-04-15")).toBe(true);
+    // Observed holidays: Christmas 2021 on Friday 12-24, Christmas 2022 and New Year 2023 on Monday.
+    expect(isFullHoliday("2021-12-24")).toBe(true);
+    expect(isFullHoliday("2022-12-26")).toBe(true);
+    expect(isFullHoliday("2023-01-02")).toBe(true);
+    // Outside the calendar's years: the rule.
+    expect(isFullHoliday("2026-12-25")).toBe(true);
+    expect(isFullHoliday("2020-04-10")).toBe(true);
+    expect(isFullHoliday("2020-04-09")).toBe(false);
     expect(isFullHoliday("2025-04-18")).toBe(true);
     expect(isFullHoliday("2024-12-25")).toBe(true);
     expect(isFullHoliday("2025-01-01")).toBe(true);
     expect(isFullHoliday("2024-07-04")).toBe(false);
     expect(isFullHoliday("2024-03-28")).toBe(false);
+  });
+});
+
+describe("CME holiday calendar", () => {
+  const Z = (s: string) => Date.parse(s);
+
+  it("is a reviewed table: sorted weekday trade dates, each once, closed or an HH:MM close, with a note", () => {
+    const dates = CME_HOLIDAYS.map((h) => h.date);
+    expect(dates).toEqual([...new Set(dates)].sort());
+    for (const h of CME_HOLIDAYS) {
+      expect(weekday(h.date) % 6, h.date).not.toBe(0);
+      expect(h.close).toMatch(/^(closed|\d\d:\d\d)$/);
+      expect(h.note.length).toBeGreaterThan(5);
+    }
+  });
+
+  it("closes only on New Year's Day, Good Friday or Christmas (or the weekday they are observed on)", () => {
+    for (const h of CME_HOLIDAYS.filter((x) => x.close === "closed")) {
+      const y = Number(h.date.slice(0, 4));
+      const md = h.date.slice(5);
+      const wd = weekday(h.date);
+      const ok =
+        md === "01-01" ||
+        md === "12-25" ||
+        (md === "01-02" && wd === 1) || // New Year's Day on a Sunday
+        (md === "12-26" && wd === 1) || // Christmas on a Sunday
+        (md === "12-24" && wd === 5) || // Christmas on a Saturday
+        h.date === goodFriday(y);
+      expect(ok, h.date).toBe(true);
+    }
+    expect(goodFriday(2024)).toBe("2024-03-29");
+    expect(goodFriday(2025)).toBe("2025-04-18");
+  });
+
+  it("keeps no rows of a closed trade date: neither the evening before it nor the day itself until 18:00 ET", () => {
+    // Christmas 2022 observed Monday 12-26: no Sunday session, Monday from 18:00 ET (23:00Z) only.
+    expect(sessionsOf("2022-12-25")).toEqual([]);
+    expect(sessionsOf("2022-12-26")).toEqual([[Z("2022-12-26T23:00:00Z"), Z("2022-12-27T05:00:00Z")]]);
+    // Christmas 2024 on Wednesday: Tuesday keeps its morning, not its evening (which is the 25th's).
+    expect(sessionsOf("2024-12-24")).toEqual([[Z("2024-12-24T05:00:00Z"), Z("2024-12-24T22:00:00Z")]]);
+    // Good Friday 2024: Thursday has no evening, Friday nothing.
+    expect(sessionsOf("2024-03-28")).toEqual([[Z("2024-03-28T04:00:00Z"), Z("2024-03-28T21:00:00Z")]]);
+    expect(sessionsOf("2024-03-29")).toEqual([]);
+    // An ordinary day: the Globex hours.
+    expect(sessionsOf("2024-03-12")).toEqual(globexRanges("2024-03-12"));
+  });
+
+  it("expects the hours to an early close, and the 16:15-16:30 ET halt before trade date 2021-06-28", () => {
+    // Christmas Eve 2024: 13:15 ET (18:15Z) close; no evening session (Christmas is closed).
+    expect(expectedRanges("2024-12-24")).toEqual([[Z("2024-12-24T05:00:00Z"), Z("2024-12-24T18:15:00Z")]]);
+    // Labor Day 2025: 13:00 ET (17:00Z), then the next trade date from 18:00 ET.
+    expect(expectedRanges("2025-09-01")).toEqual([
+      [Z("2025-09-01T04:00:00Z"), Z("2025-09-01T17:00:00Z")],
+      [Z("2025-09-01T22:00:00Z"), Z("2025-09-02T04:00:00Z")],
+    ]);
+    // Good Friday 2023: 09:15 ET.
+    expect(expectedRanges("2023-04-07")).toEqual([[Z("2023-04-07T04:00:00Z"), Z("2023-04-07T13:15:00Z")]]);
+    // Before 2021-06-28 the daily 16:15-16:30 ET halt; from then on none.
+    expect(expectedRanges("2021-06-25")).toEqual([
+      [Z("2021-06-25T04:00:00Z"), Z("2021-06-25T20:15:00Z")],
+      [Z("2021-06-25T20:30:00Z"), Z("2021-06-25T21:00:00Z")],
+    ]);
+    // A holiday closing before the halt: the halt doesn't apply.
+    expect(expectedRanges("2021-05-31")).toEqual([
+      [Z("2021-05-31T04:00:00Z"), Z("2021-05-31T17:00:00Z")],
+      [Z("2021-05-31T22:00:00Z"), Z("2021-06-01T04:00:00Z")],
+    ]);
+    expect(expectedRanges("2021-06-28")).toEqual(globexRanges("2021-06-28"));
+    expect(expectedRanges("2024-03-09")).toEqual([]);
   });
 });

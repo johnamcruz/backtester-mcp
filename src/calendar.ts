@@ -1,3 +1,5 @@
+import { CME_CALENDAR_YEARS, CME_HOLIDAYS, MAINTENANCE_HALT_UNTIL } from "./holidays-cme.js";
+
 /**
  * US/Eastern calendar math for the local order-book data, pure: ET days, the
  * CME Globex session of an ET day, and the quarterly front-contract rule the
@@ -66,7 +68,8 @@ export function addDays(d: EtDate, n: number): EtDate {
  * The CME Globex hours of an ET date as UTC ms ranges: the session opens
  * 18:00 ET Sunday to Thursday and runs to 17:00 ET the next day, with a
  * 17:00-18:00 ET daily break and no trading from Friday 17:00 to Sunday 18:00.
- * Holiday schedules aren't modelled: the data simply has no trades then.
+ * Holidays aren't applied here: sessionsOf and expectedRanges apply the reviewed
+ * CME calendar (holidays-cme.ts).
  */
 export function globexRanges(d: EtDate): Array<[number, number]> {
   const [y, m, day] = parse(d);
@@ -191,12 +194,64 @@ function easter(year: number): EtDate {
   return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
 }
 
+const HOLIDAYS = new Map(CME_HOLIDAYS.map((h) => [h.date, h]));
+const inCalendar = (d: EtDate) => Number(d.slice(0, 4)) >= CME_CALENDAR_YEARS[0] && Number(d.slice(0, 4)) <= CME_CALENDAR_YEARS[1];
+
 /**
- * Weekdays CME equity index futures don't trade at all: New Year's Day,
- * Good Friday and Christmas Day. A missing data day on one of these is a
- * holiday, not a gap. Other holidays have shortened sessions with data.
+ * Weekdays CME equity index futures don't trade at all. Within the reviewed
+ * calendar's years (holidays-cme.ts) its closed trade dates; outside them, the
+ * rule: New Year's Day, Good Friday and Christmas Day. A missing data day on
+ * one of these is a holiday, not a gap. Other holidays have shortened sessions.
  */
+/** Good Friday of a year, as an ET date. */
+export const goodFriday = (year: number): EtDate => addDays(easter(year), -2);
+
 export function isFullHoliday(d: EtDate): boolean {
+  if (inCalendar(d)) return HOLIDAYS.get(d)?.close === "closed";
   const md = d.slice(5);
-  return md === "01-01" || md === "12-25" || d === addDays(easter(Number(d.slice(0, 4))), -2);
+  return md === "01-01" || md === "12-25" || d === goodFriday(Number(d.slice(0, 4)));
+}
+
+/**
+ * The trade date a Globex range of ET date `d` belongs to: the range from 00:00 ET
+ * belongs to `d`, the one from 18:00 ET to the next calendar day (Sunday's to Monday).
+ */
+function tradeDateOfRange(d: EtDate, from: number): EtDate {
+  return from === etDayBounds(d).start ? d : addDays(d, 1);
+}
+
+/**
+ * The hours of ET date `d` whose rows the store keeps: its Globex ranges
+ * (globexRanges) without those of a closed trade date (isFullHoliday), so stray
+ * prints on a closed holiday are dropped. Early closes are not cut here (their
+ * rows are kept as before); they shorten the expected hours only.
+ */
+export function sessionsOf(d: EtDate): Array<[number, number]> {
+  return globexRanges(d).filter(([a]) => !isFullHoliday(tradeDateOfRange(d, a)));
+}
+
+/**
+ * The minutes the market is expected to trade on ET date `d`, as UTC ms ranges:
+ * sessionsOf(d), each trade date ended at its early close (holidays-cme.ts),
+ * and before trade date 2021-06-28 without the 16:15-16:30 ET daily halt. What
+ * the manifest's minute gaps are measured against.
+ */
+export function expectedRanges(d: EtDate): Array<[number, number]> {
+  const [y, m, day] = parse(d);
+  const out: Array<[number, number]> = [];
+  for (const [a, b] of sessionsOf(d)) {
+    if (tradeDateOfRange(d, a) !== d) {
+      out.push([a, b]);
+      continue;
+    }
+    const close = HOLIDAYS.get(d)?.close;
+    const end = close && close !== "closed" ? Math.min(b, etToUtc(y, m, day, Number(close.slice(0, 2)), Number(close.slice(3)))) : b;
+    if (d < MAINTENANCE_HALT_UNTIL) {
+      const h1 = etToUtc(y, m, day, 16, 15);
+      const h2 = etToUtc(y, m, day, 16, 30);
+      if (a < Math.min(end, h1)) out.push([a, Math.min(end, h1)]);
+      if (h2 < end) out.push([h2, end]);
+    } else if (a < end) out.push([a, end]);
+  }
+  return out;
 }
