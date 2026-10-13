@@ -60,4 +60,40 @@ describe("config", () => {
     expect(loadConfig({ ...base, BACKTESTER_STORE: "OFF", BACKTESTER_ORDERBOOK_DIR: "/ob" })).toMatchObject({ useStore: false, orderbookDir: "/ob" });
     expect(() => loadConfig({ ...base, BACKTESTER_STORE: "maybe" })).toThrow(/BACKTESTER_STORE must be "on" or "off"/);
   });
+
+  it("get_bars' order-flow defaults: off with no windows unless BACKTESTER_BARS_ORDER_FLOW / BACKTESTER_BARS_FLOW_WINDOWS set them", () => {
+    expect(loadConfig(base)).toMatchObject({ barsOrderFlow: false, barsFlowWindows: [] });
+    expect(publicConfig(loadConfig(base)).flow).toEqual({ largePrint: 10, source: "history", barsOrderFlow: false, barsFlowWindows: [] });
+    expect(publicConfig(loadConfig(base))).not.toHaveProperty("barsOrderFlow");
+    const c = loadConfig({ ...base, BACKTESTER_BARS_ORDER_FLOW: " TRUE ", BACKTESTER_BARS_FLOW_WINDOWS: "5, 20,1,50" });
+    expect(c).toMatchObject({ barsOrderFlow: true, barsFlowWindows: [5, 20, 1, 50] });
+    expect(publicConfig(c).flow).toMatchObject({ barsOrderFlow: true, barsFlowWindows: [5, 20, 1, 50] });
+    expect(loadConfig({ ...base, BACKTESTER_BARS_ORDER_FLOW: "false" }).barsOrderFlow).toBe(false);
+    expect(() => loadConfig({ ...base, BACKTESTER_BARS_ORDER_FLOW: "yes" })).toThrow(/^BACKTESTER_BARS_ORDER_FLOW must be "true" or "false", got "yes"$/);
+    expect(() => loadConfig({ ...base, BACKTESTER_BARS_ORDER_FLOW: "1" })).toThrow(/^BACKTESTER_BARS_ORDER_FLOW must be "true" or "false", got "1"$/);
+    expect(loadConfig({ ...base, BACKTESTER_BARS_ORDER_FLOW: " False " }).barsOrderFlow).toBe(false);
+    expect(() => loadConfig({ ...base, BACKTESTER_BARS_ORDER_FLOW: " yes " })).toThrow(/^BACKTESTER_BARS_ORDER_FLOW must be "true" or "false", got "yes"$/);
+    expect(() => loadConfig({ ...base, BACKTESTER_BARS_ORDER_FLOW: " Maybe " })).toThrow(/^BACKTESTER_BARS_ORDER_FLOW must be "true" or "false", got "Maybe"$/);
+    expect(loadConfig({ ...base, BACKTESTER_BARS_ORDER_FLOW: "  " }).barsOrderFlow).toBe(false);
+  });
+
+  it("refuses BACKTESTER_BARS_FLOW_WINDOWS outside the shared rule: whole numbers 1-50, no duplicates, at most 5", () => {
+    const err = (v: string) => { try { loadConfig({ ...base, BACKTESTER_BARS_FLOW_WINDOWS: v }); } catch (e) { return (e as Error).message; } return "accepted"; };
+    const notWhole = (item: string) => `BACKTESTER_BARS_FLOW_WINDOWS windows must be whole numbers from 1 to 50, got "${item}"`;
+    for (const item of ["0x10", "1e1", "+5", "5.0", "-3", "five", "2.5"]) expect(err(item)).toBe(notWhole(item));
+    expect(err("5,,20")).toBe(notWhole(""));
+    expect(err("5,")).toBe(notWhole(""));
+    expect(err("0")).toBe(notWhole("0"));
+    expect(err("51")).toBe(notWhole("51"));
+    // In order: the digits check over every item comes before the range check, the range before duplicates, duplicates before the count.
+    expect(err("51,abc")).toBe(notWhole("abc"));
+    expect(err("5,5,51")).toBe(notWhole("51"));
+    expect(err("5,5")).toBe("BACKTESTER_BARS_FLOW_WINDOWS has a duplicate window 5");
+    expect(err("5, 05")).toBe("BACKTESTER_BARS_FLOW_WINDOWS has a duplicate window 5");
+    expect(err("1,2,3,4,5,6,6")).toBe("BACKTESTER_BARS_FLOW_WINDOWS has a duplicate window 6");
+    expect(err("1,2,3,4,5,6")).toBe("BACKTESTER_BARS_FLOW_WINDOWS allows at most 5 windows");
+    expect(loadConfig({ ...base, BACKTESTER_BARS_FLOW_WINDOWS: "1,2,3,4,5" }).barsFlowWindows).toEqual([1, 2, 3, 4, 5]);
+    expect(loadConfig({ ...base, BACKTESTER_BARS_FLOW_WINDOWS: " 5 , 20 " }).barsFlowWindows).toEqual([5, 20]);
+    expect(loadConfig({ ...base, BACKTESTER_BARS_FLOW_WINDOWS: "  " }).barsFlowWindows).toEqual([]);
+  });
 });

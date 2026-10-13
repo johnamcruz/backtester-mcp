@@ -40,6 +40,10 @@ export interface Config {
   journalPath: string;
   /** get_bars' large-print threshold in contracts (BACKTESTER_FLOW_LARGE_PRINT, as projectx-mcp's PROJECTX_FLOW_LARGE_PRINT; default 10). */
   flowLargePrint: number;
+  /** get_bars' includeOrderFlow when the call does not pass it (BACKTESTER_BARS_ORDER_FLOW, as projectx-mcp's PROJECTX_BARS_ORDER_FLOW; default false). */
+  barsOrderFlow: boolean;
+  /** get_bars' flowWindows when the call does not pass them (BACKTESTER_BARS_FLOW_WINDOWS, as projectx-mcp's PROJECTX_BARS_FLOW_WINDOWS; default none). */
+  barsFlowWindows: number[];
 }
 
 type Env = Record<string, string | undefined>;
@@ -59,6 +63,39 @@ function list(value: string | undefined): string[] {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+function bool(env: Env, key: string, fallback: boolean): boolean {
+  const raw = env[key]?.trim() ?? "";
+  const value = raw.toLowerCase();
+  if (!value) return fallback;
+  if (value === "true") return true;
+  if (value === "false") return false;
+  throw new Error(`${key} must be "true" or "false", got "${raw}"`);
+}
+
+/** get_bars' flowWindows limits: at most this many windows, each 1 to FLOW_WINDOW_MAX bars. */
+export const FLOW_WINDOWS_MAX = 5;
+export const FLOW_WINDOW_MAX = 50;
+
+/**
+ * The shared rule (identical in projectx-mcp): split on commas, trim each item, then in order: every item is
+ * digits only, every value is 1-50, no duplicates, at most 5 windows. An empty or unset value means none.
+ */
+function flowWindows(env: Env, key: string): number[] {
+  const raw = env[key]?.trim();
+  if (!raw) return [];
+  const items = raw.split(",").map((item) => item.trim());
+  const bad = (item: string) => new Error(`${key} windows must be whole numbers from 1 to ${FLOW_WINDOW_MAX}, got "${item}"`);
+  for (const item of items) if (!/^\d+$/.test(item)) throw bad(item);
+  const windows = items.map(Number);
+  windows.forEach((n, i) => {
+    if (n < 1 || n > FLOW_WINDOW_MAX) throw bad(items[i]!);
+  });
+  const dup = windows.find((n, i) => windows.indexOf(n) !== i);
+  if (dup !== undefined) throw new Error(`${key} has a duplicate window ${dup}`);
+  if (windows.length > FLOW_WINDOWS_MAX) throw new Error(`${key} allows at most ${FLOW_WINDOWS_MAX} windows`);
+  return windows;
 }
 
 function num(env: Env, key: string, fallback: number): number {
@@ -143,6 +180,8 @@ export function loadConfig(env: Env = process.env): Config {
     maxDailyLoss: num(env, "BACKTESTER_MAX_DAILY_LOSS", 500),
     journalPath: abs(expandHome(env.BACKTESTER_JOURNAL_PATH?.trim() || join(stateDir, "journal.jsonl"))),
     flowLargePrint: num(env, "BACKTESTER_FLOW_LARGE_PRINT", 10),
+    barsOrderFlow: bool(env, "BACKTESTER_BARS_ORDER_FLOW", false),
+    barsFlowWindows: flowWindows(env, "BACKTESTER_BARS_FLOW_WINDOWS"),
   };
 }
 
@@ -171,6 +210,6 @@ export function publicConfig(c: Config) {
     feesPerSide: { micro: c.feesMicro, mini: c.feesMini },
     marketFill: c.marketFill,
     store: c.useStore ? "on" : "off",
-    flow: { largePrint: c.flowLargePrint, source: "history" as const },
+    flow: { largePrint: c.flowLargePrint, source: "history" as const, barsOrderFlow: c.barsOrderFlow, barsFlowWindows: c.barsFlowWindows },
   };
 }

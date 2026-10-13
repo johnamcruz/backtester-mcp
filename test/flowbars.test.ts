@@ -73,7 +73,7 @@ describe("get_bars order flow", () => {
     const r = (await call("get_bars", { contractId: "BT.MNQ.H24", ...minuteBars() })).data;
     expect(r.orderFlow.largePrint).toBe(1);
     expect([r.bars[0].flow.largeBuy, r.bars[0].flow.largeSell]).toEqual([2, 1]);
-    expect((await call("get_server_config", {})).data.flow).toEqual({ largePrint: 1, source: "history" });
+    expect((await call("get_server_config", {})).data.flow).toEqual({ largePrint: 1, source: "history", barsOrderFlow: false, barsFlowWindows: [] });
   });
 
   it("contracts without order-flow history get empty flow and a note: the CSV series, MES (no ES data)", async () => {
@@ -100,6 +100,44 @@ describe("get_bars order flow", () => {
     const { call } = await world("2024-03-07T14:35:00Z");
     const r = (await call("get_bars", { contractId: "BT.MNQ.H24", ...minuteBars({ endTime: "2024-03-07T10:00:00Z" }) })).data;
     expect(r).toMatchObject({ count: 0, bars: [], orderFlow: { note: "No bar has a usable time." } });
+  });
+
+  it("BACKTESTER_BARS_ORDER_FLOW and BACKTESTER_BARS_FLOW_WINDOWS are the defaults for calls that leave the arguments out", async () => {
+    const plainArgs = { contractId: "BT.MNQ.H24", unit: "minute", unitNumber: 1, limit: 10 };
+    const off = await world("2024-03-07T14:35:00Z", { BACKTESTER_BARS_FLOW_WINDOWS: "2" });
+    const plain = (await off.call("get_bars", plainArgs)).data;
+    expect(Object.keys(plain).sort()).toEqual(["barSize", "bars", "contractId", "count"]);
+    expect((await off.call("get_bars", { ...plainArgs, includeOrderFlow: true })).data.orderFlow.windows).toEqual([2]);
+    expect((await off.call("get_bars", { ...plainArgs, includeOrderFlow: true, flowWindows: [3] })).data.orderFlow.windows).toEqual([3]);
+    expect((await off.call("get_bars", { ...plainArgs, includeOrderFlow: true, flowWindows: [] })).data.orderFlow.windows).toEqual([]);
+
+    const on = await world("2024-03-07T14:35:00Z", { BACKTESTER_BARS_ORDER_FLOW: "true" });
+    const byDefault = (await on.call("get_bars", plainArgs)).data;
+    expect(byDefault.bars[0].flow).toMatchObject({ bv: 2, sv: 1, delta: 1, complete: true });
+    expect(byDefault.orderFlow.windows).toEqual([]);
+    expect(byDefault).toEqual((await off.call("get_bars", { ...plainArgs, includeOrderFlow: true, flowWindows: [] })).data);
+    expect((await on.call("get_bars", { ...plainArgs, includeOrderFlow: false })).data).toEqual(plain);
+
+    const both = await world("2024-03-07T14:35:00Z", { BACKTESTER_BARS_ORDER_FLOW: "true", BACKTESTER_BARS_FLOW_WINDOWS: "3,2" });
+    const r = (await both.call("get_bars", plainArgs)).data;
+    expect(r.orderFlow.windows).toEqual([2, 3]);
+    expect(r.bars[1].flow.windows).toEqual({ "2": { ofiTrade: 0.5, delta: 2 }, "3": { ofiTrade: null, delta: null } });
+    expect((await both.call("get_bars", { ...plainArgs, flowWindows: [2] })).data.orderFlow.windows).toEqual([2]);
+    expect((await both.call("get_server_config", {})).data.flow).toEqual({ largePrint: 10, source: "history", barsOrderFlow: true, barsFlowWindows: [3, 2] });
+  });
+
+  it("get_bars' descriptions are static: tools/list is the same with the env on and off, and never shows env values", async () => {
+    const tools = async (env: Record<string, string>) => (await (await world("2024-03-07T14:35:00Z", env)).client.listTools()).tools;
+    const off = await tools({});
+    const on = await tools({ BACKTESTER_BARS_ORDER_FLOW: "true", BACKTESTER_BARS_FLOW_WINDOWS: "5,20" });
+    expect(on).toEqual(off);
+    const bars = off.find((t) => t.name === "get_bars")!;
+    expect(bars.description).toContain("includeOrderFlow=true (default: this server's configuration, see get_server_config flow.barsOrderFlow) adds `flow`");
+    const props = bars.inputSchema.properties as Record<string, { description?: string; default?: unknown }>;
+    expect(props.includeOrderFlow!.description).toContain("Default: the server's BACKTESTER_BARS_ORDER_FLOW (false unless set)");
+    expect(props.flowWindows!.description).toContain("Default: the server's BACKTESTER_BARS_FLOW_WINDOWS (none unless set)");
+    expect(props.includeOrderFlow!.default).toBeUndefined();
+    expect(props.flowWindows!.default).toBeUndefined();
   });
 
   it("refuses more than 5 windows or a window outside 1-50, as projectx-mcp", async () => {
