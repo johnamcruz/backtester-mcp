@@ -53,9 +53,14 @@ describe("tool registry", () => {
     expect(bars.properties.unit).toMatchObject({ default: "minute", enum: ["second", "minute", "hour", "day", "week", "month"] });
     expect(bars.properties.unitNumber.default).toBe(5);
     expect(bars.properties.limit.default).toBe(100);
-    // Order flow: off by default, at most 5 windows of 1-50 bars (projectx-mcp's limits).
-    expect(bars.properties.includeOrderFlow.default).toBe(false);
-    expect(bars.properties.flowWindows).toMatchObject({ default: [], maxItems: 5, items: { minimum: 1, maximum: 50 } });
+    // Order flow: optional, so an omitted argument takes the server's configured default (BACKTESTER_BARS_ORDER_FLOW /
+    // BACKTESTER_BARS_FLOW_WINDOWS, off and none unless set); at most 5 windows of 1-50 bars (projectx-mcp's limits).
+    expect(bars.properties.includeOrderFlow).toMatchObject({ type: "boolean" });
+    expect(bars.properties.includeOrderFlow).not.toHaveProperty("default");
+    expect(bars.properties.flowWindows).toMatchObject({ maxItems: 5, items: { minimum: 1, maximum: 50 } });
+    expect(bars.properties.flowWindows).not.toHaveProperty("default");
+    expect((bars as { required?: string[] }).required ?? []).not.toContain("includeOrderFlow");
+    expect((bars as { required?: string[] }).required ?? []).not.toContain("flowWindows");
   });
 
   it("serves the guide resource and the session prompt", async () => {

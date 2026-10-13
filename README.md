@@ -128,6 +128,8 @@ Every option is in [.env.example](.env.example). Settings come from the environm
 | `BACKTESTER_DATA_DIR` | required | Folder of `<ROOT>_1min.csv` files, and of the derived store `derived/` (`npm run build-store`) |
 | `BACKTESTER_STORE` | `on` | `off` serves only the CSV series, even where the derived store covers the clock |
 | `BACKTESTER_FLOW_LARGE_PRINT` | `10` | `get_bars` order flow: prints of at least this many contracts count in `largeBuy` / `largeSell` (projectx-mcp's `PROJECTX_FLOW_LARGE_PRINT`) |
+| `BACKTESTER_BARS_ORDER_FLOW` | `false` | `true` makes `get_bars` add order flow when a call leaves `includeOrderFlow` out; an explicit `includeOrderFlow` (even `false`) wins (projectx-mcp's `PROJECTX_BARS_ORDER_FLOW`) |
+| `BACKTESTER_BARS_FLOW_WINDOWS` | none | Comma-separated window sizes (at most 5, each a whole number 1-50 written in digits only, no duplicates, e.g. `5,20`) `get_bars` uses when a call leaves `flowWindows` out; explicit `flowWindows` win; anything else is a config error at startup (projectx-mcp's `PROJECTX_BARS_FLOW_WINDOWS`) |
 | `BACKTESTER_ORDERBOOK_DIR` | the store's source | The order-book parquet folder (`l1/`, `l2/`): `build-store`'s source, and where events are read from |
 | `BACKTESTER_CLOCK_FILE` | | Replay clock file, `{ "now": "<ISO>" }`, re-read on every call |
 | `BACKTESTER_NOW` | | Fixed replay time when there is no clock file (one of the two is required) |
@@ -231,7 +233,7 @@ The fill engine (`src/fills.ts`) is ported from the harness's simulated broker, 
 
 ## Order flow (`get_bars` `includeOrderFlow`)
 
-`get_bars` takes projectx-mcp's two order-flow inputs: `includeOrderFlow` (default `false`: without it the result is unchanged) and `flowWindows` (at most 5 sizes, each 1-50 bars). The result has projectx-mcp's shape: a `flow` object on every bar and an `orderFlow` object beside `bars`. The fields are those of projectx-mcp's live field contract (its `docs/ORDER-FLOW-DESIGN.md`), ported function by function from its `src/orderflow.ts` and `src/flowtools.ts` into `src/orderflow.ts` and `src/flowtools.ts` here:
+`get_bars` takes projectx-mcp's two order-flow inputs: `includeOrderFlow` (default: the server's `BACKTESTER_BARS_ORDER_FLOW`, false unless set; without flow the result is unchanged) and `flowWindows` (at most 5 sizes, each 1-50 bars). As in projectx-mcp, a call that leaves either out gets the server's configured default instead: `BACKTESTER_BARS_ORDER_FLOW` (`true` turns flow on) and `BACKTESTER_BARS_FLOW_WINDOWS` (e.g. `5,20`), so a client can call `get_bars` the same way for every broker and let each server's configuration decide. Explicit arguments always win, `includeOrderFlow: false` included; `get_server_config` reports both settings (`flow.barsOrderFlow`, `flow.barsFlowWindows`). The result has projectx-mcp's shape: a `flow` object on every bar and an `orderFlow` object beside `bars`. The fields are those of projectx-mcp's live field contract (its `docs/ORDER-FLOW-DESIGN.md`), ported function by function from its `src/orderflow.ts` and `src/flowtools.ts` into `src/orderflow.ts` and `src/flowtools.ts` here:
 
 | `flow` field | Meaning |
 |---|---|
