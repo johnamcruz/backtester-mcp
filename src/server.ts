@@ -85,7 +85,7 @@ function outcome(res: Outcome, names: Record<number, string>) {
 }
 
 const accountId = z.number().int().describe("Trading account ID from list_accounts.");
-const contractId = z.string().min(1).describe('Contract ID, e.g. "BT.MNQ". Get it from search_contracts.');
+const contractId = z.string().min(1).describe('Contract ID, e.g. "BT.MNQ.M24" or "BT.MNQ". Get it from search_contracts.');
 const isoTime = z.string().datetime({ offset: true });
 const bracket = z
   .object({
@@ -100,7 +100,6 @@ const bracket = z
 export function createServer(deps: Deps): McpServer {
   const { config, client, journal } = deps;
   const server = new McpServer({ name: "backtester-mcp", version: "0.1.0" }, { instructions: INSTRUCTIONS });
-
   // Local data and a simulated account: nothing reaches the outside world.
   const read = { readOnlyHint: true, openWorldHint: false } as const;
   const write = { readOnlyHint: false, destructiveHint: true, openWorldHint: false } as const;
@@ -164,6 +163,21 @@ export function createServer(deps: Deps): McpServer {
     () => undefined,
     () => undefined,
   );
+
+  // The data leaving a contract settles what was open on it, as close_position flattens: journaled
+  // like a close_position (kind "exit", its flatten result), tagged roll_settlement. Appended in
+  // order; journal_read waits for them.
+  let journaling: Promise<unknown> = Promise.resolve();
+  client.onRollSettlement = (e) => {
+    const what = [
+      e.closed ? `closed ${e.closed.size} at ${e.closed.price} (order ${e.closed.orderId})` : null,
+      e.cancelled.length ? `cancelled orders ${e.cancelled.join(", ")}` : null,
+    ].filter(Boolean);
+    const text = `Roll settlement: the replay data left ${e.contractId} at ${e.at}; ${what.join("; ")}.`;
+    journaling = journaling.then(() =>
+      record({ kind: "exit", text, accountId: e.accountId, contractId: e.contractId, tags: ["roll_settlement"], data: { ...e.result, rollSettlement: true, at: e.at } }),
+    );
+  };
 
   type OrderType = (typeof PLACEABLE_ORDER_TYPES)[number];
   interface PlaceArgs {
@@ -286,6 +300,7 @@ export function createServer(deps: Deps): McpServer {
         ...pub,
         clock: { ...pub.clock, now: now.toISOString() },
         data: client.dataRanges(),
+        dataStore: client.storeInfo(),
         tradingDayStartedAt: tradingDayStart(now).toISOString(),
         serverTime: now.toISOString(),
       };
@@ -712,7 +727,10 @@ export function createServer(deps: Deps): McpServer {
       },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    handler(async (q: { kind?: (typeof JOURNAL_KINDS)[number]; tag?: string; contractId?: string; since?: string; limit: number }) => journal.read(q)),
+    handler(async (q: { kind?: (typeof JOURNAL_KINDS)[number]; tag?: string; contractId?: string; since?: string; limit: number }) => {
+      await journaling;
+      return journal.read(q);
+    }),
   );
 
   // ── Guide resource & session prompt ─────────────────────────────────

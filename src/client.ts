@@ -1,6 +1,7 @@
 import { closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { aggregate, BarStore, MINUTE, type AggUnit, type BarSeries, type OutBar } from "./bars.js";
+import { etDate, parseMonthCode } from "./calendar.js";
 import { readNow } from "./clock.js";
 import type { Config, MarketFill } from "./config.js";
 import { ORDER_TYPES } from "./enums.js";
@@ -33,6 +34,8 @@ import { roundTrips, type FillInfo, type RoundTrip } from "./metrics.js";
 import type { Trade } from "./performance.js";
 import type { FlattenResult } from "./protect.js";
 import { RiskError, realizedNet, tradingDayStart } from "./risk.js";
+import { scheduleOf } from "./rolltable.js";
+import { DerivedStore } from "./store.js";
 
 /**
  * The replay exchange: this server's stand-in for the broker API that
@@ -73,6 +76,11 @@ export interface ContractSpec {
   micro: boolean;
   description: string;
   roll: RollRule;
+  /**
+   * A contract month ("M24") of the derived store's raw bars (BT.MNQ.M24); absent for the
+   * continuous back-adjusted CSV series (BT.MNQ).
+   */
+  expiry?: string;
 }
 
 const spec = (root: string, dataRoot: string, tickSize: number, tickValue: number, description: string, roll: RollRule): ContractSpec => ({
@@ -142,10 +150,20 @@ export function frontMonthName(spec: ContractSpec, now: Date): string {
 
 export const contractIdOf = (root: string) => `BT.${root}`;
 
+/** BT.MNQ (continuous CSV series) or BT.MNQ.M24 (one contract month of the derived store). */
 export function specOf(contractId: string): ContractSpec | null {
-  const m = /^BT\.([A-Z0-9]+)$/.exec(contractId);
-  return m ? (CONTRACTS[m[1]] ?? null) : null;
+  const m = /^BT\.([A-Z0-9]+)(?:\.([A-Z]\d\d))?$/.exec(contractId);
+  const base = m ? CONTRACTS[m[1]] : undefined;
+  if (!m || !base) return null;
+  if (m[2] === undefined) return base;
+  // Only the store's quarterly contracts have month ids.
+  return base.roll === "quarterly" && parseMonthCode(m[2]) ? { ...base, expiry: m[2] } : null;
 }
+
+export const expiryIdOf = (root: string, code: string) => `BT.${root}.${code}`;
+
+const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const monthLabel = (code: string) => `${MONTH_NAMES[MONTH_CODES.indexOf(code[0])]} 20${code.slice(1)}`;
 
 // ── State ────────────────────────────────────────────────────────────
 
@@ -158,6 +176,8 @@ interface StoredOrder extends SimOrder {
   cancelSeq?: number;
   /** Filled at the last close after BACKTESTER_END (a round trip's exit reason "end"). */
   endOfWindow?: boolean;
+  /** A close the server made when the data left this contract (roll settlement), or an order it cancelled then. */
+  rollSettlement?: boolean;
   /** Filled on arrival at the replay moment it was placed (marketFill "now"), stamped at that moment. */
   arrival?: boolean;
 }
@@ -190,7 +210,36 @@ interface RunSettings {
   feesMini: number;
   /** Missing in runs created before it was pinned: those filled market orders at the next bar ("next-bar"). */
   marketFill: MarketFill;
+  /** The data source the run started on, pinned at its first call (runs created before it: the CSV series). */
+  data?: DataPin;
 }
+
+/**
+ * A run's data source: the derived store (for NQ/MNQ, the exact manifest and roll table it was
+ * built with, and the months it covers) or the CSV series only. Pinned when the run starts; a run
+ * never switches source.
+ */
+export interface DataPin {
+  useStore: boolean;
+  manifestHash: string | null;
+  months: string[];
+  rollTableHash: string | null;
+}
+
+/** What the server did when the data left a contract: what it cancelled and at what price it closed the position. */
+export interface RollSettlement {
+  accountId: number;
+  contractId: string;
+  at: string;
+  closed: { size: number; side: Side; price: number; orderId: number } | null;
+  cancelled: number[];
+  /** The settlement as close_position's flatten result (always flat). */
+  result: FlattenResult;
+}
+
+const CSV_PIN: DataPin = { useStore: false, manifestHash: null, months: [], rollTableHash: null };
+/** The roots whose data the derived store holds. */
+const STORE_ROOT = "NQ";
 
 export interface PlaceRequest {
   accountId: number;
@@ -246,12 +295,24 @@ const LOCK_STALE_MS = 30000;
 
 export interface ExchangeOptions {
   store?: BarStore;
+  /** The derived store (raw contract-month bars from local order-book data); null turns it off. */
+  derived?: DerivedStore | null;
   /** The replay time; defaults to the configured clock (file, else BACKTESTER_NOW). */
   now?: () => Date;
 }
 
 export class ReplayExchange {
   readonly store: BarStore;
+  readonly derived: DerivedStore | null;
+  /** The derived store when the current call's run is pinned to it, else null (set per transaction). */
+  private run: DerivedStore | null = null;
+  /**
+   * Set per transaction: the clock is past the store data the run is pinned to (a month it wasn't
+   * built for, or outside the roll table). Store contracts then behave as after BACKTESTER_END.
+   */
+  private beyondStore: string | null = null;
+  /** Called after a transaction for each roll settlement it made (the server journals them). */
+  onRollSettlement: ((e: RollSettlement) => void) | null = null;
   private readonly clock: () => Date;
 
   constructor(
@@ -259,6 +320,7 @@ export class ReplayExchange {
     opts: ExchangeOptions = {},
   ) {
     this.store = opts.store ?? new BarStore(config.dataDir);
+    this.derived = opts.derived !== undefined ? opts.derived : config.useStore ? new DerivedStore(config.dataDir, config.orderbookDir) : null;
     this.clock = opts.now ?? (() => readNow(config));
   }
 
@@ -270,6 +332,27 @@ export class ReplayExchange {
   /** Time the run can see: the clock, capped at BACKTESTER_END. */
   private cutoff(now: Date): number {
     return this.config.end !== null ? Math.min(now.getTime(), this.config.end) : now.getTime();
+  }
+
+  /** Whether a contract has bars: its contract month in the derived store, or its root's CSV. */
+  private hasData(c: ContractSpec): boolean {
+    return c.expiry ? !!this.run?.has(c.dataRoot, c.expiry) : this.store.has(c.dataRoot);
+  }
+
+  /** A contract's one-minute bars (call after hasData). */
+  private data(c: ContractSpec): BarSeries {
+    return c.expiry ? (this.run as DerivedStore).bars(c.dataRoot, c.expiry) : this.store.get(c.dataRoot);
+  }
+
+  /** Whether the store's data is on another contract than this contract month at `now` (no bars for it then). */
+  private awayFrom(c: ContractSpec, now: Date): boolean {
+    const sch = c.expiry && this.run ? scheduleOf(c.dataRoot) : null;
+    return !!sch && sch.dataContractAt(this.cutoff(now)) !== c.expiry;
+  }
+
+  /** Where a contract's bars come from, for messages. */
+  private dataName(c: ContractSpec): string {
+    return c.expiry ? `${c.dataRoot} ${c.expiry} in the derived store (build-store)` : `${c.dataRoot}_1min.csv`;
   }
 
   private spec(c: ContractSpec): FillSpec {
@@ -365,10 +448,50 @@ export class ReplayExchange {
    * market orders at the next bar's open, so it keeps "next-bar": a process configured for "now" is
    * refused rather than silently changing how the run fills.
    */
-  private checkSettings(state: State): void {
+  private checkSettings(state: State, now: Date): void {
+    const pinned = state.settings?.data;
+    this.beyondStore = null;
+    this.checkRunSettings(state);
+    this.run = this.checkPin(state, pinned, now);
+  }
+
+  /**
+   * The run's data source. Pinned at the run's first call: the derived store when this process has
+   * one that covers the clock, else the CSV series; a run created before pinning keeps the CSV. Every
+   * later call must see the same store (manifest and roll table), with the clock in its months.
+   */
+  private checkPin(state: State, pinned: DataPin | undefined, now: Date): DerivedStore | null {
+    const settings = state.settings as RunSettings;
+    const fresh = state.syncedTo === null && !state.orders.length && !state.trades.length;
+    const at = this.cutoff(now);
+    if (!pinned) {
+      const m = this.derived?.manifest(STORE_ROOT) ?? null;
+      settings.data =
+        fresh && m && this.derived?.covers(STORE_ROOT, at)
+          ? { useStore: true, manifestHash: this.derived.manifestHash(STORE_ROOT), months: [...m.months], rollTableHash: m.rollTable.hash }
+          : { ...CSV_PIN };
+      pinned = settings.data;
+    }
+    if (!pinned.useStore) return null;
+    const run = this.config.runId;
+    if (!this.derived) throw new ReplayError(`Run ${run} started on the derived store, and this process has it off (BACKTESTER_STORE=off). Use the run's settings, or a new BACKTESTER_RUN_ID.`);
+    if (this.derived.manifestHash(STORE_ROOT) !== pinned.manifestHash) {
+      throw new ReplayError(`The derived store changed (or is gone) since run ${run} started on it; a run never switches data. Start a new run (a new BACKTESTER_RUN_ID).`);
+    }
+    const month = etDate(at).slice(0, 7).replace("-", "");
+    if (!pinned.months.includes(month) || !scheduleOf(STORE_ROOT)?.covers(at)) {
+      // Past the run's data: as after BACKTESTER_END, reads work and only reducing orders are taken.
+      this.beyondStore =
+        `The replay clock ${new Date(at).toISOString()} is outside the derived store's months this run started on (${pinned.months[0]}..${pinned.months.at(-1)}), ` +
+        "and a run never switches data source: only market orders that reduce the position are taken, at the last close. Start a new run for this time.";
+    }
+    return this.derived;
+  }
+
+  private checkRunSettings(state: State): void {
     const mine = this.settings();
     state.settings = state.settings ? { ...state.settings, marketFill: state.settings.marketFill ?? "next-bar" } : { ...mine, marketFill: "next-bar" };
-    const diff = (Object.keys(mine) as Array<keyof RunSettings>).filter((k) => state.settings?.[k] !== mine[k]);
+    const diff = (Object.keys(mine) as Array<keyof RunSettings>).filter((k) => k !== "data" && state.settings?.[k] !== mine[k]);
     if (diff.length) {
       const hint = diff.includes("marketFill")
         ? ` To continue this run, set BACKTESTER_MARKET_FILL=${state.settings.marketFill} (runs created before market orders filled at the replay moment keep next-bar).`
@@ -386,10 +509,10 @@ export class ReplayExchange {
    * large CSV loading inside the lock can't make other processes judge it stale.
    */
   private preload(contractIds: string[]): void {
-    const roots = new Set<string>();
+    const specs = new Map<string, ContractSpec>();
     const add = (id: string) => {
       const c = specOf(id);
-      if (c) roots.add(c.dataRoot);
+      if (c) specs.set(c.expiry ? `${c.dataRoot}.${c.expiry}` : c.dataRoot, c);
     };
     contractIds.forEach(add);
     try {
@@ -398,7 +521,11 @@ export class ReplayExchange {
     } catch {
       /* no state yet, or mid-write: the locked read decides */
     }
-    for (const r of roots) if (this.store.has(r)) this.store.get(r);
+    for (const c of specs.values()) {
+      if (c.expiry) {
+        if (this.derived?.has(c.dataRoot, c.expiry)) this.derived.bars(c.dataRoot, c.expiry);
+      } else if (this.store.has(c.dataRoot)) this.store.get(c.dataRoot);
+    }
   }
 
   private tx<T>(fn: (state: State, now: Date) => T, contractIds: string[] = []): T {
@@ -408,10 +535,12 @@ export class ReplayExchange {
       // Read the clock under the lock: another process may have synced to a newer clock while this one waited.
       const now = this.clock();
       const state = this.load();
-      this.checkSettings(state);
-      this.sync(state, now);
+      this.checkSettings(state, now);
+      const settled: RollSettlement[] = [];
+      this.sync(state, now, settled);
       const out = fn(state, now);
       this.save(state);
+      for (const e of settled) this.onRollSettlement?.(e);
       return out;
     } finally {
       unlock();
@@ -488,7 +617,7 @@ export class ReplayExchange {
    * order: a bar's open fills waiting market orders, its close (once closed)
    * settles resting orders against its range. Nothing after BACKTESTER_END.
    */
-  private sync(state: State, now: Date): void {
+  private sync(state: State, now: Date, settled: RollSettlement[] = []): void {
     const cutoff = this.cutoff(now);
     if (state.syncedTo === null) {
       state.syncedTo = cutoff;
@@ -500,14 +629,98 @@ export class ReplayExchange {
           "Start a new run (a new BACKTESTER_RUN_ID or BACKTESTER_STATE_DIR) to replay again.",
       );
     }
-    const from = state.syncedTo;
+    // The data leaving a contract settles what is open on it at that moment (roll settlement):
+    // bars are processed up to each such moment, then the settlement, then on.
+    let from = state.syncedTo;
+    for (const e of this.settlementsDue(state, from, cutoff)) {
+      this.syncBars(state, from, e.at);
+      const r = this.settleRoll(state, e.contractId, e.at);
+      if (r) settled.push(r);
+      from = e.at;
+    }
+    this.syncBars(state, from, cutoff);
+    state.syncedTo = cutoff;
+  }
+
+  /** Contracts with a position or working orders whose data ends in (from, to], with that moment. */
+  private settlementsDue(state: State, from: number, to: number): Array<{ at: number; contractId: string }> {
+    if (!this.run) return [];
+    const open = new Set([
+      ...Object.entries(state.positions)
+        .filter(([, p]) => p.net !== 0)
+        .map(([id]) => id),
+      ...state.orders.filter((o) => o.status === STATUS.open).map((o) => o.contractId),
+    ]);
+    const out: Array<{ at: number; contractId: string }> = [];
+    for (const sw of this.run.switchesBetween(STORE_ROOT, from, to)) {
+      for (const id of [...open].sort()) {
+        const c = specOf(id);
+        if (c?.expiry === sw.off && c.dataRoot === STORE_ROOT) out.push({ at: sw.at, contractId: id });
+      }
+    }
+    return out.sort((a, b) => a.at - b.at);
+  }
+
+  /**
+   * The data leaves `contractId` at `at` (a roll, or a stretch the data spends on another contract):
+   * with no more bars to fill on, its working orders are cancelled and its position is closed at
+   * its last bar's close, without slippage, as fillAtEnd settles after the window. Live, the old
+   * month would trade on until it expires; the local data holds the front month only.
+   */
+  private settleRoll(state: State, contractId: string, at: number): RollSettlement | null {
+    const c = specOf(contractId) as ContractSpec;
+    const net = state.positions[contractId]?.net ?? 0;
+    const s = this.data(c);
+    const n = s.closedCount(at);
+    let closed: RollSettlement["closed"] = null;
+    // Every order working now, before the close: legs the close cancels (OCO) are reported too.
+    const working = state.orders.filter((o) => o.contractId === contractId && o.status === STATUS.open).map((o) => o.id);
+    // As close_position flattens: first the position, at market (here its last close), then, the
+    // contract flat, every order still working on it.
+    if (net !== 0 && n > 0) {
+      const price = onTick(s.c[n - 1], c.tickSize);
+      const side: Side = net > 0 ? 1 : 0;
+      const id = state.nextOrderId++;
+      state.orders.push({
+        id, accountId: state.accountId, contractId, side, type: ORDER_TYPES.market, size: Math.abs(net), limitPrice: null, stopPrice: null,
+        trailDistance: null, status: STATUS.open, placedAt: at, activeFrom: at, updatedAt: at, role: "close", flatten: true, parentId: null,
+        stopLossBracket: null, takeProfitBracket: null, fillVolume: 0, filledPrice: null, customTag: null, endOfWindow: true, rollSettlement: true,
+      });
+      const book = this.book(state, contractId);
+      const o = book.orders.find((x) => x.id === id) as SimOrder;
+      fillOrder(book, o, price, at, this.spec(c), this.ids(state), this.hooks(state, contractId));
+      this.adopt(state, book, contractId);
+      for (const t of state.trades) if (t.orderId === id) (t as Trade & { rollSettlement?: boolean }).rollSettlement = true;
+      closed = { size: Math.abs(net), side, price, orderId: id };
+    }
+    for (const o of state.orders) {
+      if (o.contractId !== contractId || o.status !== STATUS.open) continue;
+      Object.assign(o, { status: STATUS.cancelled, updatedAt: at, cancelSeq: state.nextTradeId });
+    }
+    const cancelled = working.filter((id) => state.orders.find((o) => o.id === id)?.status === STATUS.cancelled);
+    for (const id of cancelled) (state.orders.find((o) => o.id === id) as StoredOrder).rollSettlement = true;
+    if (!closed && !cancelled.length) return null;
+    const result: FlattenResult = {
+      status: "flat",
+      close: closed ? { success: true, errorCode: 0, errorMessage: null } : { success: false, errorCode: 2, errorMessage: `No open position in ${contractId}.` },
+      positionNet: 0,
+      positionSize: 0,
+      cancelledOrderIds: cancelled,
+      failedCancelOrderIds: [],
+      remainingOrderIds: [],
+    };
+    return { accountId: state.accountId, contractId, at: iso(at), closed, cancelled, result };
+  }
+
+  /** Process the bar events in (from, cutoff]: opens of bars after `from`, closes of bars closed by `cutoff`. */
+  private syncBars(state: State, from: number, cutoff: number): void {
     const contracts = [...new Set(state.orders.filter((o) => o.status === STATUS.open).map((o) => o.contractId))].sort();
     // One cursor per contract; bars are processed in time order across contracts (opens of a
     // minute, then its closes), so the account-wide daily loss sees fills as they happen.
     const curs = contracts.flatMap((contractId) => {
       const c = specOf(contractId);
-      if (!c || !this.store.has(c.dataRoot)) return [];
-      const s = this.store.get(c.dataRoot);
+      if (!c || !this.hasData(c)) return [];
+      const s = this.data(c);
       return [{ contractId, s, fs: this.spec(c), book: this.book(state, contractId), i: s.lowerBound(from - MINUTE + 1) }];
     });
     const ids = this.ids(state);
@@ -531,7 +744,6 @@ export class ReplayExchange {
       for (const k of group) k.i++;
     }
     for (const k of curs) this.adopt(state, k.book, k.contractId);
-    state.syncedTo = cutoff;
   }
 
   // ── Account ──────────────────────────────────────────────────────
@@ -562,7 +774,7 @@ export class ReplayExchange {
     for (const contractId of [...new Set(state.trades.map((t) => t.contractId))].sort()) {
       const c = specOf(contractId);
       if (!c) continue;
-      const bars = this.store.has(c.dataRoot) ? this.store.get(c.dataRoot) : null;
+      const bars = this.hasData(c) ? this.data(c) : null;
       const r = roundTrips(
         contractId,
         state.trades.filter((t) => t.contractId === contractId),
@@ -625,6 +837,8 @@ export class ReplayExchange {
       rejectReason: o.rejectReason ?? null,
       // Extra field (allowed by the interface): bracket legs and closes only ever reduce the position.
       reduceOnly: o.role !== "order",
+      // Extra field: cancelled, or a close made, by the server when the data left the contract.
+      ...(o.rollSettlement ? { rollSettlement: true } : {}),
     };
   }
 
@@ -687,6 +901,17 @@ export class ReplayExchange {
   // ── Contracts and market data ───────────────────────────────────
 
   private contractView(c: ContractSpec, now: Date) {
+    if (c.expiry) {
+      return {
+        id: expiryIdOf(c.root, c.expiry),
+        name: `${c.root}${c.expiry}`,
+        description: `${c.description} ${monthLabel(c.expiry)} (replay of raw ${c.dataRoot} trades, local order-book data)`,
+        tickSize: c.tickSize,
+        tickValue: c.tickValue,
+        activeContract: this.run?.frontAt(c.dataRoot, this.cutoff(now)) === c.expiry,
+        symbolId: `F.US.${c.root}`,
+      };
+    }
     return {
       id: contractIdOf(c.root),
       name: frontMonthName(c, now),
@@ -698,14 +923,23 @@ export class ReplayExchange {
     };
   }
 
-  private available(): ContractSpec[] {
-    return Object.values(CONTRACTS).filter((c) => this.store.has(c.dataRoot));
+  /**
+   * The contracts a search sees at `now`, one per root. Where the derived store covers `now` (an
+   * ET day of a month it was built for), the root's front contract month from it (BT.MNQ.M24:
+   * raw prices, rolls on their dates); elsewhere the root's continuous CSV series (BT.MNQ).
+   */
+  private available(now: Date): ContractSpec[] {
+    return Object.values(CONTRACTS).flatMap((c) => {
+      const front = this.run?.frontAt(c.dataRoot, this.cutoff(now)) ?? null;
+      if (front !== null) return this.run?.has(c.dataRoot, front) ? [{ ...c, expiry: front }] : [];
+      return this.store.has(c.dataRoot) ? [c] : [];
+    });
   }
 
   searchContracts(searchText: string) {
     return this.tx((_state, now) => {
       const q = searchText.trim().toUpperCase();
-      const all = this.available();
+      const all = this.available(now);
       const exact = all.filter((c) => c.root === q);
       const rest = all.filter((c) => c.root !== q && (c.root.includes(q) || c.description.toUpperCase().includes(q)));
       return [...exact, ...rest].slice(0, 20).map((c) => this.contractView(c, now));
@@ -713,31 +947,54 @@ export class ReplayExchange {
   }
 
   contract(contractId: string) {
-    return this.tx((_state, now) => {
-      const c = specOf(contractId);
-      if (!c || !this.store.has(c.dataRoot)) throw new ReplayError(`Contract ${contractId} not found (ids look like BT.MNQ; use search_contracts).`);
-      return this.contractView(c, now);
-    });
+    return this.tx((_state, now) => this.contractView(this.known(contractId), now));
   }
 
   allContracts() {
-    return this.tx((_state, now) => this.available().map((c) => this.contractView(c, now)));
+    return this.tx((_state, now) => this.available(now).map((c) => this.contractView(c, now)));
   }
 
-  /** Per contract with data: its file and first/last bar (read cheaply from the file's head and tail). */
+  /** Per contract with a CSV: its file and first/last bar (read cheaply from the file's head and tail). */
   dataRanges() {
     const out: Record<string, { file: string; first: string; last: string } | null> = {};
-    for (const c of this.available()) {
+    for (const c of Object.values(CONTRACTS).filter((x) => this.store.has(x.dataRoot))) {
       const r = this.store.range(c.dataRoot);
       out[c.root] = r ? { file: `${c.dataRoot}_1min.csv`, ...r } : null;
     }
     return out;
   }
 
-  private series(contractId: string): { c: ContractSpec; s: BarSeries } {
+  /**
+   * The run's data source as the model may see it: nothing about the store's contents after the
+   * replay clock (no last bars, counts, gaps or later contracts).
+   */
+  storeInfo() {
+    return this.tx((_state, now) => {
+      const out: Record<string, unknown> = {};
+      const run = this.run;
+      if (!run) return out;
+      const cutoff = this.cutoff(now);
+      const m = run.manifest(STORE_ROOT) as NonNullable<ReturnType<DerivedStore["manifest"]>>;
+      out[STORE_ROOT] = {
+        months: `${m.months[0]}..${m.months[m.months.length - 1]}`,
+        activeContract: run.frontAt(STORE_ROOT, cutoff),
+        contracts: Object.fromEntries(Object.entries(m.contracts).filter(([, e]) => Date.parse(e.first) < cutoff).map(([code, e]) => [code, { first: e.first }])),
+        servedFor: Object.values(CONTRACTS).filter((c) => c.dataRoot === STORE_ROOT).map((c) => c.root),
+      };
+      return out;
+    });
+  }
+
+  /** A contract id with bars, or "not found". */
+  private known(contractId: string): ContractSpec {
     const c = specOf(contractId);
-    if (!c || !this.store.has(c.dataRoot)) throw new ReplayError(`Contract ${contractId} not found (ids look like BT.MNQ; use search_contracts).`);
-    return { c, s: this.store.get(c.dataRoot) };
+    if (!c || !this.hasData(c)) throw new ReplayError(`Contract ${contractId} not found (ids look like BT.MNQ or BT.MNQ.M24; use search_contracts).`);
+    return c;
+  }
+
+  private series(contractId: string): { c: ContractSpec; s: BarSeries } {
+    const c = this.known(contractId);
+    return { c, s: this.data(c) };
   }
 
   bars(req: BarsRequest): OutBar[] {
@@ -898,17 +1155,36 @@ export class ReplayExchange {
       if (req.accountId !== state.accountId) return no(1, `Account ${req.accountId} not found.`);
       const c = specOf(req.contractId);
       if (!c) return no(8, `Contract ${req.contractId} not found.`);
-      if (!this.store.has(c.dataRoot)) return no(9, `No data for ${c.root} (${c.dataRoot}_1min.csv) in BACKTESTER_DATA_DIR.`);
-      const s = this.store.get(c.dataRoot);
-      const ended = this.ended(now, s);
+      if (!this.hasData(c)) return no(9, `No data for ${c.root} (${this.dataName(c)}) in BACKTESTER_DATA_DIR.`);
+      const s = this.data(c);
+      const beyond = c.expiry ? this.beyondStore : null;
+      const ended = beyond !== null || this.ended(now, s);
+      const net = state.positions[req.contractId]?.net ?? 0;
+      const reduces = net !== 0 && Math.sign(net) !== sideSign(req.side) && req.size <= Math.abs(net);
+      // The data is away from this contract month now: the new front between its 18:00 ET start and
+      // the data's 00:00 ET switch, or a stretch the data spends on another contract and comes back from.
+      const away = !ended && this.awayFrom(c, now);
       if (ended) {
-        // After BACKTESTER_END only a market order that reduces the position is taken: it fills at the last close.
-        const net = state.positions[req.contractId]?.net ?? 0;
-        const reduces = req.type === ORDER_TYPES.market && net !== 0 && Math.sign(net) !== sideSign(req.side) && req.size <= Math.abs(net);
-        if (!reduces) return no(5, "The replay is over (no bar left before BACKTESTER_END): only market orders that reduce the position are taken, at the last close.");
+        // After BACKTESTER_END (or past the run's store data) only a market order that reduces the position is taken: it fills at the last close.
+        if (!(reduces && req.type === ORDER_TYPES.market)) {
+          return no(5, beyond ?? "The replay is over (no bar left before BACKTESTER_END): only market orders that reduce the position are taken, at the last close.");
+        }
+      } else if (away && !reduces) {
+        const rolls = scheduleOf(c.dataRoot)?.table.rolls ?? [];
+        const off = rolls.find((r) => r.from === c.expiry && r.at <= now.toISOString());
+        if (off) return no(5, `${c.root}${c.expiry} rolled off at ${off.at}; trade the front month.`);
+        return no(
+          5,
+          (rolls.find((r) => r.to === c.expiry)?.at ?? "") > now.toISOString()
+            ? `No bars yet on ${c.root}${c.expiry}: the replay data rolls to it at 00:00 ET. Orders that open a position on it are refused until then.`
+            : `The replay data is away from ${c.root}${c.expiry} now (no bars until it comes back): only orders that reduce the position are taken; a market order fills at the last close.`,
+        );
       }
-      const next = ended ? { index: -1 } : this.nextBar(s, now);
-      const at = ended ? -1 : this.arrivalBar(s, now);
+      // Away: a reducing market order fills at the last close (as after the window); other reducing orders rest.
+      const atClose = ended || (away && req.type === ORDER_TYPES.market);
+      const rests = away && !atClose;
+      const next = atClose || rests ? { index: -1 } : this.nextBar(s, now);
+      const at = atClose || rests ? -1 : this.arrivalBar(s, now);
       // With a bar containing the moment the market trades now: market orders fill at once there.
       // Other orders rest for the next bar, so they still need one in this trading day.
       if ("reason" in next && at < 0) return no(5, `Outside trading hours: ${next.reason}.`);
@@ -966,8 +1242,10 @@ export class ReplayExchange {
       order.customTag ??= this.freeTag(state, order.id);
       if (stopPrice !== null) order.stopAt = [[t, stopPrice, state.nextTradeId]];
       state.orders.push(order);
-      if (ended) this.fillAtEnd(state, req.contractId, c, s, now, order.id);
-      else if (arrives) this.fillArrival(state, req.contractId, c, s, at, now, order.id);
+      if (atClose) this.fillAtEnd(state, req.contractId, c, s, now, order.id);
+      else if (rests) {
+        /* rests until the data is back on the contract */
+      } else if (arrives) this.fillArrival(state, req.contractId, c, s, at, now, order.id);
       else if (req.type === ORDER_TYPES.market) this.fillNowIfDue(state, req.contractId, c, s, (next as { index: number }).index, now, order.id);
       return { orderId: order.id, customTag: order.customTag, ...OK };
     }, [req.contractId]);
@@ -1011,7 +1289,7 @@ export class ReplayExchange {
       if (req.limitPrice !== null) patch.limitPrice = req.limitPrice;
       if (req.stopPrice !== null) patch.stopPrice = req.stopPrice;
       if (req.trailPrice !== null) {
-        const last = this.lastClose(this.store.get(c.dataRoot), now);
+        const last = this.lastClose(this.data(c), now);
         if (last === null) return refuse(3, "No price yet to trail from.");
         patch.stopPrice = req.trailPrice;
         patch.trailDistance = Math.round(Math.abs(last - req.trailPrice) * 1e9) / 1e9;
@@ -1091,10 +1369,11 @@ export class ReplayExchange {
     if (accountId !== state.accountId) return refuse(1, `Account ${accountId} not found.`);
     const c = specOf(contractId);
     if (!c) return refuse(3, `Contract ${contractId} not found.`);
-    if (!this.store.has(c.dataRoot)) return refuse(4, `No data for ${c.root}.`);
+    if (!this.hasData(c)) return refuse(4, `No data for ${c.root}.`);
     const held = state.positions[contractId]?.net ?? 0;
-    const s = this.store.get(c.dataRoot);
-    const ended = this.ended(now, s);
+    const s = this.data(c);
+    // Past the store's data, or with the data away from this month: a close fills at the last close.
+    const ended = (c.expiry ? this.beyondStore !== null || this.awayFrom(c, now) : false) || this.ended(now, s);
     const next = ended ? { index: -1 } : this.nextBar(s, now);
     const at = ended ? -1 : this.arrivalBar(s, now);
     const closes = state.orders.filter((o) => o.contractId === contractId && o.status === STATUS.open && o.role === "close");

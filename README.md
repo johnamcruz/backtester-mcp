@@ -22,7 +22,7 @@ These are the same 20 tools as projectx-mcp, with the same input fields, default
 
 ## Setup
 
-Requires Node.js 20.12 or later.
+Requires Node.js 20.12 or later (22.15 or later to build the [derived store](#local-order-book-data-the-derived-store-nq-and-mnq) or read its events: zstd).
 
 ```bash
 git clone https://github.com/johnamcruz/backtester-mcp && cd backtester-mcp
@@ -63,13 +63,69 @@ datetime,open,high,low,close,volume
 
 Contracts are listed only when their file exists. Ids are `BT.<ROOT>` (one continuous series per root); `name` is the front-month ticker at the replay time (`MNQH24`), which is what the harness's contract translator reads.
 
+### Local order-book data: the derived store (NQ and MNQ)
+
+For NQ there is a second source, closer to live: the raw NQ L1/L2 order-book data (monthly parquet, `l1/YYYYMM.parquet` and `l2/YYYYMM.parquet`, zstd, one row group per US/Eastern day; read only, never copied into the repo). A one-time build turns it into a compact store under `BACKTESTER_DATA_DIR/derived/`, and the server then answers NQ and MNQ the way projectx-mcp answers live TopstepX data: one contract per expiry, raw front-contract prices, rolls on their dates, no back-adjustment.
+
+```bash
+# Node 22.15+ (zstd). Reads the parquet one ET day at a time; about 37 s and 0.8 MB of store per month.
+BACKTESTER_DATA_DIR=/path/to/data BACKTESTER_ORDERBOOK_DIR=/path/to/nq_l2_parquet \
+  npm run build-store -- --from 202105 --to 202511
+```
+
+- **Idempotent and resumable.** Months in order, one ET day at a time. A day whose file already matches its source (file, size, modification time, row group, rows) and the quote state carried into it is skipped, so a stopped build continues where it was and a rerun changes nothing; a truncated day file is rebuilt. One build at a time per store (`derived/NQ/build.lock`). Progress goes to stderr. Options: `--source` / `--data-dir` (instead of the env vars).
+- **Bars.** One-minute bars from the L1 trades only: UTC minute open, half-open minutes, OHLC from trade prices in the data's order, volume = the sum of trade sizes. A minute without trades has no bar, as in live `get_bars`. Rows outside the CME Globex hours of their ET day (the 17:00-18:00 ET break, Friday 17:00 to Sunday 18:00, and rows a day's row group holds past its own ET day) are dropped.
+- **Contracts: the roll table.** The data holds one contract at a time and no contract column. Which contract it is on comes **only** from a reviewed table, `src/rolltable-nq.ts` (below; also in the manifest as `rollTable`, with its hash): no heuristic at runtime, no look-ahead, and never a contract past its expiry (third Friday 09:30 ET; what the data holds after that is not served). The table was derived per roll with `scripts/derive-roll-table.ts` (an unshipped dev tool, outside `src/` and the build; run it with `npx tsx` against a built store and the CSV): while the raw data is on contract X, the back-adjusted CSV's close minus the raw close is X's constant adjustment, whatever day the CSV itself rolled, so a step in that offset is a raw switch and its level names the contract. Every switch is at 00:00 ET (the vendor's day-file boundary). The rule by era (`calendar.ts` `rollStart`): **through U22 the Thursday before the expiry week** (third Friday minus 8 days), **from Z22 the expiry-week Monday** (third Friday minus 4 days). MNQ uses NQ's prices and volume (MNQ tracks NQ) at MNQ's tick value. Bars outside the table (before 2021-04-01, where the CSV can't referee) are not served.
+- **Ids and the front month.** `BT.<ROOT>.<month code><yy>`, e.g. `BT.MNQ.M24` (`name` `MNQM24`, `symbolId` `F.US.MNQ`), stable across runs. `activeContract` is true for the table's front month at the replay clock; it changes at the **start of the CME trading day (18:00 ET) in which the data rolls**, so a trading day has one front month (the harness caches the front per trading day). From that 18:00 until the data's 00:00 ET switch (about 6 hours) the new front has no bars yet: none are made up, and orders that would open a position on it are refused (errorCode 5, `No bars yet on MNQM24: the replay data rolls to it at 00:00 ET`); the old month still has its bars. Lookback indicators on the new front are short on roll days (its history starts at the switch). `search_contracts` and `list_available_contracts` return the front month only; `get_contract` and `get_bars` answer any contract month the store has bars for.
+- **Roll settlement (an intentional difference from live).** When the data leaves a contract for good (its roll in the table, even when the data comes back to it after that, as M22's expiry-day file; or the end of a later stretch on it), a position on it and its working orders are settled at that moment, as `close_position` flattens: the position closes at the contract's last bar close, without slippage (as after `BACKTESTER_END`), then every order still working on it is cancelled. The closing fill has `rollSettlement: true` and its round trip `reason: "roll"`; every order that ended cancelled (bracket legs the close cancelled included) shows `rollSettlement: true`; the journal gets a `close_position`-like `exit` entry (its flatten result) tagged `roll_settlement`. A stretch the data spends on another contract and comes back from (2023-12-03 and 12-06, 2022-06-17, 2025-02-09) is a data gap, not a settlement: positions and orders stay and nothing fills on bars while the contract has none; `close_position` and reducing market orders fill at once at its last close (as after the window), other reducing orders (a protective stop) rest, and only orders that open exposure are refused. Live, the old month trades on until it expires; the local data has no bars for it, and a position there could otherwise be neither closed nor stopped.
+- **Gaps** are in `derived/NQ/manifest.json`: weekdays without L1 trades or without L2 rows (`gaps.l1`, `gaps.l2`; New Year's Day, Good Friday and Christmas are `holidays`). `dropped` lists day files left out (unreadable, or built from a source file that changed or is gone).
+- **Events.** The store keeps an index (per day and minute, the row in the source parquet), not a copy of the events. `DerivedStore.events(root, date, {from, to})` reads one day's normalized events from the source: trades `{t, price, size}`, best-quote states `{t, bid, bidSize, ask, askSize}` and L2 changes `{t, side, price, size, rawSize, act, rank}` (`t` in µs, UTC; data order, ties kept; `rank` is the level's position among the non-empty levels behind the touch, not a tick distance). See `src/events.ts`. It reads whatever range it is given: a tool serving the model must clamp `to` at the replay cutoff, and should cache decoded days (order flow in `get_bars` comes in a later change).
+
+**Precedence, pinned per run.** A run's data source is pinned in its `state.json` at its first call (`settings.data`: `useStore`, the manifest's hash, its months, the roll table's hash) and every process of the run honours it: a run never switches source. Where the store covers the clock at that first call (an ET day of a built month inside the roll table), NQ and MNQ come from it (`BT.MNQ.M24`); otherwise, with `BACKTESTER_STORE=off`, and for runs created before pinning, the CSV series (`BT.MNQ`) for the whole run. Past the run's store months (after the last built month, an unbuilt month, or outside the roll table) a store run behaves as after `BACKTESTER_END`: reads work, closes and market orders that reduce a position fill at the last close, and orders that open exposure are refused with a message saying so. A process with the store off, or a store rebuilt since the run started, is refused with a clear error; start a new run instead. Every other root always uses its CSV. `get_server_config.dataStore` shows the run's store as of the clock only (months, the front month, contracts that started by then).
+
+**What live shows and what history can show around a roll.** Live, every listed expiry trades at once: TopstepX's `get_bars` for the next contract month returns its back-month history before it becomes the front, and the old contract keeps trading until it expires. The local data has the front contract only, so a contract month has bars only while the data was on it (per the table). Before that, `get_bars` for it returns no bars; after the data leaves it, its bars stop and what was open on it is settled. Lookback across a roll therefore needs the previous contract's id (or the CSV series, which is back-adjusted). The store starts at its first built month: a clock in that month sees only the bars since then.
+
+#### Roll table (NQ)
+
+From `src/rolltable-nq.ts` (the table covers 2021-04-01 00:00 ET to 2025-12-01 00:00 ET; the CSV starts 2021-04-25, so the H21 roll can't be checked and data before the table is not served). Each switch was found as the first minute of a step in the CSV-minus-raw offset. Review evidence (full build 2021-05..2025-11, bars served per contract by this table): each contract's offset sits at its mode for this share of its minutes: M21 98.8%, U21 97.4%, Z21 98.1%, H22 98.4%, M22 97.3%, U22 97.4%, Z22 97.4%, H23 99.8%, M23 99.4%, U23 99.7%, Z23 99.3%, H24 97.6%, M24 99.0%, U24 97.9%, Z24 97.3%, H25 97.7%, M25 97.8%, U25 99.3%, Z25 98.3% (independently re-derived in review: 96-99.8%); the days off the mode are the CSV's own later rolls (drift of a few points, never a spread) and partial days; checked and not switches (the CSV wandering on a partial day, or drifting after its own Sunday roll): 2021-05-11, 2022-11-21, 2023-06-11, 2023-12-10, 2024-03-10, 2024-06-10, 2025-06-29, 2025-07-20.
+
+| Roll | Data switch | Rule of its era | Notes |
+|---|---|---|---|
+| M21 → U21 | 2021-06-10 00:00 ET (2021-06-10 04:00Z) | same | rule (era 1, Thursday) |
+| U21 → Z21 | 2021-09-09 00:00 ET (2021-09-09 04:00Z) | same | rule (era 1) |
+| Z21 → H22 | 2021-12-09 00:00 ET (2021-12-09 05:00Z) | same | rule (era 1) |
+| H22 → M22 | 2022-03-10 00:00 ET (2022-03-10 05:00Z) | same | rule (era 1) |
+| M22 → U22 | 2022-06-09 00:00 ET (2022-06-09 04:00Z) | same | rule (era 1); the 2022-06-17 file is back on M22 (exception) |
+| U22 → Z22 | 2022-09-08 00:00 ET (2022-09-08 04:00Z) | same | rule (era 1; first trade 00:01 ET) |
+| Z22 → H23 | 2022-12-12 00:00 ET (2022-12-12 05:00Z) | same | rule (era 2 from here, Monday) |
+| H23 → M23 | 2023-03-13 00:00 ET (2023-03-13 04:00Z) | same | rule (era 2) |
+| M23 → U23 | 2023-06-12 00:00 ET (2023-06-12 04:00Z) | same | rule (era 2) |
+| U23 → Z23 | 2023-09-11 00:00 ET (2023-09-11 04:00Z) | same | rule (era 2) |
+| Z23 → H24 | 2023-12-11 00:00 ET (2023-12-11 05:00Z) | same | rule (era 2); 2023-12-03 evening and 2023-12-06 were on H24 (exceptions) |
+| H24 → M24 | 2024-03-11 00:00 ET (2024-03-11 04:00Z) | same | rule (era 2); the 03-10 file also holds H24 rows past 00:00 ET Monday (dropped) |
+| M24 → U24 | 2024-06-17 00:00 ET (2024-06-17 04:00Z) | same | rule (era 2) |
+| U24 → Z24 | 2024-09-12 00:00 ET (2024-09-12 04:00Z) | 2024-09-16 | EARLY: Thursday 00:00 ET, four days before the rule's 2024-09-16 |
+| Z24 → H25 | 2024-12-16 00:00 ET (2024-12-16 05:00Z) | same | rule (era 2) |
+| H25 → M25 | 2025-03-17 00:00 ET (2025-03-17 04:00Z) | same | rule (era 2) |
+| M25 → U25 | 2025-06-16 00:00 ET (2025-06-16 04:00Z) | same | rule (era 2) |
+| U25 → Z25 | 2025-09-15 00:00 ET (2025-09-15 04:00Z) | same | rule (era 2) |
+
+| Exception | From | To | Contract | Notes |
+|---|---|---|---|---|
+| 1 | 2022-06-17 00:00 ET (2022-06-17 04:00Z) | 2022-06-18 00:00 ET (2022-06-18 04:00Z) | M22 | the expiry-day file is back on M22 (offset +35.5, thin volume); cut at M22's expiry 09:30 ET: the trades after it are unassigned |
+| 2 | 2023-12-03 00:00 ET (2023-12-03 05:00Z) | 2023-12-04 00:00 ET (2023-12-04 05:00Z) | H24 | Sunday evening on the back month (25 bars) |
+| 3 | 2023-12-06 00:00 ET (2023-12-06 05:00Z) | 2023-12-07 00:00 ET (2023-12-07 05:00Z) | H24 | one day on the back month (836 bars, offset -201.75) |
+| 4 | 2025-02-09 00:00 ET (2025-02-09 05:00Z) | 2025-02-10 00:00 ET (2025-02-10 05:00Z) | none | Sunday file with one print 92.75 points off the H25 level, matching no contract (H25-M25 spread about 207): unassigned |
+
 ### Configuration
 
 Every option is in [.env.example](.env.example). Settings come from the environment (an MCP client's `env` block, or the variables a harness forwards) or a `.env` file in the working directory (`BACKTESTER_ENV_FILE` names another).
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `BACKTESTER_DATA_DIR` | required | Folder of `<ROOT>_1min.csv` files |
+| `BACKTESTER_DATA_DIR` | required | Folder of `<ROOT>_1min.csv` files, and of the derived store `derived/` (`npm run build-store`) |
+| `BACKTESTER_STORE` | `on` | `off` serves only the CSV series, even where the derived store covers the clock |
+| `BACKTESTER_ORDERBOOK_DIR` | the store's source | The order-book parquet folder (`l1/`, `l2/`): `build-store`'s source, and where events are read from |
 | `BACKTESTER_CLOCK_FILE` | | Replay clock file, `{ "now": "<ISO>" }`, re-read on every call |
 | `BACKTESTER_NOW` | | Fixed replay time when there is no clock file (one of the two is required) |
 | `BACKTESTER_START` / `BACKTESTER_END` | none | The replay window (ISO, UTC); `END` must be after `START` |
@@ -298,7 +354,7 @@ Then move the clock with `node dist/clock.js` between turns. `npm run start:http
 | | projectx-mcp | backtester-mcp |
 |---|---|---|
 | Time | Wall clock | Replay clock (`BACKTESTER_CLOCK_FILE` / `BACKTESTER_NOW`) |
-| Contract ids | `CON.F.US.MNQ.H25` | `BT.MNQ` (one continuous series per root; `name` is the front-month ticker) |
+| Contract ids | `CON.F.US.MNQ.H25`, every listed expiry with its full history | `BT.MNQ.M24` per expiry where the [derived store](#local-order-book-data-the-derived-store-nq-and-mnq) covers the clock (bars only while the data was on that contract); elsewhere `BT.MNQ`, one continuous series per root (`name` is the front-month ticker) |
 | `get_bars` units | second to month | minute, hour, day, week (from one-minute data); `second` and `month` answer an error |
 | `get_quote` | SignalR feed | Last closed one-minute bar; `bestBid = bestAsk = lastPrice`; `null` when no bar in 15 minutes |
 | Brackets | Only with Auto OCO Brackets on the account; a "Position Brackets" refusal is journaled as an account-setup problem | Always available: a replay account is always bracket-capable, so that refusal is never simulated |
@@ -310,9 +366,9 @@ Then move the clock with `node dist/clock.js` between turns. `npm run start:http
 | `canTrade` | Set by the firm | `false` once the simulated balance is at or below zero |
 | Market orders | Fill at once | Fill at once, at the open of the one-minute bar containing the replay moment plus slippage (`BACKTESTER_MARKET_FILL=next-bar`: at the next bar's open) |
 | Accounts | Your TopstepX accounts | One simulated account (`BACKTESTER_ACCOUNT_ID`) |
-| Extra result fields | | `get_server_config`: `mode`, `replay`, `window`, `clock`, `data`, run and fill settings; orders: `rejectReason`, `reduceOnly`; fills, positions, performance: [trade metrics](#trade-metrics) |
+| Extra result fields | | `get_server_config`: `mode`, `replay`, `window`, `clock`, `data`, `dataStore`, `store`, run and fill settings; orders: `rejectReason`, `reduceOnly`; fills, positions, performance: [trade metrics](#trade-metrics) |
 | Guardrail names | `PROJECTX_*` | `BACKTESTER_*`, plus the replay window |
-| No equivalent | `realtime.ts`, `tunnel.ts`, Postman collection | `clock.ts` (the clock and its CLI), `fills.ts`, `bars.ts`, `metrics.ts` |
+| No equivalent | `realtime.ts`, `tunnel.ts`, Postman collection | `clock.ts` (the clock and its CLI), `fills.ts`, `bars.ts`, `metrics.ts`, the derived store (`calendar.ts`, `parquet.ts`, `events.ts`, `rolltable.ts`, `rolltable-nq.ts`, `store.ts`, `storebuild.ts`, `build-store.ts`) |
 
 ## Development and testing
 
@@ -324,7 +380,7 @@ npm run typecheck
 npm run build
 ```
 
-Every module in `src/` has tests in `test/`, except `index.ts`, which only wires dependencies together. Tests generate tiny synthetic CSVs in temp folders and never read real data. Each MCP tool is exercised through an in-memory MCP client; `test/replay.test.ts` runs the harness's flow (entry with a stop bracket, position, stop moved, exit, fills) and multi-day replays; `test/parity.test.ts` pins the order tools' results against projectx-mcp's (fields, types, statuses, messages); `test/metrics.test.ts` checks the trade metrics against hand-computed, tick-correct examples. An optional dev check compares them with the harness's simulated broker on the same bars: `FTH_HARNESS_DIR=/path/to/futures-trading-harness npx vitest run test/harness-parity.test.ts` (skipped without it). See [CLAUDE.md](CLAUDE.md) for the layout, the rules, and what to run before a pull request.
+Every module in `src/` has tests in `test/`, except `index.ts`, which only wires dependencies together. Tests generate tiny synthetic CSVs and order-book parquet files in temp folders and never read real data. Each MCP tool is exercised through an in-memory MCP client; `test/replay.test.ts` runs the harness's flow (entry with a stop bracket, position, stop moved, exit, fills) and multi-day replays; `test/parity.test.ts` pins the order tools' results against projectx-mcp's (fields, types, statuses, messages); `test/metrics.test.ts` checks the trade metrics against hand-computed, tick-correct examples. An optional dev check compares them with the harness's simulated broker on the same bars: `FTH_HARNESS_DIR=/path/to/futures-trading-harness npx vitest run test/harness-parity.test.ts` (skipped without it). See [CLAUDE.md](CLAUDE.md) for the layout, the rules, and what to run before a pull request.
 
 ## License
 

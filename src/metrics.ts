@@ -94,6 +94,8 @@ export interface MetricOrder {
   cancelSeq?: number;
   /** Filled at the last close after BACKTESTER_END. */
   endOfWindow?: boolean;
+  /** Closed by the server when the data left the contract (roll settlement): exit reason "roll". */
+  rollSettlement?: boolean;
   /** Filled on arrival at the replay moment it was placed (marketFill "now"), stamped at that moment. */
   arrival?: boolean;
 }
@@ -103,7 +105,7 @@ export interface TickSpec {
   tickValue: number;
 }
 
-export type ExitReason = "stop" | "trail" | "target" | "close" | "end" | "other";
+export type ExitReason = "stop" | "trail" | "target" | "close" | "end" | "roll" | "other";
 
 export interface RoundTrip {
   /** The id of the round trip's opening fill (search_trades `id`). */
@@ -294,6 +296,7 @@ export function roundTrips(contractId: string, fills: Trade[], orders: MetricOrd
 
   const reasonOf = (o: MetricOrder | undefined, e: Episode, stop: { price: number; source: MetricOrder | undefined } | null): ExitReason => {
     if (!o) return "other";
+    if (o.rollSettlement) return "roll";
     if (o.endOfWindow) return "end";
     const stopLike = o.role === "sl" || (o.role === "order" && isStopType(o.type));
     if (stopLike) {
