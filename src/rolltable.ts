@@ -115,6 +115,11 @@ export class RollSchedule {
     return find(this.segments, ms) >= 0;
   }
 
+  /** Whether `ms` falls in one of the table's exception stretches (data on another contract than the rolls give, or on none). */
+  inException(ms: number): boolean {
+    return this.table.exceptions.some((e) => Date.parse(e.from) <= ms && ms < Date.parse(e.to));
+  }
+
   /** The contract the data is on at `ms` (null: none, or outside the table). */
   dataContractAt(ms: number): string | null {
     const i = find(this.segments, ms);

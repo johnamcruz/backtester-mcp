@@ -5,6 +5,7 @@ import { etDate, parseMonthCode } from "./calendar.js";
 import { readNow } from "./clock.js";
 import type { Config, MarketFill } from "./config.js";
 import { ORDER_TYPES } from "./enums.js";
+import { COMPLETE, UNVALIDATED, flowBars, flowRange, flowSourceContract, plainFlow, spanMinutes, type BarWithFlow } from "./flowtools.js";
 import {
   STATUS,
   arrivalFillPrice,
@@ -998,14 +999,55 @@ export class ReplayExchange {
   }
 
   bars(req: BarsRequest): OutBar[] {
+    return this.barsOf(req, (bars) => bars);
+  }
+
+  /**
+   * get_bars with order flow (projectx-mcp's flowtools.ts#barsWithFlow): the
+   * same bars, each with `flow` summed from the derived store's minute rows of
+   * the flow source contract (MNQ bars carry NQ's), and `windows` per n in
+   * `windows`. Read in the same transaction as the bars, as of the same replay
+   * cutoff: nothing at or after it is used. When the contract or bar unit has no
+   * flow, every bar gets empty flow and `orderFlow.note` says why.
+   */
+  barsWithFlow(req: BarsRequest, windows: number[]): { bars: Array<BarWithFlow<OutBar>>; orderFlow: Record<string, unknown> } {
+    return this.barsOf(req, (bars, c, cutoff) => {
+      const source = flowSourceContract(req.contractId);
+      const largePrint = this.config.flowLargePrint;
+      const info = { sourceContractId: source, largePrint, windows };
+      const plain = (note: string) => ({ bars: plainFlow(bars, windows), orderFlow: { ...info, note } });
+      const minutes = spanMinutes(req.unit, req.unitNumber);
+      if (minutes === null) return plain("Order flow is built from minutes: only minute and hour bars carry it.");
+      if (c.dataRoot !== STORE_ROOT) return plain(`No order-flow history for ${source}: the local order-book data is NQ only.`);
+      if (!c.expiry || !this.run) {
+        return plain(`Order flow comes from the derived store's contract months (${expiryIdOf(c.root, "M24")} and the like); the back-adjusted CSV series ${req.contractId} carries none.`);
+      }
+      const range = flowRange(bars, minutes, windows);
+      if (!range) return plain("No bar has a usable time.");
+      const rec = this.run.flowRecords(STORE_ROOT, c.expiry, range.from, range.to, cutoff);
+      if (!rec) return plain("The derived store has no order flow: build it with build-store (it builds the flow unless --no-flow).");
+      return {
+        bars: flowBars(rec.byMinute, bars, minutes, windows, largePrint),
+        orderFlow: {
+          ...info,
+          recorded: "off (replay: order flow is computed from the local order-book history)",
+          coverage: { source: "history", inferredSide: true, unvalidated: [...UNVALIDATED], ...(rec.missingDays.length ? { daysWithoutFlow: rec.missingDays } : {}) },
+          note: COMPLETE,
+        },
+      };
+    });
+  }
+
+  /** The bars of a request, closed by the replay cutoff, passed to `then` in the same transaction. */
+  private barsOf<T>(req: BarsRequest, then: (bars: OutBar[], c: ContractSpec, cutoff: number) => T): T {
     if (req.unit === "second" || req.unit === "month") {
       throw new ReplayError(`unit "${req.unit}" is not available in replay: bars are built from 1-minute data (use minute, hour, day or week).`);
     }
     return this.tx((_state, now) => {
-      const { s } = this.series(req.contractId);
+      const { c, s } = this.series(req.contractId);
       const cutoff = this.cutoff(now);
       const end = req.endTime ? Math.min(Date.parse(req.endTime), cutoff) : cutoff;
-      return aggregate(s, {
+      const bars = aggregate(s, {
         unit: req.unit as AggUnit,
         unitNumber: req.unitNumber,
         limit: req.limit,
@@ -1014,6 +1056,7 @@ export class ReplayExchange {
         cutoff,
         partial: req.includePartialBar,
       });
+      return then(bars, c, cutoff);
     }, [req.contractId]);
   }
 

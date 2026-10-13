@@ -12,7 +12,7 @@ import type { Columns } from "./parquet.js";
  * listed on each type.
  */
 
-/** A trade print (L1 type 2). Print's `side` (aggressor) isn't in the data: PR B classifies it from the prevailing quote. */
+/** A trade print (L1 type 2). Print's `side` (aggressor) isn't in the data: flowengine.ts#inferSide infers it from the quote in force before it, else the tick rule. */
 export interface TradeEvent {
   t: number;
   price: number;
@@ -40,8 +40,9 @@ export const EMPTY_QUOTE: QuoteState = { bid: null, bidSize: null, ask: null, as
  * after the change (0 for a remove; the data's own `vol` on a remove is kept
  * in `rawSize`). `rank` is the data's `depth`: the level's position among the
  * non-empty levels behind the L1 touch (1 = the first behind it), not a tick
- * distance. LevelChange's `prevSize` needs the book and is left to its
- * consumer (PR B); its `type` corresponds to `act`.
+ * distance (the order-flow book, flowengine.ts, keys levels by price and doesn't
+ * use it). LevelChange's `prevSize` needs the book and is left to its consumer;
+ * its `type` corresponds to `act`.
  */
 export interface DepthEvent {
   t: number;

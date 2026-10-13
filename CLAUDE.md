@@ -45,6 +45,10 @@ the ProjectX REST client.
   `src/storebuild.ts` and the CLI `src/build-store.ts` (`npm run build-store`). Where the
   store covers the clock, NQ/MNQ contracts are `BT.<ROOT>.<code>` (e.g. `BT.MNQ.M24`);
   elsewhere the CSV series `BT.<ROOT>`.
+- Order flow on `get_bars` (`includeOrderFlow`, `flowWindows`; README "Order flow"): projectx-mcp's live field
+  contract reproduced from history. `src/orderflow.ts` (ported from projectx-mcp's `src/orderflow.ts`, cited by
+  function), `src/flowengine.ts` (the history engine), `src/flowstore.ts` (flow files built by `build-store`, versioned
+  by `FLOW_FORMAT` in the manifest; completeness and the replay-clock clamp), `src/flowtools.ts` (`get_bars`' assembly).
 - `src/metrics.ts`: trade metrics, pure: round trips (position episodes) from
   one contract's fills and bars, with MAE/MFE, R, bars held and exit reason,
   matching the harness backtester's `engine.js#closeTrade` fields (`r`,
@@ -66,7 +70,9 @@ the ProjectX REST client.
   error codes) against copies of projectx-mcp's, `harness-parity.test.ts` an optional dev check against the harness (skipped
   without `FTH_HARNESS_DIR`); `helpers.ts` writes tiny synthetic CSVs into
   temp folders, `orderbook.ts` and `storefixture.ts` tiny synthetic order-book
-  parquet and a store built from it.
+  parquet and a store built from it; `vectors.test.ts` runs projectx-mcp's golden order-flow vectors
+  (`test/vectors/projectx/`, through the converter `flowvectors.ts`; `PROJECTX_MCP_DIR` adds a byte-identity check
+  against the pinned projectx-mcp commit).
 
 ## Commands
 

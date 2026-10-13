@@ -38,6 +38,8 @@ export interface Config {
   maxPositionSize: number;
   maxDailyLoss: number;
   journalPath: string;
+  /** get_bars' large-print threshold in contracts (BACKTESTER_FLOW_LARGE_PRINT, as projectx-mcp's PROJECTX_FLOW_LARGE_PRINT; default 10). */
+  flowLargePrint: number;
 }
 
 type Env = Record<string, string | undefined>;
@@ -140,6 +142,7 @@ export function loadConfig(env: Env = process.env): Config {
     maxPositionSize: num(env, "BACKTESTER_MAX_POSITION_SIZE", 2),
     maxDailyLoss: num(env, "BACKTESTER_MAX_DAILY_LOSS", 500),
     journalPath: abs(expandHome(env.BACKTESTER_JOURNAL_PATH?.trim() || join(stateDir, "journal.jsonl"))),
+    flowLargePrint: num(env, "BACKTESTER_FLOW_LARGE_PRINT", 10),
   };
 }
 
@@ -168,5 +171,6 @@ export function publicConfig(c: Config) {
     feesPerSide: { micro: c.feesMicro, mini: c.feesMini },
     marketFill: c.marketFill,
     store: c.useStore ? "on" : "off",
+    flow: { largePrint: c.flowLargePrint, source: "history" as const },
   };
 }

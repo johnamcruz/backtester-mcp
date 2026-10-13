@@ -6,6 +6,8 @@ import { BarSeries } from "./bars.js";
 import { etDate, type EtDate } from "./calendar.js";
 import { EMPTY_QUOTE, normalizeL1, normalizeL2, type DepthEvent, type MinuteBars, type QuoteEvent, type QuoteState, type TradeEvent } from "./events.js";
 import { ParquetFile } from "./parquet.js";
+import { FLOW_FORMAT, flowRecords, readFlowDay, type FlowDay, type FlowSummary } from "./flowstore.js";
+import type { MinuteRecord } from "./orderflow.js";
 import { scheduleOf, type RollSchedule, type RollTable } from "./rolltable.js";
 
 /**
@@ -15,6 +17,7 @@ import { scheduleOf, type RollSchedule, type RollTable } from "./rolltable.js";
  *
  *   derived/<ROOT>/manifest.json          what was built: months, days, gaps, the roll table, contracts
  *   derived/<ROOT>/days/YYYY-MM-DD.json.gz one ET day: its bars, event index, quote states
+ *   derived/<ROOT>/flow/YYYY-MM-DD.json.gz one ET day's order flow per minute (flowstore.ts)
  *
  * Which contract a bar belongs to comes only from the reviewed roll table
  * (rolltable.ts), applied to each minute.
@@ -84,6 +87,8 @@ export interface Manifest {
   dropped: Array<{ date: EtDate; reason: string }>;
   /** Per contract code: its first and last bar, bar count and the days holding them. */
   contracts: Record<string, { first: string; last: string; bars: number; days: EtDate[] }>;
+  /** The order flow built (flowstore.ts): its format and the days whose flow is current. Absent: none built. */
+  flow?: FlowSummary;
 }
 
 export const storeDir = (dataDir: string, root: string) => join(dataDir, "derived", root);
@@ -152,6 +157,7 @@ export class DerivedStore {
   private readonly manifests = new Map<string, Manifest | null>();
   private readonly hashes = new Map<string, string | null>();
   private readonly series = new Map<string, BarSeries>();
+  private readonly flowDays = new Map<string, FlowDay | null>();
 
   constructor(
     private readonly dataDir: string,
@@ -237,12 +243,30 @@ export class DerivedStore {
   }
 
   /**
+   * The order-flow minute records of contract month `code` of `root` for minutes
+   * [from, to] as of `cutoff` (flowstore.ts#flowRecords: nothing at or after the
+   * cutoff is used). Null when the store has no current flow.
+   */
+  flowRecords(root: string, code: string, from: number, to: number, cutoff: number): { byMinute: Map<number, MinuteRecord>; missingDays: EtDate[] } | null {
+    const m = this.manifest(root);
+    const schedule = scheduleOf(root);
+    if (m?.flow?.format !== FLOW_FORMAT || !schedule) return null;
+    const read = (date: EtDate) => {
+      const key = `${root}.${date}`;
+      if (!this.flowDays.has(key)) this.flowDays.set(key, readFlowDay(this.dataDir, root, date));
+      return this.flowDays.get(key) ?? null;
+    };
+    return flowRecords(read, m.flow, schedule, code, from, to, cutoff);
+  }
+
+  /**
    * One ET day's normalized events in [from, to) (UTC ms, default the whole
    * day), read from the source parquet: trades and quote states from L1
    * (the quote state replayed from the day's start), L2 changes through the
    * minute index. Rows outside the day's Globex hours are left out. It reads
-   * whatever range it is asked for: a caller serving the model (PR B) must
-   * clamp `to` at the replay cutoff, and should cache decoded days.
+   * whatever range it is asked for: a caller serving the model must clamp `to`
+   * at the replay cutoff, and should cache decoded days. (get_bars' order flow
+   * doesn't read events at call time: it is computed at build time, flowstore.ts.)
    */
   async events(root: string, date: EtDate, opts: { from?: number; to?: number; l2?: boolean } = {}): Promise<DayEvents> {
     const m = this.manifest(root);

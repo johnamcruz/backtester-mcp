@@ -399,7 +399,11 @@ export function createServer(deps: Deps): McpServer {
       description:
         "OHLCV bars for a contract, returned oldest→newest. t=bar open time (UTC), o/h/l/c=prices, v=volume. " +
         "Defaults: endTime=now (the replay clock), startTime chosen to cover `limit` bars. Max 20,000 bars. " +
-        "Only bars closed by the replay clock (unless includePartialBar); built from 1-minute data, so units are minute, hour, day, week.",
+        "Only bars closed by the replay clock (unless includePartialBar); built from 1-minute data, so units are minute, hour, day, week. " +
+        "includeOrderFlow=true adds `flow` to each minute or hour bar: bv, sv, delta, trades, volume, vwap, ofiTrade, ofiQuote, imbalance, largeBuy, largeSell, complete, " +
+        "and `windows` (ofiTrade and delta over the last n bar spans for each n in flowWindows), summed from per-minute order flow of the local order-book history " +
+        "(aggressor sides inferred from the quote, then the tick rule; exchange times). Every value is null unless all the bar's minutes are complete. " +
+        "MNQ bars carry NQ's flow (same contract month); other contracts and the CSV series carry none.",
       inputSchema: {
         contractId,
         unit: z.enum(Object.keys(BAR_UNITS) as [keyof typeof BAR_UNITS]).default("minute"),
@@ -409,6 +413,8 @@ export function createServer(deps: Deps): McpServer {
         endTime: isoTime.optional(),
         includePartialBar: z.boolean().default(false),
         live: z.boolean().default(false),
+        includeOrderFlow: z.boolean().default(false).describe("Add per-bar order flow (minute and hour bars). Default false."),
+        flowWindows: z.array(z.number().int().min(1).max(50)).max(5).default([]).describe("With includeOrderFlow: window sizes in bars, e.g. [5]."),
       },
       annotations: read,
     },
@@ -421,9 +427,17 @@ export function createServer(deps: Deps): McpServer {
       endTime?: string;
       includePartialBar: boolean;
       live: boolean;
+      includeOrderFlow: boolean;
+      flowWindows: number[];
     }) => {
-      const bars = client.bars(a);
-      return { contractId: a.contractId, barSize: `${a.unitNumber} ${a.unit}`, count: bars.length, bars };
+      const base = (count: number) => ({ contractId: a.contractId, barSize: `${a.unitNumber} ${a.unit}`, count });
+      if (!a.includeOrderFlow) {
+        const bars = client.bars(a);
+        return { ...base(bars.length), bars };
+      }
+      const windows = [...new Set(a.flowWindows)].sort((x, y) => x - y);
+      const res = client.barsWithFlow(a, windows);
+      return { ...base(res.bars.length), ...res };
     }),
   );
 

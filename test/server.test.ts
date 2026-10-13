@@ -11,7 +11,7 @@ const PROJECTX_INPUTS: Record<string, string[]> = {
   search_contracts: ["searchText", "live"],
   get_contract: ["contractId"],
   list_available_contracts: ["live"],
-  get_bars: ["contractId", "unit", "unitNumber", "limit", "startTime", "endTime", "includePartialBar", "live"],
+  get_bars: ["contractId", "unit", "unitNumber", "limit", "startTime", "endTime", "includePartialBar", "live", "includeOrderFlow", "flowWindows"],
   get_quote: ["contractId", "timeoutMs"],
   list_open_orders: ["accountId"],
   search_orders: ["accountId", "startTimestamp", "endTimestamp"],
@@ -49,10 +49,13 @@ describe("tool registry", () => {
       expect(byName[w].annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true });
     }
     expect(byName.get_bars.annotations?.readOnlyHint).toBe(true);
-    const bars = byName.get_bars.inputSchema as { properties: Record<string, { default?: unknown; enum?: unknown }> };
+    const bars = byName.get_bars.inputSchema as { properties: Record<string, Record<string, unknown>> };
     expect(bars.properties.unit).toMatchObject({ default: "minute", enum: ["second", "minute", "hour", "day", "week", "month"] });
     expect(bars.properties.unitNumber.default).toBe(5);
     expect(bars.properties.limit.default).toBe(100);
+    // Order flow: off by default, at most 5 windows of 1-50 bars (projectx-mcp's limits).
+    expect(bars.properties.includeOrderFlow.default).toBe(false);
+    expect(bars.properties.flowWindows).toMatchObject({ default: [], maxItems: 5, items: { minimum: 1, maximum: 50 } });
   });
 
   it("serves the guide resource and the session prompt", async () => {

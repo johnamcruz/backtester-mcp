@@ -83,7 +83,7 @@ describe("store build", () => {
     expect(m.days["2024-03-12"]).toMatchObject({ l2Rows: null, l2Kept: null, bars: 2 });
     expect(m.rollTable).toEqual({ ...NQ_TABLE, hash: NQ_SCHEDULE.hash });
     expect(m.dropped).toEqual([]);
-    expect(lines.at(-1)).toMatch(/^done: 7 days built, 0 up to date, \d+ rows read .*0 day files left out$/);
+    expect(lines.at(-1)).toMatch(/^done: 7 days built, 0 up to date, \d+ rows read .*0 day files left out; order flow: 6 days built, 0 up to date, 6 current in the store$/);
     expect(lines).toContain("2024-03-11 NQM24: L1 9 rows (9 kept, 3 trades, 3 bars), L2 2 rows, " + lines.find((l) => l.startsWith("2024-03-11"))!.split(", L2 2 rows, ")[1]);
   });
 

@@ -11,7 +11,7 @@ import { buildStore, type BuildSummary } from "./storebuild.js";
  */
 
 const USAGE =
-  "usage: build-store --from YYYYMM --to YYYYMM [--source <folder with l1/ and l2/>] [--data-dir <BACKTESTER_DATA_DIR>]";
+  "usage: build-store --from YYYYMM --to YYYYMM [--source <folder with l1/ and l2/>] [--data-dir <BACKTESTER_DATA_DIR>] [--no-flow]";
 
 function arg(argv: string[], name: string): string | undefined {
   const i = argv.indexOf(name);
@@ -28,7 +28,7 @@ export async function runBuildStoreCli(
   const source = arg(argv, "--source") ?? env.BACKTESTER_ORDERBOOK_DIR?.trim();
   const dataDir = arg(argv, "--data-dir") ?? env.BACKTESTER_DATA_DIR?.trim();
   if (!from || !to || !source || !dataDir) throw new Error(USAGE);
-  return buildStore({ source, dataDir, from, to, log });
+  return buildStore({ source, dataDir, from, to, log, flow: !argv.includes("--no-flow") });
 }
 
 const invoked = (() => {
