@@ -81,7 +81,7 @@ the ProjectX REST client.
 
 ```bash
 npm run typecheck
-npm test                 # vitest run
+npm test                 # vitest run in one temp root, removed after (test/run-tests.mjs; KEEP_TEST_TMP=1 keeps it)
 npm run coverage         # thresholds in vitest.config.ts are enforced
 npm run build            # tsc -> dist/
 # conformance, from a futures-trading-harness checkout:

@@ -24,8 +24,8 @@
     "clock": "node dist/clock.js",
     "build-store": "node dist/build-store.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run",
-    "coverage": "vitest run --coverage"
+    "test": "node test/run-tests.mjs",
+    "coverage": "node test/run-tests.mjs --coverage"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.1",
