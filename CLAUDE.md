@@ -45,12 +45,17 @@ the ProjectX REST client.
   positions' `roundTrip`).
 - `src/clock.ts`: reading the replay clock; also the clock CLI (`dist/clock.js`).
 - `src/risk.ts`: guardrails and trading-day math (pure functions).
+- `src/protect.ts`: projectx-mcp's bracket rules (minimum distance, signs) and the protection
+  check after a bracketed market entry, step for step over the replay state; `src/ticks.ts`:
+  projectx-mcp's tick rounding (`snapped`). `client.ts#flatten` is close_position's flatten
+  (close, cancel the contract's orders once flat, verify).
 - `src/config.ts`, `src/enums.ts`, `src/journal.ts`, `src/performance.ts`,
   `src/http.ts`: as in projectx-mcp.
 - `test/`: one Vitest file per module, `server.test.ts` through an in-memory
   MCP client, `replay.test.ts` for the harness flow and multi-day replays,
   `metrics.test.ts` with hand-computed tick-correct trade metrics,
-  `harness-parity.test.ts` an optional dev check against the harness (skipped
+  `parity.test.ts` pins the order tools' results (fields, types, statuses, messages,
+  error codes) against copies of projectx-mcp's, `harness-parity.test.ts` an optional dev check against the harness (skipped
   without `FTH_HARNESS_DIR`); `helpers.ts` writes tiny synthetic CSVs into
   temp folders.
 
@@ -77,7 +82,10 @@ BACKTESTER_DATA_DIR=<data> BACKTESTER_NOW=2024-03-05T15:00:00Z BACKTESTER_STATE_
   guardrail: ...`), outcome codes and the journal format stay identical to the
   harness's `docs/BROKER-MCP-INTERFACE.md` and to projectx-mcp. Extra fields in
   a result are allowed; missing or renamed ones are not. `test/server.test.ts`
-  pins projectx-mcp's tool and input lists.
+  pins projectx-mcp's tool and input lists, `test/parity.test.ts` its order
+  results. projectx-mcp (live) is the reference: when the two differ, this
+  server adapts, never the other way round. Intentional differences are listed
+  in README's "Differences from projectx-mcp".
 - **Fills match the harness backtester.** The rules in `src/fills.ts` are those
   of the harness's simulated broker, `scripts/lib/backtest/sim-broker.js`
   (the fill model the harness backtester `engine.js` drives), cited by

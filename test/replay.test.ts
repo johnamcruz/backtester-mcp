@@ -119,11 +119,12 @@ describe("replay window", () => {
     expect(bars[0].t).toBe(iso(T0 + 29 * MIN)); // capped at END
     // Adding risk is refused after END; flattening and cancelling still work, at the last close (the backtester's "end").
     expect((await call("place_order", { accountId: 1, contractId: "BT.MNQ", side: "buy", type: "market", size: 1, rationale: RATIONALE })).text).toMatch(/after BACKTESTER_END/);
-    expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true);
+    // close_position flattens at the last close, then cancels what still works on the contract (the sell limit).
+    expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data).toMatchObject({ status: "flat", success: true, cancelledOrderIds: [2], remainingOrderIds: [] });
     expect((await call("list_open_positions", { accountId: 1 })).data).toEqual([]);
     expect((await call("search_trades", { accountId: 1 })).data.at(-1)).toMatchObject({ sideName: "sell", price: 20000, profitAndLoss: -0.5, creationTimestamp: end });
-    expect((await call("list_open_orders", { accountId: 1 })).data).toHaveLength(1);
-    expect((await call("cancel_order", { accountId: 1, orderId: 2 })).data.success).toBe(true);
+    expect((await call("list_open_orders", { accountId: 1 })).data).toHaveLength(0);
+    expect((await call("cancel_order", { accountId: 1, orderId: 2 })).data).toMatchObject({ success: false, errorName: "OrderNotFound" });
     expect((await call("get_quote", { contractId: "BT.NQ" })).data.quote.lastUpdated).toBe(end);
   });
 });

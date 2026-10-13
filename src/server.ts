@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { ReplayError, type Outcome, type ReplayExchange } from "./client.js";
+import { ReplayError, specOf, type Outcome, type ReplayExchange } from "./client.js";
 import { publicConfig, type Config } from "./config.js";
 import {
   BAR_UNITS,
@@ -13,6 +13,8 @@ import {
   decorateTrade,
 } from "./enums.js";
 import { JOURNAL_KINDS, Journal } from "./journal.js";
+import { MIN_BRACKET_TICKS, bracketRefusal, pendingFill, positionOn, protectEntry, signedBrackets, type Protection } from "./protect.js";
+import { snapPrices, snappedField } from "./ticks.js";
 import { summarizeRoundTrips, summarizeTrades } from "./performance.js";
 import {
   RiskError,
@@ -87,7 +89,10 @@ const contractId = z.string().min(1).describe('Contract ID, e.g. "BT.MNQ". Get i
 const isoTime = z.string().datetime({ offset: true });
 const bracket = z
   .object({
-    ticks: z.number().int().describe("Distance from the entry fill, in ticks."),
+    ticks: z
+      .number()
+      .int()
+      .describe(`Distance from the entry fill, in ticks (at least ${MIN_BRACKET_TICKS}). The server signs it by side; the sign you send is ignored.`),
     type: z.enum(PLACEABLE_ORDER_TYPES).describe("Order type of the bracket leg, usually stop (for SL) or limit (for TP)."),
   })
   .optional();
@@ -154,6 +159,115 @@ export function createServer(deps: Deps): McpServer {
   };
 
   const orderGuard = (acct: number) => assertTradingAllowed(config, acct);
+  /** A journal write from an order tool: never fails the tool (as projectx-mcp's record). */
+  const record = (entry: Parameters<Journal["add"]>[0]) => journal.add(entry).then(
+    () => undefined,
+    () => undefined,
+  );
+
+  type OrderType = (typeof PLACEABLE_ORDER_TYPES)[number];
+  interface PlaceArgs {
+    accountId: number;
+    contractId: string;
+    side: "buy" | "sell";
+    type: OrderType;
+    size: number;
+    limitPrice?: number;
+    stopPrice?: number;
+    trailPrice?: number;
+    stopLossBracket?: { ticks: number; type: OrderType };
+    takeProfitBracket?: { ticks: number; type: OrderType };
+    customTag?: string;
+    rationale: string;
+  }
+
+  /**
+   * place_order as projectx-mcp's placeOrder: bracket distances checked before anything is sent,
+   * guardrails, the canTrade refusal of opening orders, prices rounded onto the tick grid, signed
+   * brackets, and for a bracketed market entry that opens, the protection check.
+   */
+  async function placeOrder(a: PlaceArgs) {
+    if (a.type === "limit" && a.limitPrice === undefined) throw new RiskError("limit orders require limitPrice.");
+    if (a.type === "stop" && a.stopPrice === undefined) throw new RiskError("stop orders require stopPrice.");
+    if (a.type === "trailing_stop" && a.trailPrice === undefined) throw new RiskError("trailing_stop orders require trailPrice.");
+    for (const [label, b] of [["stopLossBracket", a.stopLossBracket], ["takeProfitBracket", a.takeProfitBracket]] as const) {
+      const why = b ? bracketRefusal(label, b.ticks) : null;
+      if (why) throw new RiskError(why);
+    }
+
+    orderGuard(a.accountId);
+    assertSymbolAllowed(config, a.contractId);
+    assertOrderSize(config, a.size);
+
+    const before = positionOn(await openPositions(a.accountId), a.contractId);
+    const { exposure } = await exposureOf(a.accountId, a.contractId, a.side, a.size);
+    // Opening = anything but an exit no larger than the position; reversals open.
+    const opening = opensExposure(exposure) && !reducesAlone(exposure);
+    if (opening) {
+      const account = client.accounts().find((x) => x.id === a.accountId);
+      if (account?.canTrade === false) {
+        const msg = `Blocked by risk guardrail: account ${account.name} has canTrade=false (locked by the firm); only orders that reduce a position are allowed.`;
+        await record({ kind: "order_blocked", text: `${msg} | rationale: ${a.rationale}`, accountId: a.accountId, contractId: a.contractId });
+        return { ...json({ orderId: null, success: false, errorCode: 4, errorName: PLACE_ERRORS[4], errorMessage: msg }), isError: true };
+      }
+      await addGuard(exposure, a.accountId);
+    }
+
+    const protect = a.type === "market" && !!a.stopLossBracket && opening;
+    const signed = signedBrackets(a.side, a.stopLossBracket?.ticks, a.takeProfitBracket?.ticks);
+    const snap = snapPrices({ limitPrice: a.limitPrice, stopPrice: a.stopPrice, trailPrice: a.trailPrice }, a.side, specOf(a.contractId)?.tickSize ?? null);
+    const res = client.place({
+      accountId: a.accountId,
+      contractId: a.contractId,
+      type: ORDER_TYPES[a.type],
+      side: SIDES[a.side],
+      size: a.size,
+      limitPrice: snap.prices.limitPrice ?? null,
+      stopPrice: snap.prices.stopPrice ?? null,
+      trailPrice: snap.prices.trailPrice ?? null,
+      customTag: a.customTag || null,
+      stopLossBracket: a.stopLossBracket ? { ticks: signed.stop as number, type: ORDER_TYPES[a.stopLossBracket.type] } : null,
+      takeProfitBracket: a.takeProfitBracket ? { ticks: signed.target as number, type: ORDER_TYPES[a.takeProfitBracket.type] } : null,
+    });
+    let result: Record<string, unknown> = { orderId: res.orderId, customTag: res.customTag, ...outcome(res, PLACE_ERRORS), ...snappedField(snap.snapped) };
+
+    let protection: Protection | undefined;
+    if (res.success && res.orderId != null && protect) {
+      const orderId = res.orderId;
+      protection = await protectEntry(
+        {
+          order: () => client.order(a.accountId, orderId),
+          position: () => positionOn(client.positions(a.accountId), a.contractId),
+          ordersOn: () => client.openOrders(a.accountId).filter((o) => o.contractId === a.contractId),
+          cancelEntry: () => client.cancel(a.accountId, orderId).success,
+          flatten: () => client.flatten(a.accountId, a.contractId),
+          note: (text, data) => record({ kind: "note", text, accountId: a.accountId, contractId: a.contractId, orderId, tags: ["protection"], data }),
+        },
+        { contractId: a.contractId, side: a.side, orderId, before, targetRequested: !!a.takeProfitBracket },
+      );
+    } else if (res.success && a.stopLossBracket && opening && a.type !== "market") {
+      protection = pendingFill(!!a.takeProfitBracket);
+    }
+    if (protection) result = { ...result, protection };
+    // Nothing was opened: not an entry, so not success (the orderId stays for the record).
+    if (protection?.status === "not_filled") {
+      result = { ...result, success: false, errorCode: 2, errorName: PLACE_ERRORS[2], errorMessage: protection.message };
+    }
+    // The caller reads errorMessage on an error reply; an unverified flatten must say a position may be open.
+    if (protection?.status === "unknown") result.errorMessage = protection.message;
+
+    const request = { side: a.side, type: a.type, size: a.size, limitPrice: a.limitPrice, stopPrice: a.stopPrice, trailPrice: a.trailPrice, stopLossBracket: a.stopLossBracket, takeProfitBracket: a.takeProfitBracket };
+    await record({
+      kind: "order_placed",
+      text: a.rationale,
+      accountId: a.accountId,
+      contractId: a.contractId,
+      orderId: res.orderId ?? undefined,
+      data: { request, result, positionBefore: before.net, sizeBefore: before.size },
+    });
+    const isError = !result.success || protection?.status === "unknown";
+    return isError ? { ...json(result), isError: true } : json(result);
+  }
 
   // ── Session / config ────────────────────────────────────────────────
 
@@ -391,7 +505,11 @@ export function createServer(deps: Deps): McpServer {
       title: "Place order",
       description:
         "Submit an order. side: buy|sell. type: market | limit (needs limitPrice) | stop (needs stopPrice) | trailing_stop (needs trailPrice = absolute price level, NOT a distance) | join_bid | join_ask. " +
-        "Brackets (stopLossBracket/takeProfitBracket, in ticks from the fill) are supported (auto OCO). Market orders fill at once, at the replay moment, at the open of the 1-minute bar containing it plus slippage (a run with BACKTESTER_MARKET_FILL=next-bar: at the next bar's open). " +
+        `Brackets (stopLossBracket/takeProfitBracket) are distances in ticks (at least ${MIN_BRACKET_TICKS}); the server signs them by side. The replay account always takes them (auto OCO). ` +
+        "After a market entry with a stopLossBracket the server checks the fill and the stop leg; " +
+        "if it cannot, it closes the position (see `protection.status` in the result). " +
+        "Market orders fill at once, at the replay moment, at the open of the 1-minute bar containing it plus slippage (a run with BACKTESTER_MARKET_FILL=next-bar: at the next bar's open). " +
+        "Off-grid prices are rounded onto the tick grid away from the market (stops: sell down, buy up; limits: buy down, sell up) and reported in `snapped`. " +
         "Server guardrails may block the order. `rationale` is required and saved to the journal so you can learn from the outcome.",
       inputSchema: {
         accountId,
@@ -412,61 +530,12 @@ export function createServer(deps: Deps): McpServer {
       },
       annotations: write,
     },
-    async (a: {
-      accountId: number;
-      contractId: string;
-      side: "buy" | "sell";
-      type: (typeof PLACEABLE_ORDER_TYPES)[number];
-      size: number;
-      limitPrice?: number;
-      stopPrice?: number;
-      trailPrice?: number;
-      stopLossBracket?: { ticks: number; type: (typeof PLACEABLE_ORDER_TYPES)[number] };
-      takeProfitBracket?: { ticks: number; type: (typeof PLACEABLE_ORDER_TYPES)[number] };
-      customTag?: string;
-      rationale: string;
-    }) => {
+    async (a: PlaceArgs) => {
       try {
-        if (a.type === "limit" && a.limitPrice === undefined) throw new RiskError("limit orders require limitPrice.");
-        if (a.type === "stop" && a.stopPrice === undefined) throw new RiskError("stop orders require stopPrice.");
-        if (a.type === "trailing_stop" && a.trailPrice === undefined) throw new RiskError("trailing_stop orders require trailPrice.");
-
-        orderGuard(a.accountId);
-        assertSymbolAllowed(config, a.contractId);
-        assertOrderSize(config, a.size);
-
-        const { position: currentNet, exposure } = await exposureOf(a.accountId, a.contractId, a.side, a.size);
-
-        if (opensExposure(exposure) && !reducesAlone(exposure)) await addGuard(exposure, a.accountId);
-
-        const res = client.place({
-          accountId: a.accountId,
-          contractId: a.contractId,
-          type: ORDER_TYPES[a.type],
-          side: SIDES[a.side],
-          size: a.size,
-          limitPrice: a.limitPrice ?? null,
-          stopPrice: a.stopPrice ?? null,
-          trailPrice: a.trailPrice ?? null,
-          customTag: a.customTag ?? null,
-          stopLossBracket: a.stopLossBracket ? { ticks: a.stopLossBracket.ticks, type: ORDER_TYPES[a.stopLossBracket.type] } : null,
-          takeProfitBracket: a.takeProfitBracket ? { ticks: a.takeProfitBracket.ticks, type: ORDER_TYPES[a.takeProfitBracket.type] } : null,
-        });
-        const result = { orderId: res.orderId, ...outcome(res, PLACE_ERRORS) };
-        await journal.add({
-          kind: "order_placed",
-          text: a.rationale,
-          accountId: a.accountId,
-          contractId: a.contractId,
-          orderId: res.orderId ?? undefined,
-          data: { request: { side: a.side, type: a.type, size: a.size, limitPrice: a.limitPrice, stopPrice: a.stopPrice, trailPrice: a.trailPrice, stopLossBracket: a.stopLossBracket, takeProfitBracket: a.takeProfitBracket }, result, positionBefore: currentNet },
-        });
-        return res.success ? json(result) : { ...json(result), isError: true };
+        return await placeOrder(a);
       } catch (e) {
         if (e instanceof RiskError) {
-          await journal
-            .add({ kind: "order_blocked", text: `${e.message} | rationale: ${a.rationale}`, accountId: a.accountId, contractId: a.contractId })
-            .catch(() => {});
+          await record({ kind: "order_blocked", text: `${e.message} | rationale: ${a.rationale}`, accountId: a.accountId, contractId: a.contractId });
         }
         return failure(describeError(e));
       }
@@ -478,7 +547,8 @@ export function createServer(deps: Deps): McpServer {
     {
       title: "Modify order",
       description:
-        "Change size or price of a working order (e.g. move a stop to breakeven). trailPrice is an absolute price level; unlike place_order there is no max-distance check, so double-check it.",
+        "Change size or price of a working order (e.g. move a stop to breakeven). trailPrice is an absolute price level; unlike place_order there is no max-distance check, so double-check it. " +
+        "Off-grid limitPrice/stopPrice are rounded onto the tick grid by the working order's side, as in place_order (a stop-limit's limit rounds with its stop), and reported in `snapped`; trailPrice is passed through unchanged.",
       inputSchema: {
         accountId,
         orderId: z.number().int(),
@@ -492,10 +562,17 @@ export function createServer(deps: Deps): McpServer {
     },
     handler(async (a: { accountId: number; orderId: number; size?: number; limitPrice?: number; stopPrice?: number; trailPrice?: number; reason?: string }) => {
       orderGuard(a.accountId);
+      if (a.size !== undefined) assertOrderSize(config, a.size);
+      // No side or contract in the input: read the working order. If it cannot be read, the prices go
+      // unchanged (as projectx-mcp); a size increase then fails closed (noGrowth below), a cut is taken.
+      let lookupError: unknown = null;
+      const working = await openOrders(a.accountId).catch((e: unknown) => {
+        lookupError = e;
+        return [];
+      });
+      const o = working.find((x) => x.id === a.orderId);
       if (a.size !== undefined) {
-        assertOrderSize(config, a.size);
         // A bigger resting order is more exposure: the same position and daily loss checks as place_order.
-        const o = (await openOrders(a.accountId)).find((x) => x.id === a.orderId);
         if (o && !o.reduceOnly && a.size > (o.size as number)) {
           const side = o.side === SIDES.buy ? "buy" : "sell";
           const { exposure } = await exposureOf(a.accountId, o.contractId as string, side, a.size, a.orderId);
@@ -503,16 +580,35 @@ export function createServer(deps: Deps): McpServer {
           if (opensExposure(exposure) && !reducesAlone(exposure)) await addGuard(exposure, a.accountId);
         }
       }
+      const prices = { limitPrice: a.limitPrice, stopPrice: a.stopPrice, trailPrice: a.trailPrice };
+      let snap: ReturnType<typeof snapPrices> = { prices, snapped: {} };
+      const side = o?.side === SIDES.buy ? "buy" : o?.side === SIDES.sell ? "sell" : null;
+      // trailPrice is never rounded here (projectx-mcp: a working trailing stop may read it back as a distance).
+      if ((a.limitPrice !== undefined || a.stopPrice !== undefined) && side) {
+        const tick = specOf(o!.contractId as string)?.tickSize ?? null;
+        snap = snapPrices(prices, side, tick, { stopLimit: o!.type === ORDER_TYPES.stop_limit, fields: ["limitPrice", "stopPrice"] });
+      }
       const res = client.modify({
         accountId: a.accountId,
         orderId: a.orderId,
         size: a.size ?? null,
-        limitPrice: a.limitPrice ?? null,
-        stopPrice: a.stopPrice ?? null,
-        trailPrice: a.trailPrice ?? null,
+        limitPrice: snap.prices.limitPrice ?? null,
+        stopPrice: snap.prices.stopPrice ?? null,
+        trailPrice: snap.prices.trailPrice ?? null,
+        // Unread working orders: the exchange refuses a size increase and takes a cut (fail closed).
+        noGrowth: a.size !== undefined && lookupError !== null,
       });
-      if (a.reason) await journal.add({ kind: "note", text: `modify order ${a.orderId}: ${a.reason}`, accountId: a.accountId, orderId: a.orderId });
-      return outcome(res, ORDER_EDIT_ERRORS);
+      const snappedNote = Object.keys(snap.snapped).length ? ` (snapped to tick: ${JSON.stringify(snap.snapped)})` : "";
+      if (a.reason || snappedNote) {
+        await record({
+          kind: "note",
+          text: `modify order ${a.orderId}: ${a.reason ?? "price change"}${snappedNote}`,
+          accountId: a.accountId,
+          orderId: a.orderId,
+          ...(snappedNote ? { tags: ["tick-snap"], data: { snapped: snap.snapped } } : {}),
+        });
+      }
+      return { ...outcome(res, ORDER_EDIT_ERRORS), ...snappedField(snap.snapped) };
     }),
   );
 
@@ -535,16 +631,31 @@ export function createServer(deps: Deps): McpServer {
     {
       title: "Close position",
       description:
-        "Flatten the whole position in a contract at market. Does NOT cancel resting stop/target orders; check list_open_orders and cancel leftovers.",
+        "Flatten the whole position in a contract at market, then cancel every working order on that contract (stop/target legs and any other orders), then verify. " +
+        'status: "flat" (no position, no working orders), "still_open" (the position is still there or could not be read; its orders are left in place so it keeps its stop) or ' +
+        '"legs_left" (flat, but working orders remain or could not be read). The last two are errors: check list_open_positions and list_open_orders.',
       inputSchema: { accountId, contractId, reason: z.string().optional().describe("Why; saved to the journal.") },
       annotations: write,
     },
-    handler(async (a: { accountId: number; contractId: string; reason?: string }) => {
-      orderGuard(a.accountId);
-      const res = client.close(a.accountId, a.contractId, null);
-      await journal.add({ kind: "exit", text: a.reason ?? "close_position", accountId: a.accountId, contractId: a.contractId, data: outcome(res, CLOSE_ERRORS) });
-      return outcome(res, CLOSE_ERRORS);
-    }),
+    async (a: { accountId: number; contractId: string; reason?: string }) => {
+      try {
+        orderGuard(a.accountId);
+        const fl = client.flatten(a.accountId, a.contractId);
+        const result = {
+          status: fl.status,
+          success: fl.status === "flat",
+          close: outcome(fl.close as Outcome, CLOSE_ERRORS),
+          positionNet: fl.positionNet,
+          positionSize: fl.positionSize,
+          cancelledOrderIds: fl.cancelledOrderIds,
+          remainingOrderIds: fl.remainingOrderIds,
+        };
+        await record({ kind: "exit", text: a.reason ?? "close_position", accountId: a.accountId, contractId: a.contractId, data: result });
+        return fl.status === "flat" ? json(result) : { ...json(result), isError: true };
+      } catch (e) {
+        return failure(describeError(e));
+      }
+    },
   );
 
   server.registerTool(
@@ -558,7 +669,7 @@ export function createServer(deps: Deps): McpServer {
     handler(async (a: { accountId: number; contractId: string; size: number; reason?: string }) => {
       orderGuard(a.accountId);
       const res = client.close(a.accountId, a.contractId, a.size);
-      await journal.add({ kind: "exit", text: a.reason ?? `partial close ${a.size}`, accountId: a.accountId, contractId: a.contractId, data: outcome(res, CLOSE_ERRORS) });
+      await record({ kind: "exit", text: a.reason ?? `partial close ${a.size}`, accountId: a.accountId, contractId: a.contractId, data: outcome(res, CLOSE_ERRORS) });
       return outcome(res, CLOSE_ERRORS);
     }),
   );

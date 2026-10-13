@@ -31,7 +31,8 @@ import {
 } from "./fills.js";
 import { roundTrips, type FillInfo, type RoundTrip } from "./metrics.js";
 import type { Trade } from "./performance.js";
-import { realizedNet, tradingDayStart } from "./risk.js";
+import type { FlattenResult } from "./protect.js";
+import { RiskError, realizedNet, tradingDayStart } from "./risk.js";
 
 /**
  * The replay exchange: this server's stand-in for the broker API that
@@ -212,6 +213,11 @@ export interface ModifyRequest {
   limitPrice: number | null;
   stopPrice: number | null;
   trailPrice: number | null;
+  /**
+   * The server could not read the working orders to check a size change against its limits: a
+   * size increase is refused here (fail closed), a cut is taken (it only reduces risk).
+   */
+  noGrowth?: boolean;
 }
 
 export interface BarsRequest {
@@ -881,9 +887,14 @@ export class ReplayExchange {
     return n ? s.c[n - 1] : null;
   }
 
-  place(req: PlaceRequest): Outcome & { orderId: number | null } {
+  /**
+   * Place an order. `customTag` is the caller's, or one generated as projectx-mcp does when none is
+   * given (`bt-<run>-<order id>`: deterministic, unlike projectx-mcp's random `pxm-` tags). A refused
+   * order gets no generated tag (the caller's, or null), so a generated tag is never handed out twice.
+   */
+  place(req: PlaceRequest): Outcome & { orderId: number | null; customTag: string | null } {
     return this.tx((state, now) => {
-      const no = (code: number, msg: string) => ({ orderId: null, ...refuse(code, msg) });
+      const no = (code: number, msg: string) => ({ orderId: null, customTag: req.customTag, ...refuse(code, msg) });
       if (req.accountId !== state.accountId) return no(1, `Account ${req.accountId} not found.`);
       const c = specOf(req.contractId);
       if (!c) return no(8, `Contract ${req.contractId} not found.`);
@@ -952,13 +963,31 @@ export class ReplayExchange {
         filledPrice: null,
         customTag: req.customTag,
       };
+      order.customTag ??= this.freeTag(state, order.id);
       if (stopPrice !== null) order.stopAt = [[t, stopPrice, state.nextTradeId]];
       state.orders.push(order);
       if (ended) this.fillAtEnd(state, req.contractId, c, s, now, order.id);
       else if (arrives) this.fillArrival(state, req.contractId, c, s, at, now, order.id);
       else if (req.type === ORDER_TYPES.market) this.fillNowIfDue(state, req.contractId, c, s, (next as { index: number }).index, now, order.id);
-      return { orderId: order.id, ...OK };
+      return { orderId: order.id, customTag: order.customTag, ...OK };
     }, [req.contractId]);
+  }
+
+  /** A generated customTag no order of the run uses yet. */
+  private freeTag(state: State, id: number): string {
+    const used = new Set(state.orders.map((o) => o.customTag));
+    let tag = `bt-${this.config.runId}-${id}`;
+    for (let k = 2; used.has(tag); k++) tag = `bt-${this.config.runId}-${id}-${k}`;
+    return tag;
+  }
+
+  /** One order as search_orders shows it, or null. */
+  order(accountId: number, orderId: number) {
+    return this.tx((state) => {
+      this.assertAccount(state, accountId);
+      const o = state.orders.find((x) => x.id === orderId);
+      return o ? this.orderView(o) : null;
+    });
   }
 
   modify(req: ModifyRequest): Outcome {
@@ -968,6 +997,9 @@ export class ReplayExchange {
       if (!o || o.status !== STATUS.open) return refuse(2, `No working order ${req.orderId}.`);
       const c = specOf(o.contractId) as ContractSpec;
       if (o.type === ORDER_TYPES.market) return refuse(3, "A market order waiting for the next bar can't be modified; cancel it instead.");
+      if (req.noGrowth && req.size !== null && req.size > o.size) {
+        throw new RiskError(`the working orders could not be read, so a size increase (${o.size} to ${req.size}) can't be checked against the position and daily loss limits. A size cut is taken.`);
+      }
       for (const [name, p] of [["limitPrice", req.limitPrice], ["stopPrice", req.stopPrice], ["trailPrice", req.trailPrice]] as const) {
         if (p !== null && !isOnTick(p, c.tickSize)) return refuse(3, `${name} ${p} is not a multiple of the tick size ${c.tickSize}.`);
       }
@@ -997,14 +1029,16 @@ export class ReplayExchange {
   }
 
   cancel(accountId: number, orderId: number): Outcome {
-    return this.tx((state, now) => {
-      if (accountId !== state.accountId) return refuse(1, `Account ${accountId} not found.`);
-      const o = state.orders.find((x) => x.id === orderId);
-      if (!o || o.status !== STATUS.open) return refuse(2, `No working order ${orderId}.`);
-      // A cancel takes effect at once, as at a live broker and the harness sim-broker's cancel().
-      Object.assign(o, { status: STATUS.cancelled, updatedAt: now.getTime(), cancelSeq: state.nextTradeId });
-      return OK;
-    });
+    return this.tx((state, now) => this.cancelIn(state, now, accountId, orderId));
+  }
+
+  private cancelIn(state: State, now: Date, accountId: number, orderId: number): Outcome {
+    if (accountId !== state.accountId) return refuse(1, `Account ${accountId} not found.`);
+    const o = state.orders.find((x) => x.id === orderId);
+    if (!o || o.status !== STATUS.open) return refuse(2, `No working order ${orderId}.`);
+    // A cancel takes effect at once, as at a live broker and the harness sim-broker's cancel().
+    Object.assign(o, { status: STATUS.cancelled, updatedAt: now.getTime(), cancelSeq: state.nextTradeId });
+    return OK;
   }
 
   /**
@@ -1012,76 +1046,116 @@ export class ReplayExchange {
    * open of the bar containing the moment (marketFill "now"), else at the next bar's open.
    */
   close(accountId: number, contractId: string, size: number | null): Outcome {
+    return this.tx((state, now) => this.closeIn(state, now, accountId, contractId, size), [contractId]);
+  }
+
+  /**
+   * close_position, as projectx-mcp's flatten: close the whole position at market, then, once the
+   * contract is flat, cancel every working order on it (bracket legs, stops and targets the client
+   * placed, resting entries, a waiting close), and verify. While the position is still open (the
+   * close waits for the next bar, or was refused) its orders stay, so it keeps its stop. One
+   * transaction: the replay state is final, so nothing is polled.
+   */
+  flatten(accountId: number, contractId: string): FlattenResult {
     return this.tx((state, now) => {
-      if (accountId !== state.accountId) return refuse(1, `Account ${accountId} not found.`);
-      const c = specOf(contractId);
-      if (!c) return refuse(3, `Contract ${contractId} not found.`);
-      if (!this.store.has(c.dataRoot)) return refuse(4, `No data for ${c.root}.`);
-      const held = state.positions[contractId]?.net ?? 0;
-      const s = this.store.get(c.dataRoot);
-      const ended = this.ended(now, s);
-      const next = ended ? { index: -1 } : this.nextBar(s, now);
-      const at = ended ? -1 : this.arrivalBar(s, now);
-      const closes = state.orders.filter((o) => o.contractId === contractId && o.status === STATUS.open && o.role === "close");
-      const flat = closes.filter((o) => o.flatten).at(-1);
-      // With a close_position waiting, what is left to close is what the client sent after it.
-      const after = (o: StoredOrder) => !flat || o.id > flat.id;
-      const later = flat
-        ? state.orders.filter((o) => o.contractId === contractId && o.status === STATUS.open && o.role === "order" && o.type === ORDER_TYPES.market && after(o))
-        : [];
-      const ref = flat ? later.reduce((n, o) => n + sideSign(o.side) * o.size, 0) : held;
-      if (size === null) {
-        // The same request again is a no-op only with no market order sent since; any later one (even
-        // if they net to zero: one may be rejected at fill) moves the close after them.
-        if (flat && later.length === 0) return OK;
-        if (!flat && held === 0) return refuse(2, `No open position in ${contractId}.`);
-      } else {
-        if (ref === 0) {
-          return flat
-            ? refuse(7, "A close_position is already waiting for the next bar and nothing sent after it is left to close.")
-            : refuse(2, `No open position in ${contractId}.`);
-        }
-        if (size > Math.abs(ref)) return refuse(5, `Close size ${size} is larger than the position${flat ? " left after the waiting close_position" : ""} (${Math.abs(ref)}).`);
-        const waiting = closes.filter((o) => !o.flatten && after(o)).reduce((n, o) => n + o.size, 0);
-        if (waiting + size > Math.abs(ref)) return refuse(7, `Partial closes for ${waiting} are already waiting for the next bar; ${Math.abs(ref) - waiting} left to close.`);
+      const res = this.closeIn(state, now, accountId, contractId, null);
+      const close = { success: res.success, errorCode: res.errorCode, errorMessage: res.errorMessage };
+      if (accountId !== state.accountId) {
+        return { status: "still_open", close, positionNet: null, positionSize: null, cancelledOrderIds: [], failedCancelOrderIds: [], remainingOrderIds: null };
       }
-      // Refuse before touching anything: a refusal never drops the waiting close.
-      if ("reason" in next && at < 0) return refuse(6, `Order rejected: ${next.reason}.`);
-      // close_position is "flat after everything sent before it": with a client market order sent
-      // after the waiting close, the close moves to the end of the arrival order.
-      if (flat && size === null) Object.assign(flat, { status: STATUS.cancelled, updatedAt: now.getTime() });
-      const qty = size ?? Math.abs(ref);
-      const side: Side = ref > 0 ? 1 : 0;
-      const t = now.getTime();
-      const id = state.nextOrderId++;
-      state.orders.push({
-        id,
-        accountId,
-        contractId,
-        side,
-        type: ORDER_TYPES.market,
-        size: qty,
-        limitPrice: null,
-        stopPrice: null,
-        trailDistance: null,
-        status: STATUS.open,
-        placedAt: t,
-        activeFrom: t,
-        updatedAt: t,
-        role: "close",
-        flatten: size === null,
-        parentId: null,
-        stopLossBracket: null,
-        takeProfitBracket: null,
-        fillVolume: 0,
-        filledPrice: null,
-        customTag: null,
-      });
-      if (ended) this.fillAtEnd(state, contractId, c, s, now, id);
-      else if (at >= 0) this.fillArrival(state, contractId, c, s, at, now, id);
-      else this.fillNowIfDue(state, contractId, c, s, (next as { index: number }).index, now, id);
-      return OK;
+      const net = () => state.positions[contractId]?.net ?? 0;
+      const working = () => state.orders.filter((o) => o.contractId === contractId && o.status === STATUS.open);
+      if (net() !== 0) {
+        // The close waits for the next bar: when it fills and leaves the contract flat, it cancels the
+        // orders working now, as projectx-mcp's flatten cancels them once it sees the position flat.
+        const waiting = state.orders.filter((o) => o.contractId === contractId && o.status === STATUS.open && o.role === "close" && o.flatten).at(-1);
+        if (waiting) waiting.cancelOnFlat = working().filter((o) => o.id !== waiting.id).map((o) => o.id);
+        return { status: "still_open", close, positionNet: net(), positionSize: Math.abs(net()), cancelledOrderIds: [], failedCancelOrderIds: [], remainingOrderIds: null };
+      }
+      const legs = working().map((o) => o.id);
+      const cancelledOrderIds = legs.filter((id) => this.cancelIn(state, now, accountId, id).success);
+      const remainingOrderIds = working().map((o) => o.id);
+      return {
+        status: remainingOrderIds.length ? "legs_left" : "flat",
+        close,
+        positionNet: net(),
+        positionSize: Math.abs(net()),
+        cancelledOrderIds,
+        failedCancelOrderIds: legs.filter((id) => !cancelledOrderIds.includes(id)),
+        remainingOrderIds,
+      };
     }, [contractId]);
+  }
+
+  private closeIn(state: State, now: Date, accountId: number, contractId: string, size: number | null): Outcome {
+    if (accountId !== state.accountId) return refuse(1, `Account ${accountId} not found.`);
+    const c = specOf(contractId);
+    if (!c) return refuse(3, `Contract ${contractId} not found.`);
+    if (!this.store.has(c.dataRoot)) return refuse(4, `No data for ${c.root}.`);
+    const held = state.positions[contractId]?.net ?? 0;
+    const s = this.store.get(c.dataRoot);
+    const ended = this.ended(now, s);
+    const next = ended ? { index: -1 } : this.nextBar(s, now);
+    const at = ended ? -1 : this.arrivalBar(s, now);
+    const closes = state.orders.filter((o) => o.contractId === contractId && o.status === STATUS.open && o.role === "close");
+    const flat = closes.filter((o) => o.flatten).at(-1);
+    // With a close_position waiting, what is left to close is what the client sent after it.
+    const after = (o: StoredOrder) => !flat || o.id > flat.id;
+    const later = flat
+      ? state.orders.filter((o) => o.contractId === contractId && o.status === STATUS.open && o.role === "order" && o.type === ORDER_TYPES.market && after(o))
+      : [];
+    const ref = flat ? later.reduce((n, o) => n + sideSign(o.side) * o.size, 0) : held;
+    if (size === null) {
+      // The same request again is a no-op only with no market order sent since; any later one (even
+      // if they net to zero: one may be rejected at fill) moves the close after them.
+      if (flat && later.length === 0) return OK;
+      if (!flat && held === 0) return refuse(2, `No open position in ${contractId}.`);
+    } else {
+      if (ref === 0) {
+        return flat
+          ? refuse(7, "A close_position is already waiting for the next bar and nothing sent after it is left to close.")
+          : refuse(2, `No open position in ${contractId}.`);
+      }
+      if (size > Math.abs(ref)) return refuse(5, `Close size ${size} is larger than the position${flat ? " left after the waiting close_position" : ""} (${Math.abs(ref)}).`);
+      const waiting = closes.filter((o) => !o.flatten && after(o)).reduce((n, o) => n + o.size, 0);
+      if (waiting + size > Math.abs(ref)) return refuse(7, `Partial closes for ${waiting} are already waiting for the next bar; ${Math.abs(ref) - waiting} left to close.`);
+    }
+    // Refuse before touching anything: a refusal never drops the waiting close.
+    if ("reason" in next && at < 0) return refuse(6, `Order rejected: ${next.reason}.`);
+    // close_position is "flat after everything sent before it": with a client market order sent
+    // after the waiting close, the close moves to the end of the arrival order.
+    if (flat && size === null) Object.assign(flat, { status: STATUS.cancelled, updatedAt: now.getTime() });
+    const qty = size ?? Math.abs(ref);
+    const side: Side = ref > 0 ? 1 : 0;
+    const t = now.getTime();
+    const id = state.nextOrderId++;
+    state.orders.push({
+      id,
+      accountId,
+      contractId,
+      side,
+      type: ORDER_TYPES.market,
+      size: qty,
+      limitPrice: null,
+      stopPrice: null,
+      trailDistance: null,
+      status: STATUS.open,
+      placedAt: t,
+      activeFrom: t,
+      updatedAt: t,
+      role: "close",
+      flatten: size === null,
+      parentId: null,
+      stopLossBracket: null,
+      takeProfitBracket: null,
+      fillVolume: 0,
+      filledPrice: null,
+      customTag: null,
+    });
+    if (ended) this.fillAtEnd(state, contractId, c, s, now, id);
+    else if (at >= 0) this.fillArrival(state, contractId, c, s, at, now, id);
+    else this.fillNowIfDue(state, contractId, c, s, (next as { index: number }).index, now, id);
+    return OK;
   }
 
   /** The id of a close_position waiting on the contract (it will leave it flat), or null. */
