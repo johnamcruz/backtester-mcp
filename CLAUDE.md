@@ -37,6 +37,14 @@ the ProjectX REST client.
   one bar, ported from the harness simulated broker with citations
   (`sim-broker.js#<function>`). The parity target.
 - `src/bars.ts`: CSV loading and aggregation of one-minute bars.
+- The derived store (raw contract-month bars for NQ/MNQ from the local L1/L2 order-book
+  parquet; README "Local order-book data"): `src/calendar.ts` (ET days, Globex hours, the
+  quarterly roll rule), `src/parquet.ts` (hyparquet + node:zlib zstd, one row group at a
+  time), `src/events.ts` (normalized trades, quotes, L2 changes; bars from trades),
+  `src/rolltable.ts` + `src/rolltable-nq.ts` (the reviewed roll table: the only source of contract assignment; derived with `scripts/derive-roll-table.ts`), `src/store.ts` (layout, reader, events),
+  `src/storebuild.ts` and the CLI `src/build-store.ts` (`npm run build-store`). Where the
+  store covers the clock, NQ/MNQ contracts are `BT.<ROOT>.<code>` (e.g. `BT.MNQ.M24`);
+  elsewhere the CSV series `BT.<ROOT>`.
 - `src/metrics.ts`: trade metrics, pure: round trips (position episodes) from
   one contract's fills and bars, with MAE/MFE, R, bars held and exit reason,
   matching the harness backtester's `engine.js#closeTrade` fields (`r`,
@@ -57,7 +65,8 @@ the ProjectX REST client.
   `parity.test.ts` pins the order tools' results (fields, types, statuses, messages,
   error codes) against copies of projectx-mcp's, `harness-parity.test.ts` an optional dev check against the harness (skipped
   without `FTH_HARNESS_DIR`); `helpers.ts` writes tiny synthetic CSVs into
-  temp folders.
+  temp folders, `orderbook.ts` and `storefixture.ts` tiny synthetic order-book
+  parquet and a store built from it.
 
 ## Commands
 
@@ -73,7 +82,7 @@ BACKTESTER_DATA_DIR=<data> BACKTESTER_NOW=2024-03-05T15:00:00Z BACKTESTER_STATE_
 
 ## Hard rules
 
-- **Code only.** Never commit market data (CSV, parquet, manifests), run state,
+- **Code only.** Never commit market data (CSV, parquet, manifests, the derived store), run state,
   journals or clock files; `.gitignore` covers them. Tests generate tiny
   synthetic data in temp folders. Real data stays outside the repo and is
   reached through `BACKTESTER_DATA_DIR` (a local `.env`).

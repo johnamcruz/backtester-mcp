@@ -2,8 +2,12 @@ import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
 export interface Config {
-  /** Folder of `<ROOT>_1min.csv` files (local only; never in the repo). */
+  /** Folder of `<ROOT>_1min.csv` files and the derived store `derived/` (local only; never in the repo). */
   dataDir: string;
+  /** Serve contract months from the derived store where it covers the clock (BACKTESTER_STORE, default on). */
+  useStore: boolean;
+  /** The order-book parquet folder (l1/, l2/) the store's events are read from; default: the one it was built from. */
+  orderbookDir: string | null;
   /** JSON file `{ "now": "<ISO>" }` the replay driver writes; re-read on every call. */
   clockFile: string | null;
   /** Fixed replay time when there is no clock file (BACKTESTER_NOW). */
@@ -108,8 +112,13 @@ export function loadConfig(env: Env = process.env): Config {
   if (!Number.isInteger(accountId)) throw new Error("BACKTESTER_ACCOUNT_ID must be an integer.");
   const startBalance = num(env, "BACKTESTER_START_BALANCE", 100000);
   if (startBalance <= 0) throw new Error("BACKTESTER_START_BALANCE must be positive.");
+  const store = env.BACKTESTER_STORE?.trim().toLowerCase() || "on";
+  if (store !== "on" && store !== "off") throw new Error(`BACKTESTER_STORE must be "on" or "off", got "${env.BACKTESTER_STORE}"`);
+  const orderbookDir = env.BACKTESTER_ORDERBOOK_DIR?.trim();
   return {
     dataDir: abs(expandHome(dataDir)),
+    useStore: store === "on",
+    orderbookDir: orderbookDir ? abs(expandHome(orderbookDir)) : null,
     clockFile: clockFile ? abs(expandHome(clockFile)) : null,
     fixedNow,
     start,
@@ -158,5 +167,6 @@ export function publicConfig(c: Config) {
     slippageTicks: c.slippageTicks,
     feesPerSide: { micro: c.feesMicro, mini: c.feesMini },
     marketFill: c.marketFill,
+    store: c.useStore ? "on" : "off",
   };
 }

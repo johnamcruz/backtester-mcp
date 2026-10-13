@@ -2,10 +2,10 @@ import type { Config } from "./config.js";
 
 export class RiskError extends Error {}
 
-/** "BT.MNQ" -> "MNQ" (this server's contract ids). Falls back to the whole id if the shape is unexpected. */
+/** "BT.MNQ" or "BT.MNQ.M24" -> "MNQ" (this server's contract ids). Falls back to the whole id if the shape is unexpected. */
 export function symbolRoot(contractId: string): string {
   const parts = contractId.split(".");
-  return (parts.length === 2 && parts[0] === "BT" ? parts[1] : contractId).toUpperCase();
+  return ((parts.length === 2 || parts.length === 3) && parts[0] === "BT" ? parts[1] : contractId).toUpperCase();
 }
 
 const CHICAGO = new Intl.DateTimeFormat("en-US", {

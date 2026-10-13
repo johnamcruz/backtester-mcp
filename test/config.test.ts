@@ -53,4 +53,11 @@ describe("config", () => {
     expect(() => loadConfig({ ...base, BACKTESTER_ACCOUNT_ID: "1.5" })).toThrow(/integer/);
     expect(() => loadConfig({ ...base, BACKTESTER_START_BALANCE: "0" })).toThrow(/positive/);
   });
+
+  it("turns the derived store on by default, off on request, and takes the order-book folder", () => {
+    expect(loadConfig(base)).toMatchObject({ useStore: true, orderbookDir: null });
+    expect(publicConfig(loadConfig(base)).store).toBe("on");
+    expect(loadConfig({ ...base, BACKTESTER_STORE: "OFF", BACKTESTER_ORDERBOOK_DIR: "/ob" })).toMatchObject({ useStore: false, orderbookDir: "/ob" });
+    expect(() => loadConfig({ ...base, BACKTESTER_STORE: "maybe" })).toThrow(/BACKTESTER_STORE must be "on" or "off"/);
+  });
 });
