@@ -219,7 +219,10 @@ describe("place_order", () => {
     const { call, journal } = await setup();
     const res = await call("place_order", { ...order, stopLossBracket: { ticks: 20, type: "stop" }, takeProfitBracket: { ticks: 40, type: "limit" }, customTag: "fth-1" });
     expect(res.isError).toBe(false);
-    expect(res.data).toEqual({ orderId: 1, success: true, errorCode: 0, errorName: "Success", errorMessage: null });
+    expect(res.data).toEqual({
+      orderId: 1, customTag: "fth-1", success: true, errorCode: 0, errorName: "Success", errorMessage: null,
+      protection: { status: "protected", stopOrderId: 2, filledSize: 1, fillPrice: 20000.25, targetPlaced: true, message: "The entry filled and its stop is working." },
+    });
     const [entry] = await journal.read({ kind: "order_placed" });
     expect(entry).toMatchObject({ ts: iso(T0), text: RATIONALE, orderId: 1, contractId: "BT.MNQ", data: { result: { success: true }, positionBefore: 0 } });
     expect((await call("list_open_orders", { accountId: 1 })).data.map((o: any) => [o.typeName, o.stopPrice ?? o.limitPrice])).toEqual([["stop", 19995.25], ["limit", 20010.25]]);
@@ -409,7 +412,8 @@ describe("order management tools", () => {
 
   it("close and partial close journal the exit", async () => {
     const { call, journal } = await setup();
-    expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ", reason: "target hit" })).data).toMatchObject({ success: false, errorName: "PositionNotFound" });
+    // Already flat: the close is refused, the contract is verified flat, so the call succeeds (projectx-mcp's flatten).
+    expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ", reason: "target hit" })).data).toMatchObject({ status: "flat", success: true, close: { success: false, errorName: "PositionNotFound" } });
     await call("place_order", order);
     expect((await call("partial_close_position", { accountId: 1, contractId: "BT.MNQ", size: 3 })).data.errorName).toBe("InvalidCloseSize");
     expect((await call("close_position", { accountId: 1, contractId: "BT.MNQ" })).data.success).toBe(true);

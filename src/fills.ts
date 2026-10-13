@@ -83,6 +83,11 @@ export interface SimOrder {
   customTag: string | null;
   /** close_position: flattens whatever the position is when it fills (side and size set then). */
   flatten?: boolean;
+  /**
+   * close_position that answered `still_open` (it waits for the next bar): the orders working when it
+   * was sent, cancelled when it fills and leaves the contract flat (projectx-mcp's post-flat cancel).
+   */
+  cancelOnFlat?: number[];
   /** Why the broker rejected it at fill time (status rejected). */
   rejectReason?: string | null;
 }
@@ -305,6 +310,12 @@ function newLeg(parent: SimOrder, leg: "sl" | "tp", spec: BracketSpec, fill: num
 
 const cancel = (o: SimOrder, time: number) => Object.assign(o, { status: STATUS.cancelled, updatedAt: time });
 
+/** A close_position that answered still_open: cancel the orders it recorded, once the contract is flat. */
+function cancelOnFlat(book: Book, o: SimOrder, time: number): void {
+  if (!o.cancelOnFlat) return;
+  for (const s of book.orders) if (o.cancelOnFlat.includes(s.id) && s.status === STATUS.open) cancel(s, time);
+}
+
 /**
  * Fill an order (whole size; a bracket leg only as far as it reduces the
  * position), then: create the entry's bracket legs, cancel a filled leg's
@@ -327,6 +338,8 @@ export function fillOrder(book: Book, o: SimOrder, price: number, time: number, 
     const reduces = pos.net !== 0 && Math.sign(pos.net) !== sideSign(o.side);
     if (!reduces) {
       cancel(o, time);
+      // A waiting close_position whose position something else flattened first still does its post-flat cancel.
+      if (pos.net === 0) cancelOnFlat(book, o, time);
       return { fill: null, legs: [] };
     }
     size = Math.min(size, Math.abs(pos.net));
@@ -345,6 +358,7 @@ export function fillOrder(book: Book, o: SimOrder, price: number, time: number, 
   if (pos.net === 0 || Math.sign(pos.net) !== Math.sign(before)) {
     for (const s of book.orders) if ((s.role === "sl" || s.role === "tp") && s.status === STATUS.open) cancel(s, time);
   }
+  if (pos.net === 0) cancelOnFlat(book, o, time);
   // Brackets protect what the fill opened: none for a fill that only reduced the position (its legs
   // would sit on the wrong side), and only the part beyond flat for one that went through it.
   const legs: SimOrder[] = [];
