@@ -2,6 +2,7 @@ import { closeSync, existsSync, mkdirSync, openSync, statSync, unlinkSync, write
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { addDays, etDate, etDayBounds, globexRanges, isFullHoliday, weekday, type EtDate } from "./calendar.js";
 import { EMPTY_QUOTE, keepRow, minuteBars, minuteIndex, normalizeL1, type QuoteState } from "./events.js";
+import { buildFlowDays, flowSummary } from "./flowstore.js";
 import { ParquetFile } from "./parquet.js";
 import { scheduleOf, type RollSchedule } from "./rolltable.js";
 import {
@@ -43,6 +44,8 @@ export interface BuildOptions {
   root?: string;
   /** Progress lines (stderr in the CLI). */
   log?: (line: string) => void;
+  /** Build the order flow too (flowstore.ts; default true). */
+  flow?: boolean;
 }
 
 export interface BuildSummary {
@@ -50,6 +53,9 @@ export interface BuildSummary {
   missingMonths: string[];
   built: EtDate[];
   skipped: EtDate[];
+  /** Days whose order flow was built / was already current. */
+  flowBuilt: EtDate[];
+  flowSkipped: EtDate[];
   rows: number;
   seconds: number;
   manifest: Manifest;
@@ -153,6 +159,8 @@ async function build(o: BuildOptions, root: string, source: string, months: stri
     }
   }
   const doneMonths: string[] = [];
+  const flowBuilt: EtDate[] = [];
+  const flowSkipped: EtDate[] = [];
 
   for (const month of months) {
     const l1Name = `l1/${month}.parquet`;
@@ -252,6 +260,13 @@ async function build(o: BuildOptions, root: string, source: string, months: stri
       existing.set(date, day);
       built.push(date);
     }
+    if (o.flow !== false) {
+      const prefix = `${month.slice(0, 4)}-${month.slice(4)}`;
+      const f = await buildFlowDays({ source, dataDir: o.dataDir, root, days: [...existing.values()].filter((d) => d.date.startsWith(prefix)), schedule, log });
+      flowBuilt.push(...f.built);
+      flowSkipped.push(...f.skipped);
+      rows += f.rows;
+    }
     doneMonths.push(month);
   }
 
@@ -270,9 +285,10 @@ async function build(o: BuildOptions, root: string, source: string, months: stri
   log(
     `done: ${built.length} days built, ${skipped.length} up to date, ${rows} rows read in ${seconds.toFixed(1)} s` +
       (seconds > 0 && rows ? ` (${Math.round(rows / seconds)} rows/s)` : "") +
-      `; gaps L1 ${manifest.gaps.l1.length}, L2 ${manifest.gaps.l2.length}; ${manifest.dropped.length} day files left out`,
+      `; gaps L1 ${manifest.gaps.l1.length}, L2 ${manifest.gaps.l2.length}; ${manifest.dropped.length} day files left out` +
+      `; order flow: ${flowBuilt.length} days built, ${flowSkipped.length} up to date, ${manifest.flow?.days.length ?? 0} current in the store`,
   );
-  return { months: doneMonths, missingMonths, built, skipped, rows, seconds, manifest };
+  return { months: doneMonths, missingMonths, built, skipped, flowBuilt, flowSkipped, rows, seconds, manifest };
 }
 
 function countKept(ts: Float64Array, ranges: Array<[number, number]>): number {
@@ -373,6 +389,7 @@ export function buildManifest(
       }
     }
   }
+  const flow = flowSummary(dataDir, root, days, schedule);
   return {
     format: STORE_FORMAT,
     root,
@@ -384,6 +401,7 @@ export function buildManifest(
     rollTable: { ...schedule.table, hash: schedule.hash },
     dropped,
     contracts,
+    ...(flow.days.length ? { flow } : {}),
   };
 }
 

@@ -89,6 +89,14 @@ describe("the reviewed NQ roll table", () => {
     expect(NQ_SCHEDULE.switchesBetween(Z("2025-11-25T00:00:00Z"), Z("2026-01-01T00:00:00Z"))).toEqual([]);
   });
 
+  it("tells the exception stretches (half-open)", () => {
+    expect(NQ_SCHEDULE.inException(Date.parse("2023-12-06T05:00:00Z"))).toBe(true);
+    expect(NQ_SCHEDULE.inException(Date.parse("2023-12-07T04:59:00Z"))).toBe(true);
+    expect(NQ_SCHEDULE.inException(Date.parse("2023-12-07T05:00:00Z"))).toBe(false);
+    expect(NQ_SCHEDULE.inException(Date.parse("2025-02-09T23:00:00Z"))).toBe(true);
+    expect(NQ_SCHEDULE.inException(Date.parse("2024-03-05T15:00:00Z"))).toBe(false);
+  });
+
   it("hashes the table, and only NQ has one", () => {
     expect(NQ_SCHEDULE.hash).toMatch(/^[0-9a-f]{64}$/);
     expect(new RollSchedule(NQ_TABLE).hash).toBe(NQ_SCHEDULE.hash);
