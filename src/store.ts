@@ -7,6 +7,7 @@ import { etDate, type EtDate } from "./calendar.js";
 import { EMPTY_QUOTE, normalizeL1, normalizeL2, type DepthEvent, type MinuteBars, type QuoteEvent, type QuoteState, type TradeEvent } from "./events.js";
 import { ParquetFile } from "./parquet.js";
 import { FLOW_FORMAT, flowRecords, readFlowDay, type FlowDay, type FlowSummary } from "./flowstore.js";
+import { quarantineHashOf, type Conflict, type MinuteRun, type Outside, type Quarantined } from "./dayassign.js";
 import type { MinuteRecord } from "./orderflow.js";
 import { scheduleOf, type RollSchedule, type RollTable } from "./rolltable.js";
 
@@ -18,6 +19,7 @@ import { scheduleOf, type RollSchedule, type RollTable } from "./rolltable.js";
  *   derived/<ROOT>/manifest.json          what was built: months, days, gaps, the roll table, contracts
  *   derived/<ROOT>/days/YYYY-MM-DD.json.gz one ET day: its bars, event index, quote states
  *   derived/<ROOT>/flow/YYYY-MM-DD.json.gz one ET day's order flow per minute (flowstore.ts)
+ *   derived/<ROOT>/assign/YYYYMM.json      one month's day assignment report (dayassign.ts), for the manifest
  *
  * Which contract a bar belongs to comes only from the reviewed roll table
  * (rolltable.ts), applied to each minute.
@@ -79,8 +81,19 @@ export interface Manifest {
   /** Months asked for with no L1 file. */
   missingMonths: string[];
   days: Record<EtDate, DaySummary>;
-  /** Weekdays of built months without L1 trades / without L2 rows (full holidays listed apart). */
-  gaps: { l1: EtDate[]; l2: EtDate[]; holidays: EtDate[] };
+  /**
+   * Weekdays of built months without L1 trades / without L2 rows (full holidays listed apart), and
+   * `minutes`: runs of the minutes the market was expected to trade (calendar.ts#expectedRanges: Globex
+   * hours and the reviewed CME holiday calendar) without a single L1 row, oldest first.
+   */
+  gaps: { l1: EtDate[]; l2: EtDate[]; holidays: EtDate[]; minutes: MinuteRun[] };
+  /**
+   * How source row groups were assigned to ET days (dayassign.ts): every date two row groups had rows on
+   * (the one kept, the others' rows there left out), every row group with more than 1% of its rows outside
+   * its own day, the quarantined row groups left out (quarantine-nq.ts, with its hash), and built months
+   * without an assignment report (built before reports existed: rebuild them).
+   */
+  assignment: { conflicts: Conflict[]; outside: Outside[]; quarantined: Quarantined[]; quarantineHash: string; unchecked: string[] };
   /** The roll table the bars are assigned by, with its hash (runs pin it). */
   rollTable: RollTable & { hash: string };
   /** Day files left out: unreadable, or built from a source file that has changed or is gone since. */
@@ -94,6 +107,13 @@ export interface Manifest {
 export const storeDir = (dataDir: string, root: string) => join(dataDir, "derived", root);
 export const manifestPath = (dataDir: string, root: string) => join(storeDir(dataDir, root), "manifest.json");
 export const dayPath = (dataDir: string, root: string, date: EtDate) => join(storeDir(dataDir, root), "days", `${date}.json.gz`);
+export const assignPath = (dataDir: string, root: string, month: string) => join(storeDir(dataDir, root), "assign", `${month}.json`);
+/** Present while build-store rewrites the store (written first, removed after the new manifest): the store isn't used then. */
+export const buildingPath = (dataDir: string, root: string) => join(storeDir(dataDir, root), "building.json");
+
+/** How to rebuild a refused store. */
+export const REBUILD_HINT =
+  "Rebuild it over all its months: npm run build-store -- --from <first YYYYMM> --to <last YYYYMM> (unchanged days are skipped); or set BACKTESTER_STORE=off to use the CSV series on purpose.";
 
 /** Write via a temp file and rename, so a reader never sees half a file. */
 export function writeAtomic(path: string, data: string | Buffer): void {
@@ -155,6 +175,7 @@ export interface DayEvents {
  */
 export class DerivedStore {
   private readonly manifests = new Map<string, Manifest | null>();
+  private readonly refusals = new Map<string, string | null>();
   private readonly hashes = new Map<string, string | null>();
   private readonly series = new Map<string, BarSeries>();
   private readonly flowDays = new Map<string, FlowDay | null>();
@@ -166,24 +187,47 @@ export class DerivedStore {
   ) {}
 
   /**
-   * The root's manifest, read once. A store built with another roll table than
-   * this code's is not used (its contract index would be wrong): rebuild it.
+   * The root's manifest, read once; null when there is no store, or when the store
+   * is refused (`refusal` says why): a build is running or was interrupted, it is
+   * of another store format, built with another roll table (its contract
+   * index would be wrong) or another quarantine table (it could serve mistimed
+   * rows), or some of its months weren't assigned by the current day assignment.
    */
   manifest(root: string): Manifest | null {
     if (!this.manifests.has(root)) {
       const p = manifestPath(this.dataDir, root);
       const text = existsSync(p) ? readFileSync(p, "utf8") : null;
-      let m = text === null ? null : (JSON.parse(text) as Manifest);
-      if (m && m.format !== STORE_FORMAT) m = null;
+      let m: Manifest | null = null;
+      let refused: string | null = null;
+      try {
+        m = text === null ? null : (JSON.parse(text) as Manifest);
+      } catch {
+        refused = "manifest unreadable";
+      }
       const schedule = scheduleOf(root);
-      if (m && (!schedule || m.rollTable?.hash !== schedule.hash)) {
-        process.stderr.write(`[backtester-mcp] ${p} was built with another roll table: not used (rerun build-store)\n`);
+      if (existsSync(buildingPath(this.dataDir, root))) refused = "a build-store run is in progress or was interrupted";
+      else if (!m) {
+        // No store, or an unreadable manifest (refused above).
+      } else if (m.format !== STORE_FORMAT) refused = `store format ${m.format}, not ${STORE_FORMAT}`;
+      else if (!schedule || m.rollTable?.hash !== schedule.hash) refused = "built with another roll table";
+      else if (!m.assignment) refused = "built before day assignment (no assignment in manifest)";
+      else if (m.assignment.quarantineHash !== quarantineHashOf(root)) refused = "built with another quarantine table";
+      else if (m.assignment.unchecked.length) refused = `months ${m.assignment.unchecked.join(", ")} not assigned by the current day assignment`;
+      if (refused) {
+        process.stderr.write(`[backtester-mcp] the derived store ${storeDir(this.dataDir, root)} is not used: ${refused}. ${REBUILD_HINT}\n`);
         m = null;
       }
+      this.refusals.set(root, refused);
       this.manifests.set(root, m);
       this.hashes.set(root, m && text ? createHash("sha256").update(text).digest("hex") : null);
     }
     return this.manifests.get(root) ?? null;
+  }
+
+  /** Why the root's store exists but isn't used, or null (no store, or a usable one). */
+  refusal(root: string): string | null {
+    this.manifest(root);
+    return this.refusals.get(root) ?? null;
   }
 
   /** The sha256 of the root's manifest file as read (runs pin it), or null without a usable one. */

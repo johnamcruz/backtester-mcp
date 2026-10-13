@@ -41,7 +41,9 @@ describe("get_bars order flow", () => {
       windows: { "2": { ofiTrade: null, delta: null }, "3": { ofiTrade: null, delta: null } },
     });
     expect(mnq.bars[1].flow).toMatchObject({ bv: 1, sv: 0, delta: 1, complete: true, windows: { "2": { ofiTrade: 0.5, delta: 2 }, "3": { ofiTrade: null, delta: null } } });
-    expect(mnq.orderFlow).toMatchObject({ sourceContractId: "BT.NQ.H24", largePrint: 10, windows: [2, 3], coverage: { source: "history", inferredSide: true, unvalidated: ["ofiQuote"] } });
+    // Live's orderFlow shape exactly (projectx-mcp flowtools.ts#withFlow): no coverage.
+    expect(Object.keys(mnq.orderFlow).sort()).toEqual(["largePrint", "note", "recorded", "sourceContractId", "windows"]);
+    expect(mnq.orderFlow).toMatchObject({ sourceContractId: "BT.NQ.H24", largePrint: 10, windows: [2, 3] });
     expect(mnq.orderFlow.note).toMatch(/complete=true means.*ofiQuote is unvalidated/);
     const nq = (await call("get_bars", { contractId: "BT.NQ.H24", ...minuteBars({ flowWindows: [2, 3] }) })).data;
     expect(nq.bars.map((b: any) => b.flow)).toEqual(mnq.bars.map((b: any) => b.flow));
@@ -167,3 +169,4 @@ describe("flow tool helpers", () => {
     expect(plainFlow([{ t: "x" }], [2])[0].flow).toMatchObject({ complete: false, bv: null, windows: { "2": { ofiTrade: null, delta: null } } });
   });
 });
+

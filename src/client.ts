@@ -5,7 +5,7 @@ import { etDate, parseMonthCode } from "./calendar.js";
 import { readNow } from "./clock.js";
 import type { Config, MarketFill } from "./config.js";
 import { ORDER_TYPES } from "./enums.js";
-import { COMPLETE, UNVALIDATED, flowBars, flowRange, flowSourceContract, plainFlow, spanMinutes, type BarWithFlow } from "./flowtools.js";
+import { COMPLETE, flowBars, flowRange, flowSourceContract, plainFlow, spanMinutes, type BarWithFlow } from "./flowtools.js";
 import {
   STATUS,
   arrivalFillPrice,
@@ -36,7 +36,7 @@ import type { Trade } from "./performance.js";
 import type { FlattenResult } from "./protect.js";
 import { RiskError, realizedNet, tradingDayStart } from "./risk.js";
 import { scheduleOf } from "./rolltable.js";
-import { DerivedStore } from "./store.js";
+import { DerivedStore, REBUILD_HINT } from "./store.js";
 
 /**
  * The replay exchange: this server's stand-in for the broker API that
@@ -53,6 +53,16 @@ import { DerivedStore } from "./store.js";
  */
 
 export class ReplayError extends Error {}
+
+/**
+ * The error a new run gets when the derived store exists but is refused: the fix first, under 200
+ * characters (the harness keeps that much of an error), the reason cut to fit.
+ */
+export function storeRefusedMessage(reason: string): string {
+  const head = "Derived store refused: rebuild with npm run build-store over all its months (BACKTESTER_STORE=off: CSV). Reason: ";
+  const room = 199 - head.length;
+  return head + (reason.length > room ? `${reason.slice(0, room - 1)}…` : reason);
+}
 
 /** A broker answer: success, or a refusal with the interface's errorCode. */
 export interface Outcome {
@@ -466,6 +476,10 @@ export class ReplayExchange {
     const fresh = state.syncedTo === null && !state.orders.length && !state.trades.length;
     const at = this.cutoff(now);
     if (!pinned) {
+      // A store that exists but is refused (stale, interrupted build) never turns a new run into a CSV run
+      // silently. A run created before pinning (already trading) keeps the CSV it has been on.
+      const refused = this.derived?.refusal(STORE_ROOT) ?? null;
+      if (refused && fresh) throw new ReplayError(storeRefusedMessage(refused));
       const m = this.derived?.manifest(STORE_ROOT) ?? null;
       settings.data =
         fresh && m && this.derived?.covers(STORE_ROOT, at)
@@ -970,6 +984,8 @@ export class ReplayExchange {
    * replay clock (no last bars, counts, gaps or later contracts).
    */
   storeInfo() {
+    const refused = this.derived?.refusal(STORE_ROOT) ?? null;
+    if (refused) return { [STORE_ROOT]: { usable: false, refused, fix: REBUILD_HINT } };
     return this.tx((_state, now) => {
       const out: Record<string, unknown> = {};
       const run = this.run;
@@ -1031,8 +1047,8 @@ export class ReplayExchange {
         orderFlow: {
           ...info,
           recorded: "off (replay: order flow is computed from the local order-book history)",
-          coverage: { source: "history", inferredSide: true, unvalidated: [...UNVALIDATED], ...(rec.missingDays.length ? { daysWithoutFlow: rec.missingDays } : {}) },
-          note: COMPLETE,
+          // Live's shape exactly (projectx-mcp flowtools.ts#withFlow): no coverage field; what history adds is in the note.
+          note: rec.missingDays.length ? `${COMPLETE} Trading days in the range without order flow in the store: ${rec.missingDays.join(", ")}.` : COMPLETE,
         },
       };
     });

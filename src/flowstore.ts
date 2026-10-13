@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
-import { addDays, etDate, etDayBounds, globexRanges, weekday, type EtDate } from "./calendar.js";
+import { addDays, etDate, etDayBounds, globexRanges, sessionsOf, weekday, type EtDate } from "./calendar.js";
 import { EMPTY_L1, FlowEngine, BOOK_LEVELS, L1_STATE_GROUPING, type EngineCarry } from "./flowengine.js";
 import { L1_TYPE } from "./events.js";
 import { MINUTE_MS, newBucket, recordOf, type L1State, type MinuteRecord } from "./orderflow.js";
@@ -73,6 +73,8 @@ export interface FlowDay {
   l2: Ref | null;
   /** L2 rows in the day's hours: without them the imbalance is null. */
   book: boolean;
+  /** The day's hours the flow was computed over (absent in files built before it was recorded: those used globexRanges). */
+  sessions?: Array<[number, number]>;
   startHash: string;
   endHash: string;
   minutes: FlowColumns;
@@ -115,9 +117,10 @@ function carryInto(day: DayFile, prev: FlowDay | null, schedule: RollSchedule): 
   return prev && prev.date === addDays(day.date, -1) && continuesFromPrevious(day, schedule) ? prev.end : null;
 }
 
-/** Whether a day's flow file is current: its format, its source rows, and the state it started from. */
+/** Whether a day's flow file is current: its format, its source rows, its hours, and the state it started from. */
 export function flowCurrent(f: FlowDay | null, day: DayFile, prev: FlowDay | null, schedule: RollSchedule): boolean {
-  return !!f && f.format === FLOW_FORMAT && sameRef(f.l1, day.l1) && sameRef(f.l2, day.l2) && f.startHash === carryHash(carryInto(day, prev, schedule));
+  const hours = JSON.stringify(f?.sessions ?? globexRanges(day.date)) === JSON.stringify(day.sessions);
+  return !!f && f.format === FLOW_FORMAT && hours && sameRef(f.l1, day.l1) && sameRef(f.l2, day.l2) && f.startHash === carryHash(carryInto(day, prev, schedule));
 }
 
 /** First index in sorted `ts` (µs) at or after `ms`, from `lo`. */
@@ -193,7 +196,7 @@ export function computeFlowDay(day: DayFile, l1: Record<string, Float64Array> | 
     m.l1Events.push(bkt.l1Events);
   }
   const end = engine.carry();
-  return { format: FLOW_FORMAT, root: day.root, date: day.date, l1: refOf(day.l1), l2: refOf(day.l2), book, startHash: carryHash(carry), endHash: carryHash(end), minutes: m, end };
+  return { format: FLOW_FORMAT, root: day.root, date: day.date, l1: refOf(day.l1), l2: refOf(day.l2), book, sessions: day.sessions, startHash: carryHash(carry), endHash: carryHash(end), minutes: m, end };
 }
 
 /**
@@ -280,8 +283,8 @@ export function flowRecords(
     const { start, end } = etDayBounds(d);
     const f = days.has(d) ? read(d) : null;
     if (!f) {
-      // A day the market trades (Globex hours) up to the clock, without current flow: listed.
-      if (start <= last && globexRanges(d).length) missingDays.push(d);
+      // A day the market trades (Globex hours, not a closed holiday) up to the clock, without current flow: listed.
+      if (start <= last && sessionsOf(d).length) missingDays.push(d);
       continue;
     }
     const m = f.minutes;

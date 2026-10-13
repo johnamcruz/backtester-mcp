@@ -37,7 +37,7 @@ import { MINUTE_MS, addPrint, minuteOf, newBucket, ofiEvent, type L1State, type 
  * message; which grouping of history reproduces that is NOT validated yet (a µs
  * groups only about 0.1% of the rows): minutes recorded live by projectx-mcp's
  * flow recorder will calibrate it. Until then `ofiQuote` is reported as
- * unvalidated (flowtools.ts, `orderFlow.coverage.unvalidated`).
+ * unvalidated (flowtools.ts, the note of `orderFlow`).
  */
 export const L1_STATE_GROUPING = "exchange-timestamp" as const;
 

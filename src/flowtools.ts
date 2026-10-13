@@ -29,11 +29,9 @@ export const COMPLETE =
   "on the contract the bar belongs to (the roll table; not in an exception stretch), and every print sided. " +
   "Sides are inferred (the quote rule against the L1 quote in force strictly before the print, else the tick rule): history has no aggressor flag. " +
   "Times are exchange times. imbalance is null on days without L2 data. " +
-  "ofiQuote is unvalidated: how history's L1 updates group into live's per-message book states is not calibrated yet (coverage.unvalidated). " +
+  "ofiQuote is unvalidated: how history's L1 updates group into live's per-message book states is not calibrated yet. " +
   "Use a bar only when all its minutes are complete.";
 
-/** Fields whose match with live is not validated yet (orderFlow.coverage.unvalidated). */
-export const UNVALIDATED: readonly string[] = Object.freeze(["ofiQuote"]);
 
 export type FlowWindows = Record<string, { ofiTrade: number | null; delta: number | null }>;
 export type BarWithFlow<B> = B & { flow: BarFlow & { windows: FlowWindows } };
@@ -73,3 +71,4 @@ export function flowBars<B extends { t: string }>(byMinute: ReadonlyMap<number, 
     return { ...b, flow: { ...spanFlow(start), windows: Object.fromEntries(windows.map((n) => [String(n), flowWindow(spanFlow, start, span, n)])) } };
   });
 }
+

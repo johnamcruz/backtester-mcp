@@ -1,12 +1,28 @@
-import { closeSync, existsSync, mkdirSync, openSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
-import { addDays, etDate, etDayBounds, globexRanges, isFullHoliday, weekday, type EtDate } from "./calendar.js";
+import { addDays, etDayBounds, expectedRanges, isFullHoliday, sessionsOf, weekday, type EtDate } from "./calendar.js";
+import {
+  assertConflicts,
+  assignDays,
+  censusFromStats,
+  censusOf,
+  missingRuns,
+  quarantineHashOf,
+  quarantineOf as quarantineRefs,
+  quarantineTableOf,
+  type Conflict,
+  type GroupCensus,
+  type Outside,
+  type Quarantined,
+} from "./dayassign.js";
 import { EMPTY_QUOTE, keepRow, minuteBars, minuteIndex, normalizeL1, type QuoteState } from "./events.js";
-import { buildFlowDays, flowSummary } from "./flowstore.js";
+import { buildFlowDays, flowDayPath, flowSummary } from "./flowstore.js";
 import { ParquetFile } from "./parquet.js";
 import { scheduleOf, type RollSchedule } from "./rolltable.js";
 import {
   L1_COLUMNS,
+  assignPath,
+  buildingPath,
   STORE_FORMAT,
   barContracts,
   dayPath,
@@ -24,13 +40,15 @@ import {
 
 /**
  * Building the precomputed store from the local order-book parquet (see
- * store.ts for the layout). Months in order, one ET day (one row group) at a
- * time; a day whose file already matches its source (file, size, mtime, row
- * group, rows) and the quote state carried into it is skipped, so a build can
- * be stopped and resumed, and running it twice changes nothing. One build at a
- * time per store (a lock file). After the days, the manifest is recomputed
- * from every day file still matching its source: gaps and contracts, by the
- * reviewed roll table.
+ * store.ts for the layout). Months in order; in each, the ET days are assigned
+ * to row groups by the rows' own timestamps (dayassign.ts; quarantined row
+ * groups serve none), then built one day at a time. A day whose file already
+ * matches its source (file, size, mtime, row group, rows), its hours and the
+ * quote state carried into it is skipped, so a build can be stopped and
+ * resumed, and running it twice changes nothing. One build at a time per store
+ * (a lock file). After the days, the manifest is recomputed from every day
+ * file still matching its source: gaps and contracts, by the reviewed roll
+ * table, and the months' assignment reports.
  */
 
 export interface BuildOptions {
@@ -53,6 +71,8 @@ export interface BuildSummary {
   missingMonths: string[];
   built: EtDate[];
   skipped: EtDate[];
+  /** Day files removed: dates no row group serves any more. */
+  removed: EtDate[];
   /** Days whose order flow was built / was already current. */
   flowBuilt: EtDate[];
   flowSkipped: EtDate[];
@@ -86,8 +106,18 @@ const inside = (dir: string, path: string) => {
   return r === "" || (!r.startsWith("..") && !isAbsolute(r));
 };
 
-/** The ET date a row group belongs to: that of its middle row (robust to stray rows at either end). */
-export const dateOfRows = (ts: Float64Array) => etDate(Math.floor(ts[ts.length >> 1] / 1000));
+
+/** One month's day assignment, kept in the store for the manifest (store.ts#assignPath). */
+export interface MonthReport {
+  month: string;
+  l1: { file: string; size: number; mtime: number };
+  l2: { file: string; size: number; mtime: number } | null;
+  conflicts: Conflict[];
+  outside: Outside[];
+  quarantined: Quarantined[];
+  /** The quarantine table it was assigned with (dayassign.ts#quarantineHashOf). */
+  quarantineHash: string;
+}
 
 type FileStamp = { size: number; mtime: number };
 const stampOf = (path: string): FileStamp | null => {
@@ -101,6 +131,8 @@ const sameRef = (a: SourceRef | null | undefined, file: string, stamp: FileStamp
 
 const sameL2 = (a: SourceRef | null, b: SourceRef | undefined) =>
   a === null ? b === undefined : !!b && a.file === b.file && a.size === b.size && a.mtime === b.mtime && a.rowGroup === b.rowGroup && a.rows === b.rows;
+
+const sameSessions = (a: Array<[number, number]> | undefined, b: Array<[number, number]>) => JSON.stringify(a) === JSON.stringify(b);
 
 const sameQuote = (a: QuoteState, b: QuoteState) => a.bid === b.bid && a.bidSize === b.bidSize && a.ask === b.ask && a.askSize === b.askSize;
 
@@ -137,7 +169,12 @@ export async function buildStore(o: BuildOptions): Promise<BuildSummary> {
   const months = monthRange(o.from, o.to);
   const unlock = lockStore(out);
   try {
-    return await build(o, root, source, months, schedule, log);
+    // Until the new manifest is written (last, atomically), the store is marked as being built: a reader
+    // refuses it (store.ts#refusal), so a crash midway never leaves a mixed store served as valid.
+    writeAtomic(buildingPath(o.dataDir, root), JSON.stringify({ pid: process.pid, from: o.from, to: o.to }));
+    const summary = await build(o, root, source, months, schedule, log);
+    unlinkSync(buildingPath(o.dataDir, root));
+    return summary;
   } finally {
     unlock();
   }
@@ -148,6 +185,7 @@ async function build(o: BuildOptions, root: string, source: string, months: stri
   let rows = 0;
   const built: EtDate[] = [];
   const skipped: EtDate[] = [];
+  const removed: EtDate[] = [];
   const missingMonths: string[] = [];
   const existing = new Map<EtDate, DayFile>();
   for (const d of listDays(o.dataDir, root)) {
@@ -174,88 +212,113 @@ async function build(o: BuildOptions, root: string, source: string, months: stri
     const l2Stamp = stampOf(join(source, l2Name));
     const l1 = await ParquetFile.open(join(source, l1Name));
     const l2 = l2Stamp ? await ParquetFile.open(join(source, l2Name)) : null;
-    const days = [...existing.values()];
-    const doneL1 = (rg: number, n: number) => days.find((d) => sameRef(d.l1, l1Name, l1Stamp, rg, n));
-    const doneL2 = (rg: number, n: number) => (l2Stamp ? days.find((d) => sameRef(d.l2, l2Name, l2Stamp, rg, n)) : undefined);
+    const prefix = `${month.slice(0, 4)}-${month.slice(4)}`;
 
-    // L2: only the timestamps, for each day's minute index and kept count.
-    const l2Days = new Map<EtDate, SourceRef>();
-    for (const g of l2?.rowGroups ?? []) {
-      const prior = doneL2(g.index, g.rows);
-      if (prior?.l2) {
-        l2Days.set(prior.date, prior.l2);
-        continue;
+    // Which row group serves which ET day: by the rows' own timestamps (dayassign.ts).
+    const census = async (f: ParquetFile, file: string): Promise<GroupCensus[]> => {
+      const out: GroupCensus[] = [];
+      for (const g of f.rowGroups) {
+        if (!g.rows) continue;
+        const r = f.tsRange(g.index);
+        let byDate = r ? censusFromStats(g.rows, r.min, r.max) : null;
+        if (!byDate) {
+          byDate = censusOf((await f.read(g.index, ["ts"])).ts);
+          rows += g.rows;
+        }
+        out.push({ file, rowGroup: g.index, rows: g.rows, byDate });
       }
-      if (!g.rows) continue;
-      const { ts } = await (l2 as ParquetFile).read(g.index, ["ts"]);
-      rows += g.rows;
-      const date = dateOfRows(ts);
-      if (l2Days.has(date)) log(`${month}: L2 row group ${g.index} repeats ${date}; the first one is kept`);
-      else l2Days.set(date, { file: l2Name, ...(l2Stamp as FileStamp), rowGroup: g.index, rows: g.rows, kept: countKept(ts, globexRanges(date)), index: minuteIndex(ts) });
-    }
-
-    const seen = new Set<EtDate>();
-    for (const g of l1.rowGroups) {
-      const prior = doneL1(g.index, g.rows);
-      if (prior && sameL2(prior.l2, l2Days.get(prior.date)) && sameQuote(prior.quoteStart, carriedQuote(existing, prior.date, schedule))) {
-        seen.add(prior.date);
-        skipped.push(prior.date);
-        continue;
-      }
-      if (!g.rows) continue;
-      const t1 = performance.now();
-      const cols = await l1.read(g.index, L1_COLUMNS);
-      rows += g.rows;
-      const date = dateOfRows(cols.ts);
-      if (seen.has(date)) {
-        log(`${month}: L1 row group ${g.index} repeats ${date}; the first one is kept`);
-        continue;
-      }
-      seen.add(date);
-      const sessions = globexRanges(date);
-      const quoteStart = carriedQuote(existing, date, schedule);
-      const n = normalizeL1(cols, sessions, quoteStart, { quotes: false });
-      const day: DayFile = {
-        format: STORE_FORMAT,
-        root,
-        date,
-        contract: schedule.dataContractAt(etDayBounds(date).start),
-        sessions,
-        l1: { file: l1Name, ...l1Stamp, rowGroup: g.index, rows: g.rows, kept: n.kept, trades: n.trades.length, index: minuteIndex(cols.ts) },
-        l2: l2Days.get(date) ?? null,
-        quoteStart,
-        quoteEnd: { ...n.end },
-        bars: minuteBars(n.trades),
-      };
-      writeDay(o.dataDir, day);
-      existing.set(date, day);
-      built.push(date);
-      const s = (performance.now() - t1) / 1000;
+      return out;
+    };
+    const quarantine = quarantineTableOf(root);
+    const a1 = assignDays(month, l1Name, await census(l1, l1Name), quarantineRefs(quarantine, l1Name));
+    const a2 = l2 ? assignDays(month, l2Name, await census(l2, l2Name), quarantineRefs(quarantine, l2Name)) : null;
+    const report: MonthReport = {
+      month,
+      l1: { file: l1Name, ...l1Stamp },
+      l2: l2Stamp ? { file: l2Name, ...l2Stamp } : null,
+      conflicts: [...a1.conflicts, ...(a2?.conflicts ?? [])],
+      outside: [...a1.outside, ...(a2?.outside ?? [])],
+      quarantined: [...a1.quarantined, ...(a2?.quarantined ?? [])],
+      quarantineHash: quarantineHashOf(root),
+    };
+    for (const q of report.quarantined) {
       log(
-        `${date} ${root}${day.contract ?? "-"}: L1 ${g.rows} rows (${n.kept} kept, ${n.trades.length} trades, ${day.bars.t.length} bars)` +
-          `, L2 ${day.l2 ? `${day.l2.rows} rows` : "none"}, ${s.toFixed(1)} s`,
+        `${month}: ${q.file} row group ${q.rowGroup} quarantined (${q.date}, clock ${q.offsetMinutes} min late)` +
+          (q.missing ? ": no such row group (review the quarantine table)" : q.rowsChanged ? `: ${q.rows} rows, not the reviewed count (review the quarantine table)` : ""),
       );
     }
-    // L2 days with no L1 row group still get a day file (no bars).
-    for (const [date, ref] of l2Days) {
-      if (seen.has(date)) continue;
+    for (const c of report.conflicts) {
+      log(`${month}: ${c.file} row groups ${[c.kept, ...c.dropped].map((x) => x.rowGroup).join(", ")} all have rows on ${c.date}; row group ${c.kept.rowGroup} is kept (${c.kept.rows} rows there)`);
+    }
+    assertConflicts(report.conflicts);
+    writeAtomic(assignPath(o.dataDir, root, month), JSON.stringify(report, null, 1));
+
+    const dates = [...new Set([...a1.days.keys(), ...(a2?.days.keys() ?? [])])].sort();
+    // A day of this month no row group serves any more (quarantined, or now dated otherwise): its files go.
+    for (const date of [...existing.keys()].filter((d) => d.startsWith(prefix) && !dates.includes(d))) {
+      for (const p of [dayPath(o.dataDir, root, date), flowDayPath(o.dataDir, root, date)]) if (existsSync(p)) unlinkSync(p);
+      existing.delete(date);
+      removed.push(date);
+      log(`${date}: no row group serves it any more; its day file is removed`);
+    }
+
+    for (const date of dates) {
+      const sessions = sessionsOf(date);
       const prior = existing.get(date);
-      if (prior && !prior.l1 && sameL2(prior.l2, ref)) {
+      const same = !!prior && sameSessions(prior.sessions, sessions);
+      const g1 = a1.days.get(date);
+      const g2 = a2?.days.get(date);
+      let l2Ref: SourceRef | null = null;
+      if (g2) {
+        if (same && prior?.l2 && sameRef(prior.l2, l2Name, l2Stamp as FileStamp, g2.rowGroup, g2.rows)) l2Ref = prior.l2;
+        else {
+          const { ts } = await (l2 as ParquetFile).read(g2.rowGroup, ["ts"]);
+          rows += g2.rows;
+          l2Ref = { file: l2Name, ...(l2Stamp as FileStamp), rowGroup: g2.rowGroup, rows: g2.rows, kept: countKept(ts, sessions), index: minuteIndex(ts) };
+        }
+      }
+      const quoteStart = g1 ? carriedQuote(existing, date, sessions, schedule) : { ...EMPTY_QUOTE };
+      if (same && prior && sameL2(prior.l2, l2Ref ?? undefined) && sameQuote(prior.quoteStart, quoteStart) && (g1 ? sameRef(prior.l1, l1Name, l1Stamp, g1.rowGroup, g1.rows) : !prior.l1)) {
         skipped.push(date);
         continue;
       }
-      const day: DayFile = {
-        format: STORE_FORMAT,
-        root,
-        date,
-        contract: schedule.dataContractAt(etDayBounds(date).start),
-        sessions: globexRanges(date),
-        l1: null,
-        l2: ref,
-        quoteStart: { ...EMPTY_QUOTE },
-        quoteEnd: { ...EMPTY_QUOTE },
-        bars: { t: [], o: [], h: [], l: [], c: [], v: [] },
-      };
+      const t1 = performance.now();
+      let day: DayFile;
+      if (g1) {
+        const cols = await l1.read(g1.rowGroup, L1_COLUMNS);
+        rows += g1.rows;
+        const n = normalizeL1(cols, sessions, quoteStart, { quotes: false });
+        day = {
+          format: STORE_FORMAT,
+          root,
+          date,
+          contract: schedule.dataContractAt(etDayBounds(date).start),
+          sessions,
+          l1: { file: l1Name, ...l1Stamp, rowGroup: g1.rowGroup, rows: g1.rows, kept: n.kept, trades: n.trades.length, index: minuteIndex(cols.ts) },
+          l2: l2Ref,
+          quoteStart,
+          quoteEnd: { ...n.end },
+          bars: minuteBars(n.trades),
+        };
+        log(
+          `${date} ${root}${day.contract ?? "-"}: L1 ${g1.rows} rows (${n.kept} kept, ${n.trades.length} trades, ${day.bars.t.length} bars)` +
+            `, L2 ${day.l2 ? `${day.l2.rows} rows` : "none"}, ${((performance.now() - t1) / 1000).toFixed(1)} s`,
+        );
+      } else {
+        // An L2 day with no L1 row group still gets a day file (no bars).
+        day = {
+          format: STORE_FORMAT,
+          root,
+          date,
+          contract: schedule.dataContractAt(etDayBounds(date).start),
+          sessions,
+          l1: null,
+          l2: l2Ref,
+          quoteStart: { ...EMPTY_QUOTE },
+          quoteEnd: { ...EMPTY_QUOTE },
+          bars: { t: [], o: [], h: [], l: [], c: [], v: [] },
+        };
+      }
       writeDay(o.dataDir, day);
       existing.set(date, day);
       built.push(date);
@@ -285,10 +348,12 @@ async function build(o: BuildOptions, root: string, source: string, months: stri
   log(
     `done: ${built.length} days built, ${skipped.length} up to date, ${rows} rows read in ${seconds.toFixed(1)} s` +
       (seconds > 0 && rows ? ` (${Math.round(rows / seconds)} rows/s)` : "") +
-      `; gaps L1 ${manifest.gaps.l1.length}, L2 ${manifest.gaps.l2.length}; ${manifest.dropped.length} day files left out` +
+      (removed.length ? `, ${removed.length} removed` : "") +
+      `; gaps L1 ${manifest.gaps.l1.length}, L2 ${manifest.gaps.l2.length}, ${manifest.gaps.minutes.length} minute runs; ${manifest.dropped.length} day files left out` +
+      `; ${manifest.assignment.conflicts.length} day conflicts, ${manifest.assignment.quarantined.filter((q) => !q.missing).length} row groups quarantined` +
       `; order flow: ${flowBuilt.length} days built, ${flowSkipped.length} up to date, ${manifest.flow?.days.length ?? 0} current in the store`,
   );
-  return { months: doneMonths, missingMonths, built, skipped, flowBuilt, flowSkipped, rows, seconds, manifest };
+  return { months: doneMonths, missingMonths, built, skipped, removed, flowBuilt, flowSkipped, rows, seconds, manifest };
 }
 
 function countKept(ts: Float64Array, ranges: Array<[number, number]>): number {
@@ -299,12 +364,12 @@ function countKept(ts: Float64Array, ranges: Array<[number, number]>): number {
 
 /**
  * The quote state a day starts with: the previous ET day's end state when the
- * session runs on over midnight into this day (Monday to Friday) on the same
- * contract (roll table); otherwise empty (a session opening, or a data switch).
+ * session runs on over midnight into this day (its hours start at 00:00 ET:
+ * Monday to Friday, not after a closed trade date) on the same contract (roll
+ * table); otherwise empty (a session opening, or a data switch).
  */
-function carriedQuote(days: Map<EtDate, DayFile>, date: EtDate, schedule: RollSchedule): QuoteState {
-  const wd = weekday(date);
-  if (wd === 0 || wd === 6) return { ...EMPTY_QUOTE };
+function carriedQuote(days: Map<EtDate, DayFile>, date: EtDate, sessions: Array<[number, number]>, schedule: RollSchedule): QuoteState {
+  if (sessions[0]?.[0] !== etDayBounds(date).start) return { ...EMPTY_QUOTE };
   const prev = days.get(addDays(date, -1));
   const contract = schedule.dataContractAt(etDayBounds(date).start);
   return prev && contract !== null && schedule.dataContractAt(etDayBounds(date).start - 1) === contract ? { ...prev.quoteEnd } : { ...EMPTY_QUOTE };
@@ -372,7 +437,7 @@ export function buildManifest(
       if (e.days.at(-1) !== d.date) e.days.push(d.date);
     });
   }
-  const gaps: Manifest["gaps"] = { l1: [], l2: [], holidays: [] };
+  const gaps: Manifest["gaps"] = { l1: [], l2: [], holidays: [], minutes: [] };
   for (const month of months) {
     const first = `${month.slice(0, 4)}-${month.slice(4)}-01`;
     for (let d = first; d.slice(0, 7) === first.slice(0, 7); d = addDays(d, 1)) {
@@ -389,6 +454,19 @@ export function buildManifest(
       }
     }
   }
+  // Minute gaps: expected minutes (Globex hours, the CME calendar) of the built months without an L1 row.
+  // A day's index covers its whole row group: only the minutes of its own ET day count for it.
+  const withRows = new Set<number>();
+  for (const d of days) {
+    const { start, end } = etDayBounds(d.date);
+    for (const [t] of d.l1?.index ?? []) if (t >= start && t < end) withRows.add(t);
+  }
+  const expected: Array<[number, number]> = [];
+  for (const month of months) {
+    const first = `${month.slice(0, 4)}-${month.slice(4)}-01`;
+    for (let d = first; d.slice(0, 7) === first.slice(0, 7); d = addDays(d, 1)) expected.push(...expectedRanges(d));
+  }
+  gaps.minutes = missingRuns(expected, (t) => withRows.has(t));
   const flow = flowSummary(dataDir, root, days, schedule);
   return {
     format: STORE_FORMAT,
@@ -400,9 +478,42 @@ export function buildManifest(
     gaps,
     rollTable: { ...schedule.table, hash: schedule.hash },
     dropped,
+    assignment: assignmentOf(dataDir, root, source, months, stamp),
     contracts,
     ...(flow.days.length ? { flow } : {}),
   };
 }
 
 const iso = (ms: number) => new Date(ms).toISOString();
+
+/** The months' assignment reports, where current (same source files, same quarantine table); the others are `unchecked`. */
+function assignmentOf(dataDir: string, root: string, source: string, months: string[], stamp: (file: string) => FileStamp | null): Manifest["assignment"] {
+  const out: Manifest["assignment"] = {
+    conflicts: [],
+    outside: [],
+    quarantined: [],
+    quarantineHash: quarantineHashOf(root),
+    unchecked: [],
+  };
+  const current = (f: { file: string; size: number; mtime: number } | null, file: string) => {
+    const s = stamp(file);
+    return f ? !!s && f.file === file && s.size === f.size && s.mtime === f.mtime : s === null;
+  };
+  for (const month of months) {
+    const p = assignPath(dataDir, root, month);
+    let r: MonthReport | null = null;
+    try {
+      r = existsSync(p) ? (JSON.parse(readFileSync(p, "utf8")) as MonthReport) : null;
+    } catch {
+      r = null;
+    }
+    if (!r || r.quarantineHash !== out.quarantineHash || !current(r.l1, `l1/${month}.parquet`) || !current(r.l2, `l2/${month}.parquet`)) {
+      out.unchecked.push(month);
+      continue;
+    }
+    out.conflicts.push(...r.conflicts);
+    out.outside.push(...r.outside);
+    out.quarantined.push(...r.quarantined);
+  }
+  return out;
+}

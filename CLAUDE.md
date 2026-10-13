@@ -41,7 +41,10 @@ the ProjectX REST client.
   parquet; README "Local order-book data"): `src/calendar.ts` (ET days, Globex hours, the
   quarterly roll rule), `src/parquet.ts` (hyparquet + node:zlib zstd, one row group at a
   time), `src/events.ts` (normalized trades, quotes, L2 changes; bars from trades),
-  `src/rolltable.ts` + `src/rolltable-nq.ts` (the reviewed roll table: the only source of contract assignment; derived with `scripts/derive-roll-table.ts`), `src/store.ts` (layout, reader, events),
+  `src/rolltable.ts` + `src/rolltable-nq.ts` (the reviewed roll table: the only source of contract assignment; derived with `scripts/derive-roll-table.ts`),
+  `src/holidays-cme.ts` (the reviewed CME holiday calendar: closures, early closes), `src/quarantine-nq.ts` (the reviewed
+  quarantine: source row groups with a wrong clock, never served), `src/dayassign.ts` (which row group serves which ET day,
+  by the rows' own timestamps; conflicts; minute gap runs), `src/store.ts` (layout, reader, events),
   `src/storebuild.ts` and the CLI `src/build-store.ts` (`npm run build-store`). Where the
   store covers the clock, NQ/MNQ contracts are `BT.<ROOT>.<code>` (e.g. `BT.MNQ.M24`);
   elsewhere the CSV series `BT.<ROOT>`.
