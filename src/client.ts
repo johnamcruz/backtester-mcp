@@ -35,6 +35,7 @@ import { roundTrips, type FillInfo, type RoundTrip } from "./metrics.js";
 import type { Trade } from "./performance.js";
 import type { FlattenResult } from "./protect.js";
 import { RiskError, realizedNet, tradingDayStart } from "./risk.js";
+import { balanceAt, readSchedule, realizedToday } from "./balance.js";
 import { scheduleOf } from "./rolltable.js";
 import { DerivedStore, REBUILD_HINT } from "./store.js";
 
@@ -601,7 +602,7 @@ export class ReplayExchange {
     }
     if (c.maxDailyLoss > 0) {
       const dayStart = tradingDayStart(new Date(time)).getTime();
-      const realized = realizedNet(state.trades.filter((t) => Date.parse(t.creationTimestamp) >= dayStart));
+      const realized = realizedToday(state.trades.filter((t) => Date.parse(t.creationTimestamp) >= dayStart), readSchedule(c.balanceSchedule), time, dayStart);
       if (realized <= -c.maxDailyLoss) {
         return `Rejected at fill: daily loss limit reached (realized net ${realized.toFixed(2)} today, limit -${c.maxDailyLoss}); only reducing fills until the next trading day.`;
       }
@@ -763,8 +764,9 @@ export class ReplayExchange {
 
   // ── Account ──────────────────────────────────────────────────────
 
-  private accountOf(state: State) {
-    const balance = Math.round((state.startBalance + realizedNet(state.trades)) * 100) / 100;
+  private accountOf(state: State, now: Date) {
+    // The balance schedule's latest entry plus the fills after it (balance.ts), else the start balance plus every fill.
+    const balance = balanceAt(state.startBalance, state.trades, readSchedule(this.config.balanceSchedule), this.cutoff(now));
     return { id: state.accountId, name: this.config.accountName, balance, canTrade: balance > 0, isVisible: true, simulated: true };
   }
 
@@ -773,7 +775,13 @@ export class ReplayExchange {
   }
 
   accounts() {
-    return this.tx((state) => [this.accountOf(state)]);
+    return this.tx((state, now) => [this.accountOf(state, now)]);
+  }
+
+  /** Today's realized P&L from today's fills (`today`), with the balance schedule's carried P&L (balance.ts). */
+  realizedToday(today: Array<{ creationTimestamp: string; profitAndLoss: number | null; fees: number | null; voided: boolean }>): number {
+    const now = this.now();
+    return realizedToday(today, readSchedule(this.config.balanceSchedule), this.cutoff(now), tradingDayStart(now).getTime());
   }
 
   /**

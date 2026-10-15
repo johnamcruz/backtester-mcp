@@ -155,6 +155,7 @@ Every option is in [.env.example](.env.example). Settings come from the environm
 | `BACKTESTER_STATE_DIR` | `~/.backtester-mcp/runs/<run id>` | The run's folder: `state.json` (account, orders, fills), its lock, and the default journal |
 | `BACKTESTER_ACCOUNT_ID` / `BACKTESTER_ACCOUNT_NAME` | `1` / `BACKTEST-<run id>` | The simulated account |
 | `BACKTESTER_START_BALANCE` | `100000` | Starting balance |
+| `BACKTESTER_BALANCE_SCHEDULE` | unset | Replay only: a JSON file of `{ at, balance, dayPnl }` entries the replay driver appends (a practice day that starts from an account state part way through an attempt). From each entry's time the balance is its `balance` plus later fills, and today's realized P&L (the daily loss limit, the account snapshot) counts its `dayPnl`. Re-read on every call; a missing file is no schedule, a malformed one fails the account read. Never a live setting; not shown in `get_server_config` |
 | `BACKTESTER_SLIPPAGE_TICKS` | `1` | Ticks of slippage per market and stop fill |
 | `BACKTESTER_FEES_MICRO` / `BACKTESTER_FEES_MINI` | `0.37` / `1.40` | Fees per side per contract |
 | `BACKTESTER_MARKET_FILL` | `now` | When market orders fill (see [Fills](#fills)): `now` at the replay moment they are placed, as live; `next-bar` at the next one-minute bar's open (the rule before this setting; runs created then keep it) |
