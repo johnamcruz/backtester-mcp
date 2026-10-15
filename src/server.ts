@@ -153,7 +153,7 @@ export function createServer(deps: Deps): McpServer {
   /** Adding exposure needs the replay window; protective and risk-reducing orders never do. */
   const addGuard = async (exposure: ExposureInput, acct: number) => {
     assertInWindow(config, client.now());
-    if (config.maxDailyLoss > 0) assertDailyLoss(config, realizedNet(await trades(acct, dayStart())));
+    if (config.maxDailyLoss > 0) assertDailyLoss(config, client.realizedToday(await trades(acct, dayStart())));
     assertPositionLimit(config, exposure);
   };
 
@@ -337,7 +337,8 @@ export function createServer(deps: Deps): McpServer {
     handler(async ({ accountId: acct }: { accountId: number }) => {
       const start = dayStart();
       const [accounts, positions, orders, today] = await Promise.all([client.accounts(), positionsWithMetrics(acct), openOrders(acct), trades(acct, start)]);
-      const realized = realizedNet(today);
+      // Today's P&L with what the balance schedule carried into the day (replay only; balance.ts).
+      const realized = client.realizedToday(today);
       return {
         account: accounts.find((a) => a.id === acct) ?? null,
         positions,

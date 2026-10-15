@@ -20,6 +20,12 @@ export interface Config {
   stateDir: string;
   statePath: string;
   startBalance: number;
+  /**
+   * The balance schedule (BACKTESTER_BALANCE_SCHEDULE, replay only; balance.ts): a JSON file the replay driver
+   * appends `{ at, balance, dayPnl }` entries to, each setting the account's balance from that replay time on. Not
+   * shown in the public config.
+   */
+  balanceSchedule: string | null;
   slippageTicks: number;
   feesMicro: number;
   feesMini: number;
@@ -166,6 +172,7 @@ export function loadConfig(env: Env = process.env): Config {
     stateDir,
     statePath: join(stateDir, "state.json"),
     startBalance,
+    balanceSchedule: env.BACKTESTER_BALANCE_SCHEDULE?.trim() ? abs(expandHome(env.BACKTESTER_BALANCE_SCHEDULE.trim())) : null,
     slippageTicks: num(env, "BACKTESTER_SLIPPAGE_TICKS", 1),
     feesMicro: num(env, "BACKTESTER_FEES_MICRO", 0.37),
     feesMini: num(env, "BACKTESTER_FEES_MINI", 1.4),
