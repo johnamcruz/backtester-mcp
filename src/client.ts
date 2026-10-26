@@ -862,6 +862,10 @@ export class ReplayExchange {
       reduceOnly: o.role !== "order",
       // Extra field: cancelled, or a close made, by the server when the data left the contract.
       ...(o.rollSettlement ? { rollSettlement: true } : {}),
+      // The interface's `bracket`, exactly as projectx-mcp sets it (its enums.ts bracketOf): only a
+      // stop-type (4) stop leg is marked; a target leg and the entry link are omitted there (not yet
+      // confirmed live), so they are omitted here too.
+      ...(o.role === "sl" && o.type === ORDER_TYPES.stop ? { bracket: { role: "stop" } } : {}),
     };
   }
 
