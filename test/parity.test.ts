@@ -73,6 +73,37 @@ describe("1. place_order brackets", () => {
     expect(legs.map((o: any) => [o.typeName, o.stopPrice ?? o.limitPrice])).toEqual([["stop", stopAt], ["limit", targetAt]]);
   });
 
+  // projectx-mcp's enums.ts bracketOf: `bracket: { role: "stop" }` only on a stop (type 4) order tagged
+  // "-SL" (its stop bracket leg); target legs, trailing-stop legs and every other order carry none, and no
+  // `entry` is set.
+  it("marks the stop leg with bracket { role: stop }, as projectx-mcp does, and nothing else", async () => {
+    const { call } = await setup();
+    await call("place_order", bracketed);
+    await call("place_order", { ...order, type: "limit", limitPrice: 19000 });
+    const open = (await call("list_open_orders", { accountId: 1 })).data;
+    expect(open.map((o: any) => [o.typeName, o.bracket])).toEqual([["stop", { role: "stop" }], ["limit", undefined], ["limit", undefined]]);
+    const all = (await call("search_orders", { accountId: 1, startTimestamp: new Date(0).toISOString() })).data;
+    expect(all.filter((o: any) => o.bracket).map((o: any) => o.bracket)).toEqual([{ role: "stop" }]);
+    const snap = (await call("get_account_snapshot", { accountId: 1 })).data;
+    expect(snap.openOrders.filter((o: any) => o.bracket)).toHaveLength(1);
+  });
+
+  it("a stop placed with its own tag ending -SL is marked, as live; one without is not", async () => {
+    const { call } = await setup();
+    await call("place_order", { ...order, type: "stop", stopPrice: 21000, customTag: "x-SL" });
+    await call("place_order", { ...order, type: "stop", stopPrice: 21001 });
+    const open = (await call("list_open_orders", { accountId: 1 })).data;
+    expect(open.map((o: any) => [o.stopPrice, o.bracket])).toEqual([[21000, { role: "stop" }], [21001, undefined]]);
+  });
+
+  it("a trailing-stop stop leg carries no bracket, as projectx-mcp marks only type-4 legs", async () => {
+    const { call } = await setup();
+    await call("place_order", { ...order, stopLossBracket: { ticks: 10, type: "trailing_stop" } });
+    const open = (await call("list_open_orders", { accountId: 1 })).data;
+    expect(open.length).toBeGreaterThan(0);
+    expect(open.some((o: any) => "bracket" in o)).toBe(false);
+  });
+
   it("a 4-tick bracket is taken", async () => {
     const { call } = await setup();
     expect((await call("place_order", { ...order, stopLossBracket: { ticks: 4, type: "stop" } })).data.protection.status).toBe("protected");

@@ -147,7 +147,7 @@ Journal entries are stamped with the replay time. `place_order` saves your `rati
 | `search_contracts` / `get_contract` / `list_available_contracts` | Contract IDs (`BT.MNQ.M24` or `BT.MNQ`), tick size, tick value |
 | `get_bars` | Historical OHLCV bars up to the replay clock; with `includeOrderFlow`, order flow per bar (NQ and MNQ) |
 | `get_quote` | Last price as of the replay clock |
-| `list_open_orders` / `search_orders` | Working orders / order history |
+| `list_open_orders` / `search_orders` | Working orders / order history. A stop bracket leg (type stop) carries `bracket: { role: "stop" }`, as live. Target legs and the entry link aren't marked yet: a missing `bracket` means unknown, not "no bracket". |
 | `list_open_positions` | Open positions, each with its trade so far (`roundTrip`) |
 | `search_trades` / `get_performance` | Fills with round-trip metrics / statistics (win rate, expectancy, profit factor; `roundTrips`: $ and R, drawdown, MAE/MFE) |
 | `place_order` / `modify_order` / `cancel_order` | Order entry and management |

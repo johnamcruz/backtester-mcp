@@ -862,6 +862,11 @@ export class ReplayExchange {
       reduceOnly: o.role !== "order",
       // Extra field: cancelled, or a close made, by the server when the data left the contract.
       ...(o.rollSettlement ? { rollSettlement: true } : {}),
+      // The interface's `bracket`, exactly as projectx-mcp sets it (its enums.ts bracketOf): a stop-type
+      // (4) order carrying the platform's stop-leg tag (ending "-SL") is marked. Here that is a stop leg
+      // (whose tag this server leaves null), or any stop whose own customTag ends "-SL", as live marks it.
+      // A target leg and the entry link are omitted there (not yet confirmed live), so here too.
+      ...(o.type === ORDER_TYPES.stop && (o.role === "sl" || (typeof o.customTag === "string" && o.customTag.endsWith("-SL"))) ? { bracket: { role: "stop" } } : {}),
     };
   }
 
