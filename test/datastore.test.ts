@@ -185,6 +185,41 @@ describe("contracts from the derived store", () => {
   });
 });
 
+describe("dataGaps (replay only): the window's days the store has no bars for", () => {
+  it("lists the window's L1 gap days per served root, a calendar fact not cut at the clock, holidays and L2-only gaps left out", async () => {
+    // Window Tue 03-12 .. Fri 03-15 (END Saturday 00:00Z = Friday 20:00 ET, inside Saturday's trading day).
+    const env = { BACKTESTER_START: "2024-03-12T00:00:00Z", BACKTESTER_END: "2024-03-16T00:00:00Z" };
+    const { call, summary } = await world("2024-03-12T14:35:00Z", env);
+    const cfg = (await call("get_server_config", {})).data;
+    // 03-12 has L1 without L2 (bars: not a gap); 03-13 nothing; 03-14 L2 without L1; 03-15 nothing. 03-13..15 lie after the clock.
+    expect(cfg.dataGaps).toEqual({ NQ: ["2024-03-13", "2024-03-14", "2024-03-15"], MNQ: ["2024-03-13", "2024-03-14", "2024-03-15"] });
+    expect(Object.keys(cfg).indexOf("dataGaps")).toBe(Object.keys(cfg).indexOf("dataStore") + 1);
+    void summary;
+  });
+
+  it("keeps to the window's trading days: a START at 18:00 ET opens the next day's, an open bound lists to the store's end", async () => {
+    // START Wednesday 03-13 18:00 ET (22:00Z, EDT) is trading day 03-14; no END: every later gap, Good Friday (03-29) apart.
+    const { call } = await world("2024-03-13T22:30:00Z", { BACKTESTER_START: "2024-03-13T22:00:00Z" });
+    const gaps = (await call("get_server_config", {})).data.dataGaps.NQ as string[];
+    expect(gaps[0]).toBe("2024-03-14");
+    expect(gaps).not.toContain("2024-03-13");
+    expect(gaps).not.toContain("2024-03-29");
+    expect(gaps.at(-1)).toBe("2024-03-28");
+    expect(gaps).toEqual([...gaps].sort());
+  });
+
+  it("is empty without a store: store off, CSV run, or a refused store", async () => {
+    const off = await world("2024-03-12T14:35:00Z", { BACKTESTER_STORE: "off" });
+    expect((await off.call("get_server_config", {})).data.dataGaps).toEqual({});
+    const b = await builtStore();
+    const p = join(b.dataDir, "derived", "NQ", "manifest.json");
+    const m = JSON.parse(readFileSync(p, "utf8"));
+    writeFileSync(p, JSON.stringify({ ...m, assignment: { ...m.assignment, quarantineHash: "0".repeat(64) } }));
+    const refused = await setup({ dir: b.dir, now: Z("2024-03-12T14:35:00Z") });
+    expect((await refused.call("get_server_config", {})).data.dataGaps).toEqual({});
+  });
+});
+
 describe("roll settlement", () => {
   it("settles a position and working orders on a contract when the data leaves it: closed at its last close, cancelled, journaled", async () => {
     // Sunday 18:00:30 ET: M24 is the front already, the data is on H24 until 00:00 ET; the trader holds H24.

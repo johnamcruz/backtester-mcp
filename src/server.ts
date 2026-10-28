@@ -290,7 +290,7 @@ export function createServer(deps: Deps): McpServer {
     {
       title: "Server config and guardrails",
       description:
-        "Show whether trading is enabled and the risk guardrails this server enforces (max order size, max position, daily loss limit, allowed accounts/symbols), plus the replay: window, clock, and the data range per symbol. Call this first in every session.",
+        "Show whether trading is enabled and the risk guardrails this server enforces (max order size, max position, daily loss limit, allowed accounts/symbols), plus the replay: window, clock, the data range per symbol, and dataGaps (per root, the window's trading days without source data: no bars, skipped). Call this first in every session.",
       annotations: read,
     },
     handler(async () => {
@@ -301,6 +301,7 @@ export function createServer(deps: Deps): McpServer {
         clock: { ...pub.clock, now: now.toISOString() },
         data: client.dataRanges(),
         dataStore: client.storeInfo(),
+        dataGaps: client.dataGaps(),
         tradingDayStartedAt: tradingDayStart(now).toISOString(),
         serverTime: now.toISOString(),
       };

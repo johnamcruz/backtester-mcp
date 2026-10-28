@@ -1,7 +1,7 @@
 import { closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { aggregate, BarStore, MINUTE, type AggUnit, type BarSeries, type OutBar } from "./bars.js";
-import { etDate, parseMonthCode } from "./calendar.js";
+import { addDays, etDate, parseMonthCode, tradingDayStartEt, type EtDate } from "./calendar.js";
 import { readNow } from "./clock.js";
 import type { Config, MarketFill } from "./config.js";
 import { ORDER_TYPES } from "./enums.js";
@@ -1015,6 +1015,29 @@ export class ReplayExchange {
     });
   }
 
+  /**
+   * Replay only (live never sends it): per root the store serves, the ET trading days of the replay
+   * window the run's store has no bars for: the manifest's L1 gaps (weekdays without a trade; full
+   * holidays are listed apart and not here), oldest first. On such a day the front contract still
+   * shows and get_bars returns the last bar before it, so a driver skips the day up front. It is a
+   * fact of the source's calendar, like the holidays, not of prices, so the whole window is listed
+   * (no clock cutoff); an unset window bound leaves that side open. Empty when the run has no store
+   * (CSV series, store off or refused).
+   */
+  dataGaps(): Record<string, EtDate[]> {
+    if (this.derived?.refusal(STORE_ROOT)) return {};
+    return this.tx(() => {
+      const run = this.run;
+      const m = run?.manifest(STORE_ROOT);
+      if (!m) return {};
+      const { start, end } = this.config;
+      const from = start === null ? null : tradingDateOf(start);
+      const to = end === null ? null : tradingDateOf(end - 1);
+      const days = m.gaps.l1.filter((d) => (from === null || d >= from) && (to === null || d <= to)).sort();
+      return Object.fromEntries(Object.values(CONTRACTS).filter((c) => c.dataRoot === STORE_ROOT).map((c) => [c.root, [...days]]));
+    });
+  }
+
   /** A contract id with bars, or "not found". */
   private known(contractId: string): ContractSpec {
     const c = specOf(contractId);
@@ -1529,3 +1552,8 @@ export class ReplayExchange {
   }
 }
 
+
+/** The CME trading day (an ET date) `ms` falls in: it starts at 18:00 ET the evening before. */
+export function tradingDateOf(ms: number): EtDate {
+  return addDays(etDate(tradingDayStartEt(ms)), 1);
+}
