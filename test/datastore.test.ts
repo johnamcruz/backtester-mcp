@@ -36,6 +36,76 @@ const hourly = (date: string, hours: number[], price: number) => hours.flatMap((
 const bars = (call: (n: string, a: Record<string, unknown>) => Promise<{ data: any }>, contractId: string, extra: Record<string, unknown> = {}) =>
   call("get_bars", { contractId, unit: "minute", unitNumber: 1, limit: 100, ...extra }).then((r) => r.data);
 
+describe("a contract month's history before the data's switch to it (live: every expiry has its back-month bars)", () => {
+  const H24_SHIFTED = [
+    // H24's own minutes (03-07, 03-08, the Sunday 03-10 open), shifted by the spread at the switch: M24's first
+    // open 18270 minus H24's last close before it, 18020 (03-10 22:01Z): +250, a tick multiple.
+    { t: "2024-03-07T14:30:00.000Z", o: 18250, h: 18251.5, l: 18249.25, c: 18249.25 },
+    { t: "2024-03-07T14:31:00.000Z", o: 18252, h: 18252, l: 18252, c: 18252 },
+    { t: "2024-03-08T14:30:00.000Z", o: 18260, c: 18260 },
+    { t: "2024-03-08T14:31:00.000Z", o: 18260.25, c: 18260.25 },
+    { t: "2024-03-10T22:00:00.000Z", o: 18270, c: 18270 },
+    { t: "2024-03-10T22:01:00.000Z", o: 18270, c: 18270 },
+  ];
+
+  it("serves the previous contract's bars shifted by the spread at the switch, then its own, once its first bar is closed", async () => {
+    const { call } = await world("2024-03-11T04:03:00Z");
+    const got = (await bars(call, "BT.MNQ.M24")).bars;
+    expect(got).toMatchObject([...H24_SHIFTED, { t: "2024-03-11T04:00:00.000Z", o: 18270 }, { t: "2024-03-11T04:01:00.000Z", o: 18270.5 }, { t: "2024-03-11T04:02:00.000Z", o: 18271 }]);
+    expect(got.slice(0, 6).map((b: any) => b.v)).toEqual([3, 1, 1, 1, 1, 1]);
+    for (const b of got) for (const k of ["o", "h", "l", "c"]) expect((b[k] * 4) % 1).toBe(0);
+    // NQ the same; day bars are built from the same minutes.
+    expect((await bars(call, "BT.NQ.M24")).bars).toMatchObject(got.map(({ t, o, c }: any) => ({ t, o, c })));
+    const daily = (await call("get_bars", { contractId: "BT.MNQ.M24", unit: "day", unitNumber: 1, limit: 10, includePartialBar: true })).data.bars;
+    expect(daily.length).toBeGreaterThanOrEqual(3);
+    expect(daily[0]).toMatchObject({ o: 18250 });
+  });
+
+  it("serves no history from before the switch while the new front's first bar isn't closed (the spread is not known yet)", async () => {
+    // Sunday evening: M24 is the front, the data is still on H24: no M24 bar, so no history either.
+    const evening = await world("2024-03-10T22:30:00Z");
+    expect((await bars(evening.call, "BT.MNQ.M24")).bars).toEqual([]);
+    // 04:00:30Z: M24's first bar is still forming.
+    const forming = await world("2024-03-11T04:00:30Z");
+    expect((await bars(forming.call, "BT.MNQ.M24")).bars).toEqual([]);
+    expect((await bars(forming.call, "BT.MNQ.M24", { includePartialBar: true })).bars).toEqual([]);
+    // 04:01:00Z: it closed, and the history comes with it.
+    const closed = await world("2024-03-11T04:01:00Z");
+    expect((await bars(closed.call, "BT.MNQ.M24")).bars).toHaveLength(7);
+  });
+
+  it("leaves the contract's own data alone: H24 unshifted, M24's quote on its own bars only", async () => {
+    const { call } = await world("2024-03-11T04:03:00Z");
+    expect((await bars(call, "BT.MNQ.H24")).bars.at(-1)).toMatchObject({ t: "2024-03-10T22:01:00.000Z", c: 18020 });
+    expect((await call("get_quote", { contractId: "BT.MNQ.M24" })).data.quote).toMatchObject({ lastPrice: 18271, volume: 3 });
+  });
+
+  it("keeps the new contract's own bars before the switch (an exception stretch) and drops the old contract's at those minutes", async () => {
+    // December 2023: Z23 -> H24 at 2023-12-11 05:00Z; 2023-12-06 (an exception) is on H24 itself.
+    const days: Record<string, SynthDay> = {
+      "2023-12-05": { l1: l1Minutes(Z("2023-12-05T15:00:00Z"), 2, 16000) },
+      "2023-12-06": { l1: l1Minutes(Z("2023-12-06T15:00:00Z"), 2, 16200) },
+      "2023-12-07": { l1: l1Minutes(Z("2023-12-07T15:00:00Z"), 1, 16010) },
+      "2023-12-10": { l1: l1Minutes(Z("2023-12-11T04:58:00Z"), 2, 16020) },
+      "2023-12-11": { l1: l1Minutes(Z("2023-12-11T05:00:00Z"), 2, 16230) },
+    };
+    const { call } = await worldWith(days, ["202312", "202312"], "2023-12-11T05:05:00Z");
+    const got = (await bars(call, "BT.MNQ.H24")).bars.map((b: any) => [b.t, b.o]);
+    // Spread: 16230 - 16020 = 210 (the old contract's last close before the switch, 04:59Z).
+    expect(got).toEqual([
+      ["2023-12-05T15:00:00.000Z", 16210],
+      ["2023-12-05T15:01:00.000Z", 16210],
+      ["2023-12-06T15:00:00.000Z", 16200],
+      ["2023-12-06T15:01:00.000Z", 16200],
+      ["2023-12-07T15:00:00.000Z", 16220],
+      ["2023-12-11T04:58:00.000Z", 16230],
+      ["2023-12-11T04:59:00.000Z", 16230],
+      ["2023-12-11T05:00:00.000Z", 16230],
+      ["2023-12-11T05:01:00.000Z", 16230],
+    ]);
+  });
+});
+
 describe("a store that exists but is refused", () => {
   it("says so in under 200 characters, the fix first, a long reason cut", () => {
     const long = storeRefusedMessage(`months ${Array.from({ length: 55 }, (_, i) => String(202105 + i)).join(", ")} weren't assigned`);
@@ -99,7 +169,8 @@ describe("contracts from the derived store", () => {
     expect((await bars(evening.call, "BT.MNQ.M24")).bars).toEqual([]);
     expect((await bars(evening.call, "BT.MNQ.H24")).bars.at(-1)).toMatchObject({ t: "2024-03-10T22:00:00.000Z", c: 18020 });
     const after = await world("2024-03-11T04:01:00Z");
-    expect((await bars(after.call, "BT.MNQ.M24")).bars.map((x: any) => x.t)).toEqual(["2024-03-11T04:00:00.000Z"]);
+    // Once M24's first bar is closed, its history reaches back as live's does (below); its own first bar is the last.
+    expect((await bars(after.call, "BT.MNQ.M24")).bars.at(-1)).toMatchObject({ t: "2024-03-11T04:00:00.000Z", o: 18270 });
   });
 
   it("shows in get_server_config nothing of the store past the replay clock", async () => {
@@ -360,12 +431,13 @@ describe("get_bars from the derived store", () => {
     const f = await ParquetFile.open(join(source, "l1", "202403.parquet"));
     const g = f.rowGroups[4];
     const src = minuteBars(normalizeL1(await f.read(g.index, L1_COLUMNS), globexRanges("2024-03-11")).trades);
+    // (After the six minutes of H24 history its get_bars carries: the history tests above.)
     const res = await bars(call, "BT.MNQ.M24");
-    expect(res.bars.slice(0, 3)).toEqual(src.t.map((t, i) => ({ t: iso(t), o: src.o[i], h: src.h[i], l: src.l[i], c: src.c[i], v: src.v[i] })));
+    expect(res.bars.slice(6, 9)).toEqual(src.t.map((t, i) => ({ t: iso(t), o: src.o[i], h: src.h[i], l: src.l[i], c: src.c[i], v: src.v[i] })));
     // 14:31 isn't closed at 14:31:30.
-    expect(res.bars.map((b: any) => b.t)).toEqual(["2024-03-11T04:00:00.000Z", "2024-03-11T04:01:00.000Z", "2024-03-11T04:02:00.000Z", "2024-03-12T14:30:00.000Z"]);
+    expect(res.bars.slice(6).map((b: any) => b.t)).toEqual(["2024-03-11T04:00:00.000Z", "2024-03-11T04:01:00.000Z", "2024-03-11T04:02:00.000Z", "2024-03-12T14:30:00.000Z"]);
     // Aggregated: one bar per closed hour with trades (the 14:00 hour is still forming).
-    expect((await bars(call, "BT.NQ.M24", { unit: "hour" })).bars).toEqual([{ t: "2024-03-11T04:00:00.000Z", o: 18270, h: 18271, l: 18270, c: 18271, v: 3 }]);
+    expect((await bars(call, "BT.NQ.M24", { unit: "hour" })).bars.at(-1)).toEqual({ t: "2024-03-11T04:00:00.000Z", o: 18270, h: 18271, l: 18270, c: 18271, v: 3 });
     // The old contract keeps its own history, up to its last front-month minute.
     expect((await bars(call, "BT.NQ.H24")).bars.at(-1)).toEqual({ t: "2024-03-10T22:01:00.000Z", o: 18020, h: 18020, l: 18020, c: 18020, v: 1 });
   });
