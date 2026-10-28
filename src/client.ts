@@ -37,7 +37,7 @@ import type { FlattenResult } from "./protect.js";
 import { RiskError, realizedNet, tradingDayStart } from "./risk.js";
 import { balanceAt, readSchedule, realizedToday } from "./balance.js";
 import { scheduleOf } from "./rolltable.js";
-import { DerivedStore, REBUILD_HINT } from "./store.js";
+import { DerivedStore, REBUILD_HINT, type DataGap } from "./store.js";
 
 /**
  * The replay exchange: this server's stand-in for the broker API that
@@ -332,7 +332,9 @@ export class ReplayExchange {
     opts: ExchangeOptions = {},
   ) {
     this.store = opts.store ?? new BarStore(config.dataDir);
-    this.derived = opts.derived !== undefined ? opts.derived : config.useStore ? new DerivedStore(config.dataDir, config.orderbookDir) : null;
+    // The store's days without order-book data are served from the root's price CSV (store.ts PriceFallback).
+    const prices = (root: string) => (this.store.has(root) ? this.store.get(root) : null);
+    this.derived = opts.derived !== undefined ? opts.derived : config.useStore ? new DerivedStore(config.dataDir, config.orderbookDir, prices) : null;
     this.clock = opts.now ?? (() => readNow(config));
   }
 
@@ -1016,25 +1018,24 @@ export class ReplayExchange {
   }
 
   /**
-   * Replay only (live never sends it): per root the store serves, the ET trading days of the replay
-   * window the run's store has no bars for: the manifest's L1 gaps (weekdays without a trade; full
-   * holidays are listed apart and not here), oldest first. On such a day the front contract still
-   * shows and get_bars returns the last bar before it, so a driver skips the day up front. It is a
-   * fact of the source's calendar, like the holidays, not of prices, so the whole window is listed
-   * (no clock cutoff); an unset window bound leaves that side open. Empty when the run has no store
-   * (CSV series, store off or refused).
+   * Replay only (live never sends it): per root the store serves, the ET trading days of the replay window the run's
+   * store has no order-book data for (the manifest's gaps.l1: weekdays without a trade; full holidays are listed apart
+   * and not here), oldest first, each `{ day, bars, flow: false }`: `bars: true` when the price CSV serves the day's
+   * bars (store.ts PriceFallback: the day is traded, with no order flow, as live shows a minute without flow),
+   * `bars: false` when neither source has a bar (a driver skips it: the front still shows, get_bars returns the last
+   * bar before it). A fact of the source's calendar, like the holidays, not of prices, so the whole window is listed
+   * (no clock cutoff); an unset window bound leaves that side open. Empty when the run has no store.
    */
-  dataGaps(): Record<string, EtDate[]> {
+  dataGaps(): Record<string, DataGap[]> {
     if (this.derived?.refusal(STORE_ROOT)) return {};
     return this.tx(() => {
       const run = this.run;
-      const m = run?.manifest(STORE_ROOT);
-      if (!m) return {};
+      if (!run?.manifest(STORE_ROOT)) return {};
       const { start, end } = this.config;
       const from = start === null ? null : tradingDateOf(start);
       const to = end === null ? null : tradingDateOf(end - 1);
-      const days = m.gaps.l1.filter((d) => (from === null || d >= from) && (to === null || d <= to)).sort();
-      return Object.fromEntries(Object.values(CONTRACTS).filter((c) => c.dataRoot === STORE_ROOT).map((c) => [c.root, [...days]]));
+      const days = run.dataGaps(STORE_ROOT).filter((g) => (from === null || g.day >= from) && (to === null || g.day <= to));
+      return Object.fromEntries(Object.values(CONTRACTS).filter((c) => c.dataRoot === STORE_ROOT).map((c) => [c.root, days.map((g) => ({ ...g }))]));
     });
   }
 

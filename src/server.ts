@@ -290,7 +290,7 @@ export function createServer(deps: Deps): McpServer {
     {
       title: "Server config and guardrails",
       description:
-        "Show whether trading is enabled and the risk guardrails this server enforces (max order size, max position, daily loss limit, allowed accounts/symbols), plus the replay: window, clock, the data range per symbol, and dataGaps (per root, the window's trading days without source data: no bars, skipped). Call this first in every session.",
+        "Show whether trading is enabled and the risk guardrails this server enforces (max order size, max position, daily loss limit, allowed accounts/symbols), plus the replay: window, clock, the data range per symbol, and dataGaps (per root, the window's trading days without order-book data: {day, bars, flow: false}; bars true: served from the price CSV, no order flow; bars false: no bars at all, skipped). Call this first in every session.",
       annotations: read,
     },
     handler(async () => {

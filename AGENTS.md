@@ -141,7 +141,7 @@ Journal entries are stamped with the replay time. `place_order` saves your `rati
 
 | Tool | Purpose |
 |---|---|
-| `get_server_config` | Whether trading is enabled, guardrail limits, trading-day start, the replay window, clock and data ranges, and `dataGaps`: per root, the window's trading days the local data has no bars for (replay only; nothing trades on them, and the replay driver skips them) |
+| `get_server_config` | Whether trading is enabled, guardrail limits, trading-day start, the replay window, clock and data ranges, and `dataGaps`: per root, the window's trading days without order-book data, each `{day, bars, flow: false}` (replay only): `bars: true` days are served from the price CSV and trade normally with no order flow; `bars: false` days have no bars at all, nothing trades on them, and the replay driver skips them |
 | `list_accounts` | The simulated account, balance, `canTrade`, `mcpTradingAllowed` |
 | `get_account_snapshot` | Balance, positions (with `roundTrip`), working orders, today's P&L and remaining loss allowance |
 | `search_contracts` / `get_contract` / `list_available_contracts` | Contract IDs (`BT.MNQ.M24` or `BT.MNQ`), tick size, tick value |

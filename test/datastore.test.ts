@@ -185,22 +185,48 @@ describe("contracts from the derived store", () => {
   });
 });
 
-describe("dataGaps (replay only): the window's days the store has no bars for", () => {
-  it("lists the window's L1 gap days per served root, a calendar fact not cut at the clock, holidays and L2-only gaps left out", async () => {
+describe("days without order-book data: bars from the price CSV, no order flow; dataGaps lists every gap day", () => {
+  const no = (day: string) => ({ day, bars: false, flow: false });
+  const csvOnly = (day: string) => ({ day, bars: true, flow: false });
+
+  it("serves a gap day's bars from the CSV less the contract's adjustment (measured on its store days), flow blank, and fills on them", async () => {
+    // The CSV is the store +2000 (back-adjusted): on Tue 03-12 both have 14:30 and 14:31 (18280 raw, 20280 CSV).
+    // Wed 03-13 has no order-book data at all; the CSV has 14:00-14:29 there, at 20300 (raw 18300, M24's).
+    const b = await builtStore();
+    writeData(b.dataDir, { NQ: [...flat(Z("2024-03-12T14:00:00Z"), 60, 20280), ...flat(Z("2024-03-13T14:00:00Z"), 30, 20300)] });
+    const env = { BACKTESTER_START: "2024-03-12T00:00:00Z", BACKTESTER_END: "2024-03-16T00:00:00Z" };
+    const { call } = await setup({ dir: b.dir, now: Z("2024-03-13T14:10:02Z"), env });
+    const got = (await bars(call, "BT.MNQ.M24", { includeOrderFlow: true, startTime: "2024-03-12T00:00:00Z", endTime: "2024-03-13T14:10:02Z" }));
+    const day13 = got.bars.filter((x: any) => x.t >= "2024-03-13");
+    expect(day13.map((x: any) => x.t)).toEqual(Array.from({ length: 10 }, (_, i) => iso(Z("2024-03-13T14:00:00Z") + i * MIN)));
+    expect(day13.every((x: any) => x.o === 18300 && x.c === 18300)).toBe(true);
+    // Order flow: blank (no record: complete false, every value null), as live shows a minute without flow.
+    expect(day13.every((x: any) => x.flow.complete === false && x.flow.bv === null && x.flow.delta === null)).toBe(true);
+    // The store's own bars the day before keep theirs.
+    expect(got.bars.filter((x: any) => x.t.startsWith("2024-03-12")).map((x: any) => x.c)).toEqual([18280, 18280]);
+    // A market order fills on the served bars (the open of the minute containing the moment, plus a tick of slippage).
+    const buy = await call("place_order", { accountId: 1, contractId: "BT.MNQ.M24", side: "buy", type: "market", size: 1, rationale: RATIONALE });
+    expect(buy.data, JSON.stringify(buy.data)).toMatchObject({ success: true });
+    expect((await call("list_open_positions", { accountId: 1 })).data).toMatchObject([{ contractId: "BT.MNQ.M24", size: 1, averagePrice: 18300.25 }]);
+    // dataGaps: 03-13 has bars (the CSV's); 03-14 (L2 only) and 03-15 have none in either source.
+    expect((await call("get_server_config", {})).data.dataGaps.NQ).toEqual([csvOnly("2024-03-13"), no("2024-03-14"), no("2024-03-15")]);
+  });
+
+  it("lists the window's gap days per served root, a calendar fact not cut at the clock; holidays and L2-only gaps left out; no CSV: no bars", async () => {
     // Window Tue 03-12 .. Fri 03-15 (END Saturday 00:00Z = Friday 20:00 ET, inside Saturday's trading day).
     const env = { BACKTESTER_START: "2024-03-12T00:00:00Z", BACKTESTER_END: "2024-03-16T00:00:00Z" };
-    const { call, summary } = await world("2024-03-12T14:35:00Z", env);
+    const { call } = await world("2024-03-12T14:35:00Z", env);
     const cfg = (await call("get_server_config", {})).data;
-    // 03-12 has L1 without L2 (bars: not a gap); 03-13 nothing; 03-14 L2 without L1; 03-15 nothing. 03-13..15 lie after the clock.
-    expect(cfg.dataGaps).toEqual({ NQ: ["2024-03-13", "2024-03-14", "2024-03-15"], MNQ: ["2024-03-13", "2024-03-14", "2024-03-15"] });
+    // 03-12 has L1 without L2 (bars: not a gap); 03-13 nothing; 03-14 L2 without L1; 03-15 nothing; the CSV has none of them.
+    const want = [no("2024-03-13"), no("2024-03-14"), no("2024-03-15")];
+    expect(cfg.dataGaps).toEqual({ NQ: want, MNQ: want });
     expect(Object.keys(cfg).indexOf("dataGaps")).toBe(Object.keys(cfg).indexOf("dataStore") + 1);
-    void summary;
   });
 
   it("keeps to the window's trading days: a START at 18:00 ET opens the next day's, an open bound lists to the store's end", async () => {
     // START Wednesday 03-13 18:00 ET (22:00Z, EDT) is trading day 03-14; no END: every later gap, Good Friday (03-29) apart.
     const { call } = await world("2024-03-13T22:30:00Z", { BACKTESTER_START: "2024-03-13T22:00:00Z" });
-    const gaps = (await call("get_server_config", {})).data.dataGaps.NQ as string[];
+    const gaps = ((await call("get_server_config", {})).data.dataGaps.NQ as Array<{ day: string }>).map((g) => g.day);
     expect(gaps[0]).toBe("2024-03-14");
     expect(gaps).not.toContain("2024-03-13");
     expect(gaps).not.toContain("2024-03-29");
