@@ -1,7 +1,7 @@
 import { closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { aggregate, BarStore, MINUTE, type AggUnit, type BarSeries, type OutBar } from "./bars.js";
-import { etDate, parseMonthCode } from "./calendar.js";
+import { addDays, etDate, parseMonthCode, tradingDayStartEt, type EtDate } from "./calendar.js";
 import { readNow } from "./clock.js";
 import type { Config, MarketFill } from "./config.js";
 import { ORDER_TYPES } from "./enums.js";
@@ -37,7 +37,7 @@ import type { FlattenResult } from "./protect.js";
 import { RiskError, realizedNet, tradingDayStart } from "./risk.js";
 import { balanceAt, readSchedule, realizedToday } from "./balance.js";
 import { scheduleOf } from "./rolltable.js";
-import { DerivedStore, REBUILD_HINT } from "./store.js";
+import { DerivedStore, REBUILD_HINT, type DataGap } from "./store.js";
 
 /**
  * The replay exchange: this server's stand-in for the broker API that
@@ -236,6 +236,11 @@ export interface DataPin {
   manifestHash: string | null;
   months: string[];
   rollTableHash: string | null;
+  /**
+   * The root's price CSV as the run started (size:mtime, BarStore.stamp): the store's days without order-book data are
+   * served from it. Absent in a run pinned before it was stamped (not checked); null: no CSV.
+   */
+  csvStamp?: string | null;
 }
 
 /** What the server did when the data left a contract: what it cancelled and at what price it closed the position. */
@@ -332,7 +337,9 @@ export class ReplayExchange {
     opts: ExchangeOptions = {},
   ) {
     this.store = opts.store ?? new BarStore(config.dataDir);
-    this.derived = opts.derived !== undefined ? opts.derived : config.useStore ? new DerivedStore(config.dataDir, config.orderbookDir) : null;
+    // The store's days without order-book data are served from the root's price CSV (store.ts PriceFallback).
+    const prices = (root: string, from: number, to: number) => this.store.slice(root, from, to);
+    this.derived = opts.derived !== undefined ? opts.derived : config.useStore ? new DerivedStore(config.dataDir, config.orderbookDir, prices) : null;
     this.clock = opts.now ?? (() => readNow(config));
   }
 
@@ -484,7 +491,7 @@ export class ReplayExchange {
       const m = this.derived?.manifest(STORE_ROOT) ?? null;
       settings.data =
         fresh && m && this.derived?.covers(STORE_ROOT, at)
-          ? { useStore: true, manifestHash: this.derived.manifestHash(STORE_ROOT), months: [...m.months], rollTableHash: m.rollTable.hash }
+          ? { useStore: true, manifestHash: this.derived.manifestHash(STORE_ROOT), months: [...m.months], rollTableHash: m.rollTable.hash, csvStamp: this.store.stamp(STORE_ROOT) }
           : { ...CSV_PIN };
       pinned = settings.data;
     }
@@ -493,6 +500,9 @@ export class ReplayExchange {
     if (!this.derived) throw new ReplayError(`Run ${run} started on the derived store, and this process has it off (BACKTESTER_STORE=off). Use the run's settings, or a new BACKTESTER_RUN_ID.`);
     if (this.derived.manifestHash(STORE_ROOT) !== pinned.manifestHash) {
       throw new ReplayError(`The derived store changed (or is gone) since run ${run} started on it; a run never switches data. Start a new run (a new BACKTESTER_RUN_ID).`);
+    }
+    if (pinned.csvStamp !== undefined && this.store.stamp(STORE_ROOT) !== pinned.csvStamp) {
+      throw new ReplayError(`The price CSV ${STORE_ROOT}_1min.csv changed (or is gone) since run ${run} started on it; a run never switches data. Start a new run (a new BACKTESTER_RUN_ID).`);
     }
     const month = etDate(at).slice(0, 7).replace("-", "");
     if (!pinned.months.includes(month) || !scheduleOf(STORE_ROOT)?.covers(at)) {
@@ -1015,6 +1025,28 @@ export class ReplayExchange {
     });
   }
 
+  /**
+   * Replay only (live never sends it): per root the store serves, the ET trading days of the replay window the run's
+   * store has no order-book data for (the manifest's gaps.l1: weekdays without a trade; full holidays are listed apart
+   * and not here), oldest first, each `{ day, bars, flow: false }`: `bars: true` when the price CSV serves the day's
+   * bars (store.ts PriceFallback: the day is traded, with no order flow, as live shows a minute without flow),
+   * `bars: false` when neither source has a bar (a driver skips it: the front still shows, get_bars returns the last
+   * bar before it). A fact of the source's calendar, like the holidays, not of prices, so the whole window is listed
+   * (no clock cutoff); an unset window bound leaves that side open. Empty when the run has no store.
+   */
+  dataGaps(): Record<string, DataGap[]> {
+    if (this.derived?.refusal(STORE_ROOT)) return {};
+    return this.tx(() => {
+      const run = this.run;
+      if (!run?.manifest(STORE_ROOT)) return {};
+      const { start, end } = this.config;
+      const from = start === null ? null : tradingDateOf(start);
+      const to = end === null ? null : tradingDateOf(end - 1);
+      const days = run.dataGaps(STORE_ROOT, from, to);
+      return Object.fromEntries(Object.values(CONTRACTS).filter((c) => c.dataRoot === STORE_ROOT).map((c) => [c.root, days.map((g) => ({ ...g }))]));
+    });
+  }
+
   /** A contract id with bars, or "not found". */
   private known(contractId: string): ContractSpec {
     const c = specOf(contractId);
@@ -1529,3 +1561,8 @@ export class ReplayExchange {
   }
 }
 
+
+/** The CME trading day (an ET date) `ms` falls in: it starts at 18:00 ET the evening before. */
+export function tradingDateOf(ms: number): EtDate {
+  return addDays(etDate(tradingDayStartEt(ms)), 1);
+}

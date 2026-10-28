@@ -4,7 +4,8 @@ import { minuteBars, normalizeL1 } from "../src/events.js";
 import { ParquetFile } from "../src/parquet.js";
 import { symbolRoot } from "../src/risk.js";
 import { globexRanges } from "../src/calendar.js";
-import { L1_COLUMNS } from "../src/store.js";
+import { BarSeries, BarStore, parseCsv } from "../src/bars.js";
+import { DerivedStore, L1_COLUMNS } from "../src/store.js";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { NQ_SCHEDULE } from "../src/rolltable.js";
@@ -182,6 +183,90 @@ describe("contracts from the derived store", () => {
     });
     expect(JSON.stringify(cfg.dataStore)).not.toMatch(/M24|last|bars|gaps/);
     expect(cfg.data.NQ).toMatchObject({ file: "NQ_1min.csv" });
+  });
+});
+
+describe("days without order-book data: bars from the price CSV, no order flow; dataGaps lists every gap day", () => {
+  const no = (day: string) => ({ day, bars: false, flow: false });
+  const csvOnly = (day: string) => ({ day, bars: true, flow: false });
+
+  it("serves a gap day's bars from the CSV less the contract's adjustment (measured on its store days), flow blank, and fills on them", async () => {
+    // The CSV is the store +2000 (back-adjusted): on Tue 03-12 both have 14:30 and 14:31 (18280 raw, 20280 CSV).
+    // Wed 03-13 has no order-book data at all; the CSV has 14:00-14:29 there, at 20300 (raw 18300, M24's).
+    const b = await builtStore();
+    writeData(b.dataDir, { NQ: [...flat(Z("2024-03-12T14:00:00Z"), 60, 20280), ...flat(Z("2024-03-13T14:00:00Z"), 30, 20300)] });
+    const env = { BACKTESTER_START: "2024-03-12T00:00:00Z", BACKTESTER_END: "2024-03-16T00:00:00Z" };
+    const { call } = await setup({ dir: b.dir, now: Z("2024-03-13T14:10:02Z"), env });
+    const got = (await bars(call, "BT.MNQ.M24", { includeOrderFlow: true, startTime: "2024-03-12T00:00:00Z", endTime: "2024-03-13T14:10:02Z" }));
+    const day13 = got.bars.filter((x: any) => x.t >= "2024-03-13");
+    expect(day13.map((x: any) => x.t)).toEqual(Array.from({ length: 10 }, (_, i) => iso(Z("2024-03-13T14:00:00Z") + i * MIN)));
+    expect(day13.every((x: any) => x.o === 18300 && x.c === 18300)).toBe(true);
+    // Order flow: blank (no record: complete false, every value null), as live shows a minute without flow.
+    expect(day13.every((x: any) => x.flow.complete === false && x.flow.bv === null && x.flow.delta === null)).toBe(true);
+    // The store's own bars the day before keep theirs.
+    expect(got.bars.filter((x: any) => x.t.startsWith("2024-03-12")).map((x: any) => x.c)).toEqual([18280, 18280]);
+    // A market order fills on the served bars (the open of the minute containing the moment, plus a tick of slippage).
+    const buy = await call("place_order", { accountId: 1, contractId: "BT.MNQ.M24", side: "buy", type: "market", size: 1, rationale: RATIONALE });
+    expect(buy.data, JSON.stringify(buy.data)).toMatchObject({ success: true });
+    expect((await call("list_open_positions", { accountId: 1 })).data).toMatchObject([{ contractId: "BT.MNQ.M24", size: 1, averagePrice: 18300.25 }]);
+    // dataGaps: 03-13 has bars (the CSV's); 03-14 (L2 only) and 03-15 have none in either source.
+    expect((await call("get_server_config", {})).data.dataGaps.NQ).toEqual([csvOnly("2024-03-13"), no("2024-03-14"), no("2024-03-15")]);
+  });
+
+  it("reads only the gap days' rows of the CSV (never the whole file), and serves what a full parse of it would", async () => {
+    const b = await builtStore();
+    writeData(b.dataDir, { NQ: [...flat(Z("2024-03-12T14:00:00Z"), 60, 20280), ...flat(Z("2024-03-13T14:00:00Z"), 30, 20300), ...flat(Z("2024-04-01T14:00:00Z"), 30, 20400)] });
+    const file = new BarStore(b.dataDir);
+    const sliced = new DerivedStore(b.dataDir, null, (root, from, to) => file.slice(root, from, to));
+    const whole = parseCsv(readFileSync(join(b.dataDir, "NQ_1min.csv"), "utf8"));
+    const reference = new DerivedStore(b.dataDir, null, (_root, from, to) => {
+      const a = whole.lowerBound(from);
+      const z = Math.max(a, whole.lowerBound(to));
+      return new BarSeries(whole.t.slice(a, z), whole.o.slice(a, z), whole.h.slice(a, z), whole.l.slice(a, z), whole.c.slice(a, z), whole.v.slice(a, z));
+    });
+    for (const code of ["H24", "M24"]) {
+      const got = sliced.bars("NQ", code);
+      const want = reference.bars("NQ", code);
+      for (const col of ["t", "o", "h", "l", "c", "v"] as const) expect([...got[col]], `${code}.${col}`).toEqual([...want[col]]);
+    }
+    expect(sliced.bars("NQ", "M24").length).toBe(reference.bars("NQ", "M24").length);
+    expect(sliced.dataGaps("NQ")).toEqual(reference.dataGaps("NQ"));
+    expect(sliced.dataGaps("NQ").find((g) => g.day === "2024-03-13")).toEqual({ day: "2024-03-13", bars: true, flow: false });
+    expect(sliced.dataGaps("NQ", "2024-03-14", "2024-03-15").map((g) => g.day)).toEqual(["2024-03-14", "2024-03-15"]);
+    expect((file as unknown as { cache: Map<string, unknown> }).cache.size).toBe(0);
+  });
+
+  it("lists the window's gap days per served root, a calendar fact not cut at the clock; holidays and L2-only gaps left out; no CSV: no bars", async () => {
+    // Window Tue 03-12 .. Fri 03-15 (END Saturday 00:00Z = Friday 20:00 ET, inside Saturday's trading day).
+    const env = { BACKTESTER_START: "2024-03-12T00:00:00Z", BACKTESTER_END: "2024-03-16T00:00:00Z" };
+    const { call } = await world("2024-03-12T14:35:00Z", env);
+    const cfg = (await call("get_server_config", {})).data;
+    // 03-12 has L1 without L2 (bars: not a gap); 03-13 nothing; 03-14 L2 without L1; 03-15 nothing; the CSV has none of them.
+    const want = [no("2024-03-13"), no("2024-03-14"), no("2024-03-15")];
+    expect(cfg.dataGaps).toEqual({ NQ: want, MNQ: want });
+    expect(Object.keys(cfg).indexOf("dataGaps")).toBe(Object.keys(cfg).indexOf("dataStore") + 1);
+  });
+
+  it("keeps to the window's trading days: a START at 18:00 ET opens the next day's, an open bound lists to the store's end", async () => {
+    // START Wednesday 03-13 18:00 ET (22:00Z, EDT) is trading day 03-14; no END: every later gap, Good Friday (03-29) apart.
+    const { call } = await world("2024-03-13T22:30:00Z", { BACKTESTER_START: "2024-03-13T22:00:00Z" });
+    const gaps = ((await call("get_server_config", {})).data.dataGaps.NQ as Array<{ day: string }>).map((g) => g.day);
+    expect(gaps[0]).toBe("2024-03-14");
+    expect(gaps).not.toContain("2024-03-13");
+    expect(gaps).not.toContain("2024-03-29");
+    expect(gaps.at(-1)).toBe("2024-03-28");
+    expect(gaps).toEqual([...gaps].sort());
+  });
+
+  it("is empty without a store: store off, CSV run, or a refused store", async () => {
+    const off = await world("2024-03-12T14:35:00Z", { BACKTESTER_STORE: "off" });
+    expect((await off.call("get_server_config", {})).data.dataGaps).toEqual({});
+    const b = await builtStore();
+    const p = join(b.dataDir, "derived", "NQ", "manifest.json");
+    const m = JSON.parse(readFileSync(p, "utf8"));
+    writeFileSync(p, JSON.stringify({ ...m, assignment: { ...m.assignment, quarantineHash: "0".repeat(64) } }));
+    const refused = await setup({ dir: b.dir, now: Z("2024-03-12T14:35:00Z") });
+    expect((await refused.call("get_server_config", {})).data.dataGaps).toEqual({});
   });
 });
 
@@ -385,6 +470,23 @@ describe("the run's data source is pinned", () => {
     expect((await again.call("search_contracts", { searchText: "MNQ" })).text).toMatch(/derived store changed .* since run .* started/);
   });
 
+  it("refuses a process whose price CSV changed since the run started (the gap days' bars come from it)", async () => {
+    const w = await world("2024-03-12T14:35:00Z");
+    expect((await w.call("search_contracts", { searchText: "MNQ" })).data[0].id).toBe("BT.MNQ.M24");
+    expect(JSON.parse(readFileSync(join(w.dir, "state", "state.json"), "utf8")).settings.data.csvStamp).toMatch(/^\d+:\d+$/);
+    const same = await setup({ dir: w.dir });
+    expect((await same.call("search_contracts", { searchText: "MNQ" })).isError).toBe(false);
+    writeFileSync(join(w.dataDir, "NQ_1min.csv"), readFileSync(join(w.dataDir, "NQ_1min.csv"), "utf8") + "2024-03-12 14:40:00+00:00,1,1,1,1,1\n");
+    const again = await setup({ dir: w.dir });
+    expect((await again.call("search_contracts", { searchText: "MNQ" })).text).toMatch(/price CSV NQ_1min\.csv changed .* since run .* started/);
+    // A run pinned before the CSV was stamped has nothing to compare: it carries on.
+    const p = join(w.dir, "state", "state.json");
+    const st = JSON.parse(readFileSync(p, "utf8"));
+    delete st.settings.data.csvStamp;
+    writeFileSync(p, JSON.stringify(st));
+    expect(((await (await setup({ dir: w.dir })).call("search_contracts", { searchText: "MNQ" })).isError)).toBe(false);
+  });
+
   it("keeps a run that started on the CSV on the CSV, even where a store covers the clock later", async () => {
     const w = await world("2024-03-12T14:35:00Z", { BACKTESTER_STORE: "off" });
     expect((await w.call("search_contracts", { searchText: "MNQ" })).data[0].id).toBe("BT.MNQ");
@@ -399,7 +501,7 @@ describe("the run's data source is pinned", () => {
     const w = await world("2024-03-12T14:35:00Z");
     await w.call("search_contracts", { searchText: "MNQ" });
     const state = JSON.parse(readFileSync(join(w.dir, "state", "state.json"), "utf8"));
-    expect(state.settings.data).toEqual({ useStore: true, manifestHash: expect.stringMatching(/^[0-9a-f]{64}$/), months: ["202403"], rollTableHash: NQ_SCHEDULE.hash });
+    expect(state.settings.data).toEqual({ useStore: true, manifestHash: expect.stringMatching(/^[0-9a-f]{64}$/), months: ["202403"], rollTableHash: NQ_SCHEDULE.hash, csvStamp: expect.stringMatching(/^\d+:\d+$/) });
   });
 
   it("keeps a run created before pinning (state without it, already trading) on the CSV", async () => {

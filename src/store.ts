@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFile
 import { dirname, join } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { BarSeries, MINUTE } from "./bars.js";
-import { etDate, type EtDate } from "./calendar.js";
+import { etDate, etDayBounds, sessionsOf, type EtDate } from "./calendar.js";
 import { EMPTY_QUOTE, normalizeL1, normalizeL2, type DepthEvent, type MinuteBars, type QuoteEvent, type QuoteState, type TradeEvent } from "./events.js";
 import { ParquetFile } from "./parquet.js";
 import { FLOW_FORMAT, flowRecords, readFlowDay, type FlowDay, type FlowSummary } from "./flowstore.js";
@@ -162,6 +162,30 @@ export function barContracts(day: DayFile, schedule: RollSchedule): Array<string
   return day.bars.t.map((t) => schedule.dataContractAt(t));
 }
 
+/**
+ * A day of the store without order-book data (the manifest's gaps.l1: no trade, no day file) served from the root's
+ * price CSV instead: the front contract's minutes of that day (roll table), the CSV's back-adjusted prices less the
+ * contract's constant adjustment (the CSV's close minus the raw close, the same on every day the data is on the
+ * contract: measured on the nearest store days of the contract before and after), volume as is, no order flow.
+ */
+export interface PriceFallback {
+  date: EtDate;
+  code: string;
+  /** CSV minus raw, in price; subtracted from the CSV's OHLC. */
+  offset: number;
+  /** The neighbouring store days it was measured on, each with its offset and the share of matched minutes at it. */
+  measured: Array<{ date: EtDate; offset: number; share: number; minutes: number }>;
+  /** The day's served minutes of the CSV, as the CSV has them (not yet adjusted), oldest first. */
+  rows: BarSeries;
+}
+
+/** One gap day as get_server_config.dataGaps lists it: bars from the price CSV (bars: true) or none at all. */
+export interface DataGap {
+  day: EtDate;
+  bars: boolean;
+  flow: false;
+}
+
 export interface DayEvents {
   trades: TradeEvent[];
   quotes: QuoteEvent[];
@@ -179,12 +203,102 @@ export class DerivedStore {
   private readonly hashes = new Map<string, string | null>();
   private readonly series = new Map<string, BarSeries>();
   private readonly flowDays = new Map<string, FlowDay | null>();
+  private readonly fallbacks = new Map<string, PriceFallback | null>();
 
   constructor(
     private readonly dataDir: string,
     /** Overrides the manifest's source folder for event reads (BACKTESTER_ORDERBOOK_DIR). */
     private readonly sourceDir: string | null = null,
+    /** The root's price CSV (back-adjusted, continuous), for the store's days without order-book data; null: none. */
+    private readonly prices: ((root: string, from: number, to: number) => BarSeries | null) | null = null,
   ) {}
+
+  /** The manifest's gap days (gaps.l1) the store has no bars for, oldest first. */
+  private gapDays(root: string): EtDate[] {
+    const m = this.manifest(root);
+    return m ? m.gaps.l1.filter((date) => !m.days[date]?.bars) : [];
+  }
+
+  /** The contracts the roll table puts the data on during a day's Globex hours (the roll table only: no CSV read). */
+  private codesOf(date: EtDate, schedule: RollSchedule): string[] {
+    const codes = new Set<string>();
+    for (const [a, b] of sessionsOf(date)) {
+      for (const seg of schedule.segments) if (seg.contract !== null && seg.from < b && seg.to > a) codes.add(seg.contract);
+    }
+    return [...codes];
+  }
+
+  /**
+   * One gap day's bars of `code` from the price CSV (PriceFallback), or null: the CSV has no minute of the day's
+   * Globex hours on `code`, or `code` has no store day to measure its adjustment on (the day has no bars at all).
+   * Reads only the day's rows and the neighbouring store days' rows from the CSV (BarStore.slice), never the file whole.
+   */
+  private fallbackFor(root: string, date: EtDate, code: string): PriceFallback | null {
+    const key = `${root}.${date}.${code}`;
+    if (this.fallbacks.has(key)) return this.fallbacks.get(key) ?? null;
+    let out: PriceFallback | null = null;
+    const m = this.manifest(root);
+    const schedule = scheduleOf(root);
+    const { start, end } = etDayBounds(date);
+    const day = m && schedule ? this.prices?.(root, start, end) ?? null : null;
+    if (m && schedule && day) {
+      const sessions = sessionsOf(date);
+      const keep: number[] = [];
+      for (let i = 0; i < day.length; i++) {
+        const t = day.t[i];
+        if (sessions.some(([a, b]) => t >= a && t < b) && schedule.dataContractAt(t) === code) keep.push(i);
+      }
+      if (keep.length) {
+        const days = m.contracts[code]?.days ?? [];
+        const before = [...days].reverse().find((d) => d < date);
+        const after = days.find((d) => d > date);
+        const measured = [before, after].filter((d): d is EtDate => !!d).map((d) => ({ date: d, ...this.adjustment(root, code, d, schedule) })).filter((x) => x.minutes > 0);
+        if (measured.length) {
+          const pick = (col: Float64Array) => Float64Array.from(keep, (i) => col[i]);
+          out = { date, code, offset: measured[0].offset, measured, rows: new BarSeries(pick(day.t), pick(day.o), pick(day.h), pick(day.l), pick(day.c), pick(day.v)) };
+        }
+      }
+    }
+    this.fallbacks.set(key, out);
+    return out;
+  }
+
+  /** The CSV's close minus the store's on a store day's minutes of `code`: the most common difference (ticks), its share. */
+  private adjustment(root: string, code: string, date: EtDate, schedule: RollSchedule): { offset: number; share: number; minutes: number } {
+    const day = readDay(this.dataDir, root, date);
+    const counts = new Map<number, number>();
+    let n = 0;
+    const t = day?.bars.t ?? [];
+    // Only the CSV rows over the day's own minutes are needed.
+    const csv = t.length ? this.prices?.(root, t[0], t[t.length - 1] + 1) ?? null : null;
+    if (day && csv) {
+      const owner = barContracts(day, schedule);
+      for (let i = 0; i < day.bars.t.length; i++) {
+        if (owner[i] !== code) continue;
+        const k = csv.lowerBound(day.bars.t[i]);
+        if (k >= csv.length || csv.t[k] !== day.bars.t[i]) continue;
+        const d = Math.round((csv.c[k] - day.bars.c[i]) * 4) / 4;
+        counts.set(d, (counts.get(d) ?? 0) + 1);
+        n++;
+      }
+    }
+    const [offset, hits] = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0] - b[0])[0] ?? [0, 0];
+    return { offset, share: n ? Math.round((hits / n) * 1000) / 1000 : 0, minutes: n };
+  }
+
+  /**
+   * The store's gap days (gaps.l1), optionally only those from `from` to `to` (inclusive): each with whether the price
+   * CSV serves its bars; none has order flow. Reads only those days' rows of the CSV.
+   */
+  dataGaps(root: string, from: EtDate | null = null, to: EtDate | null = null): DataGap[] {
+    const m = this.manifest(root);
+    const schedule = scheduleOf(root);
+    if (!m || !schedule) return [];
+    const stored = new Set(this.gapDays(root));
+    return m.gaps.l1
+      .filter((day) => (from === null || day >= from) && (to === null || day <= to))
+      .map((day) => ({ day, bars: stored.has(day) && this.codesOf(day, schedule).some((code) => this.fallbackFor(root, day, code)), flow: false as const }));
+  }
 
   /**
    * The root's manifest, read once; null when there is no store, or when the store
@@ -265,21 +379,38 @@ export class DerivedStore {
     const entry = m?.contracts[code];
     if (!m || !entry) throw new Error(`no stored bars for ${root} ${code}`);
     const cols: number[][] = [[], [], [], [], [], []];
+    const push = (t: number, o: number, h: number, l: number, c: number, v: number) => {
+      cols[0].push(t);
+      cols[1].push(o);
+      cols[2].push(h);
+      cols[3].push(l);
+      cols[4].push(c);
+      cols[5].push(v);
+    };
+    // The days without order-book data the price CSV serves for this contract, merged in date order.
+    const schedule = scheduleOf(root);
+    const fills = schedule
+      ? this.gapDays(root)
+          .filter((date) => this.codesOf(date, schedule).includes(code))
+          .flatMap((date) => this.fallbackFor(root, date, code) ?? [])
+      : [];
+    const fill = (f: PriceFallback) => {
+      const r = f.rows;
+      for (let i = 0; i < r.length; i++) push(r.t[i], r.o[i] - f.offset, r.h[i] - f.offset, r.l[i] - f.offset, r.c[i] - f.offset, r.v[i]);
+    };
+    let fi = 0;
     for (const date of entry.days) {
+      while (fi < fills.length && fills[fi].date < date) fill(fills[fi++]);
       const day = readDay(this.dataDir, root, date);
       if (!day) throw new Error(`store day file ${date} of ${root} is missing or of another format: rebuild with build-store`);
       const owner = barContracts(day, scheduleOf(root) as RollSchedule);
       const b = day.bars;
       for (let i = 0; i < b.t.length; i++) {
         if (owner[i] !== code) continue;
-        cols[0].push(b.t[i]);
-        cols[1].push(b.o[i]);
-        cols[2].push(b.h[i]);
-        cols[3].push(b.l[i]);
-        cols[4].push(b.c[i]);
-        cols[5].push(b.v[i]);
+        push(b.t[i], b.o[i], b.h[i], b.l[i], b.c[i], b.v[i]);
       }
     }
+    while (fi < fills.length) fill(fills[fi++]);
     const [t, o, h, l, c, v] = cols.map((x) => Float64Array.from(x));
     s = new BarSeries(t, o, h, l, c, v);
     this.series.set(key, s);
