@@ -175,10 +175,8 @@ export interface PriceFallback {
   offset: number;
   /** The neighbouring store days it was measured on, each with its offset and the share of matched minutes at it. */
   measured: Array<{ date: EtDate; offset: number; share: number; minutes: number }>;
-  /** Indices into the CSV series of the day's served minutes. */
-  from: number;
-  to: number;
-  minutes: number[];
+  /** The day's served minutes of the CSV, as the CSV has them (not yet adjusted), oldest first. */
+  rows: BarSeries;
 }
 
 /** One gap day as get_server_config.dataGaps lists it: bars from the price CSV (bars: true) or none at all. */
@@ -205,61 +203,75 @@ export class DerivedStore {
   private readonly hashes = new Map<string, string | null>();
   private readonly series = new Map<string, BarSeries>();
   private readonly flowDays = new Map<string, FlowDay | null>();
-  private readonly fallbacks = new Map<string, PriceFallback[]>();
+  private readonly fallbacks = new Map<string, PriceFallback | null>();
 
   constructor(
     private readonly dataDir: string,
     /** Overrides the manifest's source folder for event reads (BACKTESTER_ORDERBOOK_DIR). */
     private readonly sourceDir: string | null = null,
     /** The root's price CSV (back-adjusted, continuous), for the store's days without order-book data; null: none. */
-    private readonly prices: ((root: string) => BarSeries | null) | null = null,
+    private readonly prices: ((root: string, from: number, to: number) => BarSeries | null) | null = null,
   ) {}
 
+  /** The manifest's gap days (gaps.l1) the store has no bars for, oldest first. */
+  private gapDays(root: string): EtDate[] {
+    const m = this.manifest(root);
+    return m ? m.gaps.l1.filter((date) => !m.days[date]?.bars) : [];
+  }
+
+  /** The contracts the roll table puts the data on during a day's Globex hours (the roll table only: no CSV read). */
+  private codesOf(date: EtDate, schedule: RollSchedule): string[] {
+    const codes = new Set<string>();
+    for (const [a, b] of sessionsOf(date)) {
+      for (const seg of schedule.segments) if (seg.contract !== null && seg.from < b && seg.to > a) codes.add(seg.contract);
+    }
+    return [...codes];
+  }
+
   /**
-   * The store's days without order-book data that the price CSV serves (PriceFallback), oldest first. A gap day the
-   * CSV has no minute of in the day's Globex hours, or whose contract has no store day to measure its adjustment on,
-   * is left out: it has no bars at all.
+   * One gap day's bars of `code` from the price CSV (PriceFallback), or null: the CSV has no minute of the day's
+   * Globex hours on `code`, or `code` has no store day to measure its adjustment on (the day has no bars at all).
+   * Reads only the day's rows and the neighbouring store days' rows from the CSV (BarStore.slice), never the file whole.
    */
-  priceFallbacks(root: string): PriceFallback[] {
-    const cached = this.fallbacks.get(root);
-    if (cached) return cached;
+  private fallbackFor(root: string, date: EtDate, code: string): PriceFallback | null {
+    const key = `${root}.${date}.${code}`;
+    if (this.fallbacks.has(key)) return this.fallbacks.get(key) ?? null;
+    let out: PriceFallback | null = null;
     const m = this.manifest(root);
     const schedule = scheduleOf(root);
-    const csv = m && schedule && m.gaps.l1.length ? this.prices?.(root) ?? null : null;
-    const out: PriceFallback[] = [];
-    if (m && schedule && csv) {
-      for (const date of m.gaps.l1) {
-        if (m.days[date]?.bars) continue;
-        const { start, end } = etDayBounds(date);
-        const sessions = sessionsOf(date);
-        const byCode = new Map<string, number[]>();
-        for (let i = csv.lowerBound(start); i < csv.length && csv.t[i] < end; i++) {
-          const t = csv.t[i];
-          if (!sessions.some(([a, b]) => t >= a && t < b)) continue;
-          const code = schedule.dataContractAt(t);
-          if (code === null) continue;
-          (byCode.get(code) ?? byCode.set(code, []).get(code)!).push(i);
-        }
-        for (const [code, minutes] of byCode) {
-          const days = m.contracts[code]?.days ?? [];
-          const before = [...days].reverse().find((d) => d < date);
-          const after = days.find((d) => d > date);
-          const measured = [before, after].filter((d): d is EtDate => !!d).map((d) => ({ date: d, ...this.adjustment(root, code, d, csv, schedule) })).filter((x) => x.minutes > 0);
-          if (!measured.length) continue;
-          out.push({ date, code, offset: measured[0].offset, measured, from: minutes[0], to: minutes[minutes.length - 1] + 1, minutes });
+    const { start, end } = etDayBounds(date);
+    const day = m && schedule ? this.prices?.(root, start, end) ?? null : null;
+    if (m && schedule && day) {
+      const sessions = sessionsOf(date);
+      const keep: number[] = [];
+      for (let i = 0; i < day.length; i++) {
+        const t = day.t[i];
+        if (sessions.some(([a, b]) => t >= a && t < b) && schedule.dataContractAt(t) === code) keep.push(i);
+      }
+      if (keep.length) {
+        const days = m.contracts[code]?.days ?? [];
+        const before = [...days].reverse().find((d) => d < date);
+        const after = days.find((d) => d > date);
+        const measured = [before, after].filter((d): d is EtDate => !!d).map((d) => ({ date: d, ...this.adjustment(root, code, d, schedule) })).filter((x) => x.minutes > 0);
+        if (measured.length) {
+          const pick = (col: Float64Array) => Float64Array.from(keep, (i) => col[i]);
+          out = { date, code, offset: measured[0].offset, measured, rows: new BarSeries(pick(day.t), pick(day.o), pick(day.h), pick(day.l), pick(day.c), pick(day.v)) };
         }
       }
     }
-    this.fallbacks.set(root, out);
+    this.fallbacks.set(key, out);
     return out;
   }
 
   /** The CSV's close minus the store's on a store day's minutes of `code`: the most common difference (ticks), its share. */
-  private adjustment(root: string, code: string, date: EtDate, csv: BarSeries, schedule: RollSchedule): { offset: number; share: number; minutes: number } {
+  private adjustment(root: string, code: string, date: EtDate, schedule: RollSchedule): { offset: number; share: number; minutes: number } {
     const day = readDay(this.dataDir, root, date);
     const counts = new Map<number, number>();
     let n = 0;
-    if (day) {
+    const t = day?.bars.t ?? [];
+    // Only the CSV rows over the day's own minutes are needed.
+    const csv = t.length ? this.prices?.(root, t[0], t[t.length - 1] + 1) ?? null : null;
+    if (day && csv) {
       const owner = barContracts(day, schedule);
       for (let i = 0; i < day.bars.t.length; i++) {
         if (owner[i] !== code) continue;
@@ -274,12 +286,18 @@ export class DerivedStore {
     return { offset, share: n ? Math.round((hits / n) * 1000) / 1000 : 0, minutes: n };
   }
 
-  /** The store's gap days (gaps.l1): each with whether the price CSV serves its bars; none has order flow. */
-  dataGaps(root: string): DataGap[] {
+  /**
+   * The store's gap days (gaps.l1), optionally only those from `from` to `to` (inclusive): each with whether the price
+   * CSV serves its bars; none has order flow. Reads only those days' rows of the CSV.
+   */
+  dataGaps(root: string, from: EtDate | null = null, to: EtDate | null = null): DataGap[] {
     const m = this.manifest(root);
-    if (!m) return [];
-    const served = new Set(this.priceFallbacks(root).map((f) => f.date));
-    return m.gaps.l1.map((day) => ({ day, bars: served.has(day), flow: false as const }));
+    const schedule = scheduleOf(root);
+    if (!m || !schedule) return [];
+    const stored = new Set(this.gapDays(root));
+    return m.gaps.l1
+      .filter((day) => (from === null || day >= from) && (to === null || day <= to))
+      .map((day) => ({ day, bars: stored.has(day) && this.codesOf(day, schedule).some((code) => this.fallbackFor(root, day, code)), flow: false as const }));
   }
 
   /**
@@ -370,10 +388,15 @@ export class DerivedStore {
       cols[5].push(v);
     };
     // The days without order-book data the price CSV serves for this contract, merged in date order.
-    const fills = this.priceFallbacks(root).filter((f) => f.code === code);
-    const csv = fills.length ? this.prices?.(root) ?? null : null;
+    const schedule = scheduleOf(root);
+    const fills = schedule
+      ? this.gapDays(root)
+          .filter((date) => this.codesOf(date, schedule).includes(code))
+          .flatMap((date) => this.fallbackFor(root, date, code) ?? [])
+      : [];
     const fill = (f: PriceFallback) => {
-      for (const i of f.minutes) push(csv!.t[i], csv!.o[i] - f.offset, csv!.h[i] - f.offset, csv!.l[i] - f.offset, csv!.c[i] - f.offset, csv!.v[i]);
+      const r = f.rows;
+      for (let i = 0; i < r.length; i++) push(r.t[i], r.o[i] - f.offset, r.h[i] - f.offset, r.l[i] - f.offset, r.c[i] - f.offset, r.v[i]);
     };
     let fi = 0;
     for (const date of entry.days) {

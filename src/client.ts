@@ -236,6 +236,11 @@ export interface DataPin {
   manifestHash: string | null;
   months: string[];
   rollTableHash: string | null;
+  /**
+   * The root's price CSV as the run started (size:mtime, BarStore.stamp): the store's days without order-book data are
+   * served from it. Absent in a run pinned before it was stamped (not checked); null: no CSV.
+   */
+  csvStamp?: string | null;
 }
 
 /** What the server did when the data left a contract: what it cancelled and at what price it closed the position. */
@@ -333,7 +338,7 @@ export class ReplayExchange {
   ) {
     this.store = opts.store ?? new BarStore(config.dataDir);
     // The store's days without order-book data are served from the root's price CSV (store.ts PriceFallback).
-    const prices = (root: string) => (this.store.has(root) ? this.store.get(root) : null);
+    const prices = (root: string, from: number, to: number) => this.store.slice(root, from, to);
     this.derived = opts.derived !== undefined ? opts.derived : config.useStore ? new DerivedStore(config.dataDir, config.orderbookDir, prices) : null;
     this.clock = opts.now ?? (() => readNow(config));
   }
@@ -486,7 +491,7 @@ export class ReplayExchange {
       const m = this.derived?.manifest(STORE_ROOT) ?? null;
       settings.data =
         fresh && m && this.derived?.covers(STORE_ROOT, at)
-          ? { useStore: true, manifestHash: this.derived.manifestHash(STORE_ROOT), months: [...m.months], rollTableHash: m.rollTable.hash }
+          ? { useStore: true, manifestHash: this.derived.manifestHash(STORE_ROOT), months: [...m.months], rollTableHash: m.rollTable.hash, csvStamp: this.store.stamp(STORE_ROOT) }
           : { ...CSV_PIN };
       pinned = settings.data;
     }
@@ -495,6 +500,9 @@ export class ReplayExchange {
     if (!this.derived) throw new ReplayError(`Run ${run} started on the derived store, and this process has it off (BACKTESTER_STORE=off). Use the run's settings, or a new BACKTESTER_RUN_ID.`);
     if (this.derived.manifestHash(STORE_ROOT) !== pinned.manifestHash) {
       throw new ReplayError(`The derived store changed (or is gone) since run ${run} started on it; a run never switches data. Start a new run (a new BACKTESTER_RUN_ID).`);
+    }
+    if (pinned.csvStamp !== undefined && this.store.stamp(STORE_ROOT) !== pinned.csvStamp) {
+      throw new ReplayError(`The price CSV ${STORE_ROOT}_1min.csv changed (or is gone) since run ${run} started on it; a run never switches data. Start a new run (a new BACKTESTER_RUN_ID).`);
     }
     const month = etDate(at).slice(0, 7).replace("-", "");
     if (!pinned.months.includes(month) || !scheduleOf(STORE_ROOT)?.covers(at)) {
@@ -1034,7 +1042,7 @@ export class ReplayExchange {
       const { start, end } = this.config;
       const from = start === null ? null : tradingDateOf(start);
       const to = end === null ? null : tradingDateOf(end - 1);
-      const days = run.dataGaps(STORE_ROOT).filter((g) => (from === null || g.day >= from) && (to === null || g.day <= to));
+      const days = run.dataGaps(STORE_ROOT, from, to);
       return Object.fromEntries(Object.values(CONTRACTS).filter((c) => c.dataRoot === STORE_ROOT).map((c) => [c.root, days.map((g) => ({ ...g }))]));
     });
   }

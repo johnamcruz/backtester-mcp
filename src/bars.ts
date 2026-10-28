@@ -1,5 +1,6 @@
-import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { readCsvRange } from "./csvrange.js";
 import { tradingDayStart } from "./risk.js";
 
 export const MINUTE = 60000;
@@ -118,6 +119,29 @@ export class BarStore {
       this.cache.set(dataRoot, s);
     }
     return s;
+  }
+
+  /**
+   * The rows with `from <= t < to`, without loading the file whole (csvrange.ts) unless it is loaded already;
+   * null when the root has no file. The same rows as `get(dataRoot)` holds there.
+   */
+  slice(dataRoot: string, from: number, to: number): BarSeries | null {
+    if (!this.has(dataRoot)) return null;
+    const cached = this.cache.get(dataRoot);
+    if (!cached) return readCsvRange(dataFile(this.dataDir, dataRoot), from, to);
+    const a = cached.lowerBound(from);
+    const b = Math.max(a, cached.lowerBound(to));
+    return new BarSeries(cached.t.slice(a, b), cached.o.slice(a, b), cached.h.slice(a, b), cached.l.slice(a, b), cached.c.slice(a, b), cached.v.slice(a, b));
+  }
+
+  /** The file's size and modification time (a run pins them: the bars it serves from it must not change), or null without a file. */
+  stamp(dataRoot: string): string | null {
+    try {
+      const st = statSync(dataFile(this.dataDir, dataRoot));
+      return `${st.size}:${Math.floor(st.mtimeMs)}`;
+    } catch {
+      return null;
+    }
   }
 
   /** First and last bar times of a file, read from its head and tail only (no full load). */
