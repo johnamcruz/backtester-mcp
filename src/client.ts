@@ -1073,8 +1073,10 @@ export class ReplayExchange {
       throw new ReplayError(`unit "${req.unit}" is not available in replay: bars are built from 1-minute data (use minute, hour, day or week).`);
     }
     return this.tx((_state, now) => {
-      const { c, s } = this.series(req.contractId);
+      const { c, s: own } = this.series(req.contractId);
       const cutoff = this.cutoff(now);
+      // A contract month's history reaches back before the data's switch to it, as live's does (store.ts#history).
+      const s = c.expiry && this.run ? this.run.history(c.dataRoot, c.expiry, cutoff) : own;
       const end = req.endTime ? Math.min(Date.parse(req.endTime), cutoff) : cutoff;
       const bars = aggregate(s, {
         unit: req.unit as AggUnit,

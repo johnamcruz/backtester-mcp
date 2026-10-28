@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
-import { BarSeries } from "./bars.js";
+import { BarSeries, MINUTE } from "./bars.js";
 import { etDate, type EtDate } from "./calendar.js";
 import { EMPTY_QUOTE, normalizeL1, normalizeL2, type DepthEvent, type MinuteBars, type QuoteEvent, type QuoteState, type TradeEvent } from "./events.js";
 import { ParquetFile } from "./parquet.js";
@@ -282,6 +282,56 @@ export class DerivedStore {
     }
     const [t, o, h, l, c, v] = cols.map((x) => Float64Array.from(x));
     s = new BarSeries(t, o, h, l, c, v);
+    this.series.set(key, s);
+    return s;
+  }
+
+  /**
+   * A contract month's bars as live's history shows them (get_bars): live, every listed expiry trades at once, so
+   * the new front's bars reach back before it became the front (its back-month trading). The local data holds the
+   * front only, so before the data's switch to `code` (its roll in the table) its history is the previous
+   * contract's bars shifted by the spread at the switch: `code`'s first bar's open minus the previous contract's
+   * last close before it (adjacent minutes: every switch is at 00:00 ET, inside the overnight session). Minutes
+   * where `code` has bars of its own before the switch (an exception stretch) keep them. One contract back: about
+   * a quarter of history before the roll. Until `code`'s first bar after the switch is closed at `cutoff` the
+   * spread isn't known, and only its own bars are served (no bar is made up from a later price). The prices are
+   * tick multiples (a difference of two); the volume is the previous contract's (the front's activity). Fills,
+   * quotes and settlement never read this: they use `bars` (only the contract's own data).
+   */
+  history(root: string, code: string, cutoff: number): BarSeries {
+    const own = this.bars(root, code);
+    const roll = scheduleOf(root)?.table.rolls.find((r) => r.to === code);
+    if (!roll || !this.has(root, roll.from)) return own;
+    const at = Date.parse(roll.at);
+    const k = own.lowerBound(at);
+    if (k >= own.length || own.t[k] + MINUTE > cutoff) return own;
+    const key = `${root}.${code}.history`;
+    const cached = this.series.get(key);
+    if (cached) return cached;
+    const prev = this.bars(root, roll.from);
+    const j = prev.lowerBound(at) - 1;
+    if (j < 0) return own;
+    const spread = own.o[k] - prev.c[j];
+    const cols: number[][] = [[], [], [], [], [], []];
+    const push = (s: BarSeries, i: number, d: number) => {
+      cols[0].push(s.t[i]);
+      cols[1].push(s.o[i] + d);
+      cols[2].push(s.h[i] + d);
+      cols[3].push(s.l[i] + d);
+      cols[4].push(s.c[i] + d);
+      cols[5].push(s.v[i]);
+    };
+    // Merge, oldest first: the previous contract's minutes before the switch (shifted), and every own bar, which
+    // wins a minute both have.
+    let a = 0;
+    for (let i = 0; i < own.length; i++) {
+      while (a <= j && prev.t[a] < own.t[i]) push(prev, a++, spread);
+      if (a <= j && prev.t[a] === own.t[i]) a++;
+      push(own, i, 0);
+    }
+    while (a <= j) push(prev, a++, spread);
+    const [t, o, h, l, c, v] = cols.map((x) => Float64Array.from(x));
+    const s = new BarSeries(t, o, h, l, c, v);
     this.series.set(key, s);
     return s;
   }
